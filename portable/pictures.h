@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <string>
 #include <vector>
 
 namespace goldbox {
@@ -25,10 +26,12 @@ struct PictureArchive {
         std::vector<Step> steps;
         bool whole_archive = false;
         bool realtime = false;
+        std::string label;
     };
     std::vector<Clip> clips;
     std::size_t playback_only_frames = 0; // Synthetic frames appended after the gallery frames.
     std::vector<unsigned> partial_ids;
+    std::vector<std::string> frame_labels;
     std::size_t gallery_count() const { return frames.size() - playback_only_frames; }
 };
 

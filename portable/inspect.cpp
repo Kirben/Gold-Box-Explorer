@@ -100,7 +100,9 @@ int main(int argc, char** argv)
             }
             std::cout << '\n';
             for (const auto& clip : archive.clips) {
-                if (clip.whole_archive)
+                if (!clip.label.empty())
+                    std::cout << clip.label << ':';
+                else if (clip.whole_archive)
                     std::cout << "Ending:";
                 else
                     std::cout << "Animation " << clip.id << ':';

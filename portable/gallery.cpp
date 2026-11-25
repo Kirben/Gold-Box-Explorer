@@ -837,7 +837,8 @@ private:
                 clips_ = std::move(archive.clips);
                 for (std::size_t i = 0; i < count; ++i) {
                     const auto& frame = frames_[i];
-                    const auto label = glb ? wxString::Format("Map %u", frame.id)
+                    const auto label = i < archive.frame_labels.size() ? wxString::FromUTF8(archive.frame_labels[i])
+                        : glb ? wxString::Format("Map %u", frame.id)
                         : packwall ? wxString::Format("Wall set %u", frame.id)
                         : cmp && count > 1 ? wxString::Format("Tile %u", frame.id)
                         : anm ? wxString::Format("Frame %u", frame.id)

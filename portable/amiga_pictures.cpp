@@ -429,6 +429,184 @@ PictureArchive read_amiga_ilbm(const std::filesystem::path& path)
     return archive;
 }
 
+namespace {
+constexpr std::size_t intro_pack_start = 0x238;
+constexpr std::size_t intro_raw_size = 135036;
+constexpr std::size_t intro_data_start = 6240;
+
+bool amiga_intro_header(const Bytes& bytes)
+{
+    return bytes.size() >= 36 && dword(bytes, 0) == 0x3f3 && dword(bytes, 8) == 2 &&
+        dword(bytes, 28) == 0x3e9 && dword(bytes, 32) == 0x83;
+}
+
+Bytes expand_amiga_intro(const Bytes& packed)
+{
+    if (!amiga_intro_header(packed) || packed.size() < intro_pack_start + 12 ||
+        dword(packed, 0x228) != 0x09090909 || dword(packed, 0x230) != 0x3ea)
+        throw std::runtime_error("Invalid Pool of Radiance Amiga intro header");
+    const auto length = dword(packed, 0x17c);
+    if (length < 8 || length % 4 || length > packed.size() - intro_pack_start - 4)
+        throw std::runtime_error("Invalid Amiga intro packed length");
+    auto cursor = intro_pack_start + length;
+    const auto previous_word = [&] {
+        if (cursor == intro_pack_start)
+            throw std::runtime_error("Truncated Amiga intro bitstream");
+        cursor -= 4;
+        return dword(packed, cursor);
+    };
+    const auto trailer = previous_word();
+    const unsigned skip = trailer & 255;
+    if ((trailer >> 8) != intro_raw_size || skip >= 32)
+        throw std::runtime_error("Invalid Amiga intro compression trailer");
+    auto bits = previous_word() >> skip;
+    unsigned available = 32 - skip;
+    const auto read_bits = [&](unsigned count) {
+        unsigned value = 0;
+        for (unsigned i = 0; i < count; ++i) {
+            if (!available) {
+                bits = previous_word();
+                available = 32;
+            }
+            value = (value << 1) | (bits & 1);
+            bits >>= 1;
+            --available;
+        }
+        return value;
+    };
+    Bytes raw(intro_raw_size);
+    auto dest = raw.size();
+    const auto run_length = [&](std::size_t size, unsigned extension_bits) {
+        unsigned extra;
+        do {
+            extra = read_bits(extension_bits);
+            size += extra;
+            if (size > dest)
+                throw std::runtime_error("Amiga intro run exceeds unpacked size");
+        } while (extra == (1u << extension_bits) - 1);
+        return size;
+    };
+    while (dest) {
+        if (!read_bits(1)) {
+            const auto count = run_length(1, 2);
+            for (std::size_t i = 0; i < count; ++i)
+                raw[--dest] = static_cast<std::uint8_t>(read_bits(8));
+            if (!dest)
+                break;
+        }
+        const auto tag = read_bits(2);
+        const auto offset = read_bits(tag == 3 && !read_bits(1) ? 7 : 9);
+        const auto count = tag == 3 ? run_length(5, 3) : tag + 2;
+        if (count > dest || offset >= raw.size() - dest)
+            throw std::runtime_error("Invalid Amiga intro back-reference");
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto byte = raw[dest + offset];
+            raw[--dest] = byte;
+        }
+    }
+    // These image offsets are specific to the original English executable layout.
+    unsigned a = 1, b = 0;
+    for (const auto byte : raw) {
+        a = (a + byte) % 65521;
+        b = (b + a) % 65521;
+    }
+    if (a != 0x0428 || b != 0x875c)
+        throw std::runtime_error("Unsupported or corrupt Pool of Radiance Amiga intro");
+    return raw;
+}
+
+Frame intro_frame(const Bytes& raw, unsigned screen)
+{
+    struct Strip { unsigned source, destination, height; };
+    constexpr Strip strips[]{
+        {93,30,48}, {455,60,16}, {398,30,56}, {474,60,19},
+        {141,20,146}, {0,20,92}, {288,20,110}, {499,20,100},
+    };
+    Frame frame{screen, 0, 320, 200, Bytes(320 * 200 * 4)};
+    const auto cmap = intro_data_start + 128302 + (screen == 5 ? 32 : 0);
+    std::array<std::array<std::uint8_t, 4>, 16> palette{};
+    for (unsigned i = 0; i < palette.size(); ++i) {
+        const auto rgb = word(raw, cmap + i * 2);
+        palette[i] = {static_cast<std::uint8_t>(((rgb >> 8) & 15) * 17),
+                      static_cast<std::uint8_t>(((rgb >> 4) & 15) * 17),
+                      static_cast<std::uint8_t>((rgb & 15) * 17), 255};
+    }
+    const bool title = screen == std::size(strips);
+    const unsigned first = title ? 0 : strips[screen].destination;
+    const unsigned end = title ? frame.height : first + strips[screen].height;
+    const unsigned span = title ? 8000 : 24000;
+    const auto source = title ? intro_data_start : intro_data_start + 32032 + strips[screen].source * 40;
+    for (unsigned y = 0; y < frame.height; ++y)
+        for (unsigned x = 0; x < frame.width; ++x) {
+            unsigned index = 0;
+            if (y >= first && y < end) {
+                const auto at = source + (y - first) * 40 + x / 8;
+                for (unsigned plane = 0; plane < 4; ++plane)
+                    index |= ((raw[at + plane * span] >> (7 - x % 8)) & 1) << plane;
+            }
+            std::copy(palette[index].begin(), palette[index].end(),
+                      frame.rgba.data() + (y * frame.width + x) * 4);
+        }
+    return frame;
+}
+}
+
+bool is_amiga_intro(const std::filesystem::path& path)
+{
+    auto name = path.filename().string();
+    for (auto& c : name)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (name != "intro")
+        return false;
+    std::ifstream stream(path, std::ios::binary);
+    Bytes header(36);
+    return stream.read(reinterpret_cast<char*>(header.data()), header.size()) && amiga_intro_header(header);
+}
+
+PictureArchive read_amiga_intro(const std::filesystem::path& path)
+{
+    std::ifstream stream(path, std::ios::binary);
+    const Bytes packed{std::istreambuf_iterator<char>(stream), {}};
+    const auto raw = expand_amiga_intro(packed);
+    PictureArchive archive;
+    archive.frame_labels = {"SSI", "And...", "Ubi Soft", "Present", "AD&D and copyright",
+                            "Pool of Radiance", "Game credits", "Amiga credits", "Title artwork"};
+    const auto count = archive.frame_labels.size();
+    for (unsigned screen = 0; screen < count; ++screen)
+        archive.frames.push_back(intro_frame(raw, screen));
+    PictureArchive::Clip clip{0, {}, true, true, "Introduction"};
+    // Use the portable game port's pacing for the executable's RGB4 fades.
+    constexpr int fade_ms = 40, hold_ms = 5000, gap_ms = 400;
+    Frame black{0, 16, 320, 200, Bytes(320 * 200 * 4)};
+    for (std::size_t i = 3; i < black.rgba.size(); i += 4)
+        black.rgba[i] = 255;
+    const auto black_index = archive.frames.size();
+    archive.frames.push_back(std::move(black));
+    for (std::size_t screen = 0; screen < count; ++screen) {
+        std::array<std::size_t, 17> fade{};
+        fade[1] = screen;
+        fade[16] = black_index;
+        for (unsigned divisor = 2; divisor < 16; ++divisor) {
+            auto frame = archive.frames[screen];
+            frame.index = divisor - 1;
+            for (std::size_t i = 0; i < frame.rgba.size(); i += 4)
+                for (unsigned c = 0; c < 3; ++c)
+                    frame.rgba[i + c] = static_cast<std::uint8_t>((frame.rgba[i + c] / 17 / divisor) * 17);
+            fade[divisor] = archive.frames.size();
+            archive.frames.push_back(std::move(frame));
+        }
+        for (unsigned divisor = 16; divisor > 1; --divisor)
+            clip.steps.push_back({fade[divisor], fade_ms});
+        clip.steps.push_back({screen, 2 * fade_ms + hold_ms});
+        for (unsigned divisor = 2; divisor <= 16; ++divisor)
+            clip.steps.push_back({fade[divisor], fade_ms});
+        clip.steps.back().duration_ms += gap_ms;
+    }
+    archive.playback_only_frames = archive.frames.size() - count;
+    archive.clips.push_back(std::move(clip));
+    return archive;
+}
+
 std::optional<PictureArchive> try_amiga_pictures(const std::filesystem::path& path)
 {
     auto title = path.stem().string();
