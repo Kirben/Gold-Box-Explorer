@@ -1,4 +1,5 @@
 #include "dax.h"
+#include "disk_image.h"
 #include "geo.h"
 #include "pictures.h"
 #include "records.h"
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -1374,6 +1376,78 @@ static void luck_records(const fs::path& dir)
     }
 }
 
+void disk_images(const fs::path& dir)
+{
+    const auto contents = [](const fs::path& path) {
+        std::ifstream stream(path, std::ios::binary);
+        return Bytes(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>{});
+    };
+    const auto extract = [&](const char* filename, const Bytes& bytes, const char* folder) {
+        const auto path = dir / filename;
+        write(path, bytes);
+        const auto destination = dir / folder;
+        fs::create_directories(destination);
+        // Existing matching cache contents can be left behind when the test is rerun.
+        for (const auto& entry : fs::directory_iterator(destination))
+            fs::remove_all(entry.path());
+        extract_disk_image(path, destination);
+        return destination;
+    };
+
+    Bytes d64(174848 + 683);
+    constexpr unsigned directory = (17 * 21 + 1) * 256;
+    d64[directory + 1] = 255;
+    d64[directory + 2] = 0x82;
+    d64[directory + 3] = 1;
+    std::fill_n(d64.begin() + directory + 5, 16, 0xa0);
+    std::copy_n("TITLEPG", 7, d64.begin() + directory + 5);
+    d64[0] = 1;
+    d64[1] = 1;
+    std::fill_n(d64.begin() + 2, 254, 0x43);
+    d64[257] = 3;
+    d64[258] = 0x31;
+    d64[259] = 0x32;
+    auto expected = Bytes(254, 0x43);
+    expected.insert(expected.end(), {0x31, 0x32});
+    check(contents(extract("test.D64", d64, "commodore") / "TITLEPG.PRG") == expected,
+          "D64 file chain, PRG naming or final sector length is incorrect");
+
+    for (const bool fast : {false, true}) {
+        Bytes adf(901120);
+        const auto set = [&](unsigned block, unsigned offset, std::uint32_t value) {
+            for (unsigned i = 0; i < 4; ++i)
+                adf[block * 512 + offset + i] = static_cast<std::uint8_t>(value >> (24 - 8 * i));
+        };
+        const auto name = [&](unsigned block, std::string_view text) {
+            adf[block * 512 + 432] = static_cast<std::uint8_t>(text.size());
+            std::copy(text.begin(), text.end(), adf.begin() + block * 512 + 433);
+        };
+        set(0, 0, fast ? 0x444f5301 : 0x444f5300);
+        set(0, 8, 880);
+        set(880, 0, 2);
+        set(880, 24, 881);
+        set(880, 508, 1);
+        set(881, 0, 2);
+        set(881, 24, 882);
+        set(881, 508, 2);
+        name(881, "Data");
+        set(882, 0, 2);
+        set(882, 308, 883);
+        set(882, 324, 3);
+        set(882, 508, 0xfffffffdu);
+        name(882, "ECL.DAX");
+        if (!fast) {
+            set(883, 0, 8);
+            set(883, 12, 3);
+        }
+        const auto start = 883 * 512 + (fast ? 0 : 24);
+        std::copy_n("ECL", 3, adf.begin() + start);
+        const auto destination = fast ? extract("ffs.adf", adf, "ffs") : extract("ofs.adf", adf, "ofs");
+        check(contents(destination / "Data" / "ECL.DAX") == Bytes{'E', 'C', 'L'},
+              "ADF file data or subdirectory is incorrect");
+    }
+}
+
 int main(int argc, char** argv)
 {
     try {
@@ -1396,6 +1470,7 @@ int main(int argc, char** argv)
         else if (name == "ilbm") ilbm(dir);
         else if (name == "frua-records") frua_records(dir);
         else if (name == "luck") luck_records(dir);
+        else if (name == "disk-images") disk_images(dir);
         else if (name == "vace") vace(dir);
         else if (name == "geo") geo(dir);
         else if (name == "walls") walls(dir);

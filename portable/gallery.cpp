@@ -12,6 +12,7 @@
 #include "records.h"
 #include "save_map.h"
 #include "xmi.h"
+#include "disk_image.h"
 
 #include <wx/dcbuffer.h>
 #include <wx/dirctrl.h>
@@ -31,6 +32,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <random>
 #include <set>
 #include <sstream>
 
@@ -488,6 +490,8 @@ public:
         CreateStatusBar();
 
         auto* file_menu = new wxMenu;
+        file_menu->Append(wxID_OPEN, "&Open Disk Image...\tCtrl+O");
+        file_menu->AppendSeparator();
         file_menu->Append(export_png_id, "Export PNG...");
         file_menu->Append(export_frames_id, "Export All Frames...");
         file_menu->Append(export_animation_id, "Export Animation...");
@@ -502,6 +506,13 @@ public:
         menu_bar->Append(file_menu, "&File");
         SetMenuBar(menu_bar);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { Close(); }, wxID_EXIT);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) {
+            wxFileDialog dialog(this, "Open disk image", {}, {},
+                "Amiga and Commodore disk images (*.adf;*.d64)|*.adf;*.d64;*.ADF;*.D64",
+                wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+            if (dialog.ShowModal() == wxID_OK)
+                mount_image(fs::u8path(dialog.GetPath().ToUTF8().data()));
+        }, wxID_OPEN);
         Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent& event) {
             event.Enable(preview_->can_export());
         }, export_png_id);
@@ -543,10 +554,33 @@ public:
 
         folders->Bind(wxEVT_DIRCTRL_SELECTIONCHANGED, [this, folders](wxTreeEvent& event) {
             const auto path = folders->GetPath(event.GetItem());
-            if (!path.empty())
+            if (!path.empty()) {
+                active_image_.clear();
                 browse(fs::u8path(path.ToUTF8().data()), {});
+            }
         });
         files_->Bind(wxEVT_LISTBOX, [this](wxCommandEvent&) { open(); });
+        files_->Bind(wxEVT_LISTBOX_DCLICK, [this](wxCommandEvent&) {
+            const auto selected = files_->GetSelection();
+            if (selected == wxNOT_FOUND)
+                return;
+            const auto path = paths_.at(selected);
+            if (!active_image_.empty() && selected == 0) {
+                if (current_folder_ == mounted_images_.at(active_image_)) {
+                    const auto image = active_image_;
+                    active_image_.clear();
+                    browse(image.parent_path(), image.filename());
+                } else {
+                    browse(current_folder_.parent_path(), current_folder_.filename());
+                }
+            } else {
+                std::error_code error;
+                if (fs::is_directory(path, error))
+                    browse(path, {});
+                else if (goldbox::is_disk_image(path))
+                    mount_image(path);
+            }
+        });
         pictures_->Bind(wxEVT_LISTBOX, [this](wxCommandEvent&) {
             reset_playback();
             preview_->Scroll(0, 0);
@@ -595,12 +629,22 @@ public:
             }
         });
         browse(folder, initial.filename());
+        if (goldbox::is_disk_image(initial))
+            mount_image(initial);
         CallAfter([folders] {
             auto* tree = folders->GetTreeCtrl();
             const auto selected = tree->GetSelection();
             if (selected.IsOk())
                 tree->EnsureVisible(selected);
         });
+    }
+
+    ~Gallery() override
+    {
+        if (!disk_cache_.empty()) {
+            std::error_code error;
+            fs::remove_all(disk_cache_, error);
+        }
     }
 
 private:
@@ -812,25 +856,80 @@ private:
                                  wxString::Format("Exported sample %u as WAV", id));
     }
 
+    void mount_image(const fs::path& path)
+    {
+        try {
+            const auto image = fs::canonical(path);
+            auto cached = mounted_images_.find(image);
+            if (cached == mounted_images_.end()) {
+                if (disk_cache_.empty()) {
+                    const auto temp = fs::temp_directory_path();
+                    std::random_device random;
+                    for (unsigned attempt = 0; attempt < 16 && disk_cache_.empty(); ++attempt) {
+                        const auto candidate = temp / ("goldbox-disks-" + std::to_string(random()));
+                        if (fs::create_directory(candidate))
+                            disk_cache_ = candidate;
+                    }
+                    if (disk_cache_.empty())
+                        throw std::runtime_error("Could not create a temporary disk cache");
+                }
+                const auto directory = disk_cache_ / std::to_string(mounted_images_.size());
+                fs::create_directory(directory);
+                try {
+                    goldbox::extract_disk_image(image, directory);
+                    cached = mounted_images_.emplace(image, directory).first;
+                } catch (...) {
+                    std::error_code error;
+                    fs::remove_all(directory, error);
+                    throw;
+                }
+            }
+            active_image_ = image;
+            const auto directory = cached->second;
+            browse(directory, {});
+        } catch (const std::exception& error) {
+            wxMessageBox(wxString::FromUTF8(error.what()), "Could not open disk image", wxOK | wxICON_ERROR, this);
+        }
+    }
+
     void browse(const fs::path& folder, const fs::path& selected)
     {
+        current_folder_ = folder;
         paths_.clear();
         files_->Clear();
+        if (active_image_.empty()) {
+            SetTitle("Gold Box Explorer");
+        } else {
+            const auto& root = mounted_images_.at(active_image_);
+            const auto location = folder.lexically_relative(root);
+            auto title = wxString::FromUTF8(active_image_.filename().u8string());
+            if (location != ".")
+                title += " / " + wxString::FromUTF8(location.generic_u8string());
+            SetTitle("Gold Box Explorer - " + title);
+        }
         std::error_code error;
         for (fs::directory_iterator it(folder, error), end; !error && it != end; it.increment(error)) {
             std::error_code file_error;
-            if (it->is_regular_file(file_error))
+            if (it->is_regular_file(file_error) || (!active_image_.empty() && it->is_directory(file_error)))
                 paths_.push_back(it->path());
         }
         std::sort(paths_.begin(), paths_.end());
-        int index = 0;
+        int index = active_image_.empty() ? 0 : 1;
+        if (!active_image_.empty())
+            files_->Append("[..]");
         for (const auto& path : paths_) {
-            const auto row = files_->Append(wxString::FromUTF8(path.filename().u8string()));
+            auto label = wxString::FromUTF8(path.filename().u8string());
+            std::error_code type_error;
+            if (fs::is_directory(path, type_error) || goldbox::is_disk_image(path))
+                label = "[" + label + "]";
+            const auto row = files_->Append(label);
             if (path.filename() == selected)
                 index = row;
         }
+        if (!active_image_.empty())
+            paths_.insert(paths_.begin(), current_folder_.parent_path());
         if (!paths_.empty())
-            files_->SetSelection(index);
+            files_->SetSelection(std::min<int>(index, paths_.size() - 1));
         open();
         if (error)
             SetStatusText(wxString::FromUTF8(error.message()));
@@ -853,6 +952,17 @@ private:
         saved_map_.reset();
         original_map_->SetValue(false);
         const auto selected = files_->GetSelection();
+        if (selected != wxNOT_FOUND) {
+            const auto& path = paths_.at(selected);
+            std::error_code error;
+            if ((!active_image_.empty() && selected == 0) || fs::is_directory(path, error) ||
+                goldbox::is_disk_image(path)) {
+                show_view(false, false);
+                SetStatusText("Double-click to open.");
+                render();
+                return;
+            }
+        }
         const bool wall = selected != wxNOT_FOUND && goldbox::is_wall_archive(paths_.at(selected));
         const bool tlb = selected != wxNOT_FOUND && goldbox::is_tlb_archive(paths_.at(selected));
         const bool glb = selected != wxNOT_FOUND && goldbox::is_geo_glb(paths_.at(selected));
@@ -1202,6 +1312,10 @@ private:
     RecordList* record_list_;
     RecordDetails* details_;
     goldbox::RecordKind record_kind_ = goldbox::RecordKind::none;
+    fs::path current_folder_;
+    fs::path disk_cache_;
+    fs::path active_image_;
+    std::map<fs::path, fs::path> mounted_images_;
     std::vector<fs::path> paths_;
     std::vector<goldbox::Frame> frames_;
     std::vector<goldbox::PictureArchive::Clip> clips_;
