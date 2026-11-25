@@ -515,6 +515,51 @@ void records(const fs::path& dir)
     check(inventory.size() == 1 && has_field(inventory[0], {"Owner", "Orc"}), "Missing inventory owner");
 }
 
+void vault(const fs::path& dir)
+{
+    Bytes bytes(16 + 50 * 18, 255);
+    std::fill_n(bytes.begin(), 16 + 3 * 18, 0);
+    bytes[0] = 2;
+    bytes[2] = 1;
+    bytes[4] = 9;
+    bytes[8] = 7;
+    bytes[12] = bytes[13] = 255;
+    bytes[14] = 2;
+    bytes[16] = 1;
+    bytes[18] = 18;
+    bytes[19] = 26;
+    bytes[22] = bytes[23] = 255;
+    bytes[24] = 255;
+    bytes[34] = 'I';
+    bytes[47] = 1;
+    bytes[52] = 2;
+    bytes[55] = 240;
+    const auto path = dir / "vaulta.dat";
+    write(path, bytes);
+    check(record_kind(path) == RecordKind::vault && record_kind("VAULT.DAT") == RecordKind::vault,
+          "Vault file routing mismatch");
+    const auto rows = read_record_rows(path);
+    check(rows.size() == 4 && has_field(rows[0], {"Platinum pieces", "65538"}) &&
+          has_field(rows[0], {"Gems", "9"}) && has_field(rows[0], {"Jewels", "7"}),
+          "Wrong vault currency or record count");
+    check(rows[1].name == "Fine Long Sword" && has_field(rows[1], {"Magic bonus", "-1"}) &&
+          has_field(rows[1], {"Value", "-1"}) &&
+          rows[2].name == "Bundle" && rows[3].name == "[240]" &&
+          has_field(rows[3], {"Part of bundle record", "2"}), "Wrong FRUA item names or bundle layout");
+
+    bytes[14] = 0;
+    write(path, bytes);
+    check(read_record_rows(path).size() == 1, "Empty vault should still show money and ignore padding");
+    bytes[14] = 51;
+    write(path, bytes);
+    try {
+        read_record_rows(path);
+    } catch (const std::runtime_error&) {
+        return;
+    }
+    throw std::runtime_error("Accepted a FRUA vault with too many items");
+}
+
 void saves(const fs::path& dir)
 {
     const auto folder = dir / "SAVE";
@@ -571,6 +616,7 @@ int main(int argc, char** argv)
         else if (name == "cmp") cmp(dir);
         else if (name == "packwall") packwall(dir);
         else if (name == "anm") anm(dir);
+        else if (name == "vault") vault(dir);
         else if (name == "vace") vace(dir);
         else if (name == "geo") geo(dir);
         else if (name == "walls") walls(dir);

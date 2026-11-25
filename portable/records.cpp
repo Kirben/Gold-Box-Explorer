@@ -1,5 +1,6 @@
 #include "records.h"
 #include "item_names.h"
+#include "frua_item_names.h"
 
 #include <algorithm>
 #include <cctype>
@@ -47,6 +48,7 @@ unsigned word(const std::uint8_t* data, unsigned offset)
 }
 
 int signed_byte(unsigned byte) { return byte < 128 ? byte : static_cast<int>(byte) - 256; }
+int signed_word(unsigned value) { return static_cast<int>(value) - (value >= 0x8000 ? 0x10000 : 0); }
 
 void field(RecordRow& row, const char* label, long long value)
 {
@@ -146,6 +148,81 @@ RecordRow item(unsigned id, unsigned slot, const std::uint8_t* b, const std::str
     return row;
 }
 
+std::vector<RecordRow> read_vault(const std::filesystem::path& path)
+{
+    constexpr unsigned header_size = 16;
+    constexpr unsigned record_size = 18;
+    constexpr unsigned padded_records = 50;
+    const auto bytes = read_save(path);
+    const auto* data = bytes.data();
+    if (bytes.size() < header_size + padded_records * record_size ||
+        (bytes.size() - header_size) % record_size != 0 || word(data, 12) != 0xffff)
+        throw std::runtime_error("Expected a Forgotten Realms Unlimited Adventures DOS vault");
+    const auto available = (bytes.size() - header_size) / record_size;
+    const auto roots = word(data, 14);
+    if (roots > available)
+        throw std::runtime_error("Invalid FRUA vault item count");
+
+    RecordRow summary{0, 0, "Vault contents", {}};
+    field(summary, "Platinum pieces", word(data, 0) | (std::uint32_t(word(data, 2)) << 16));
+    field(summary, "Gems", word(data, 4) | (std::uint32_t(word(data, 6)) << 16));
+    field(summary, "Jewels", word(data, 8) | (std::uint32_t(word(data, 10)) << 16));
+    field(summary, "Stored items and bundles", roots);
+    std::vector<RecordRow> rows;
+    rows.push_back(std::move(summary));
+
+    std::size_t current = 0;
+    auto next_item = [&](unsigned parent) {
+        if (current >= available)
+            throw std::runtime_error("Truncated FRUA vault item or bundle");
+        const auto* item = data + header_size + record_size * current++;
+        const auto slot = static_cast<unsigned>(current);
+        RecordRow row{item[0], slot - 1, {}, {}};
+        // The game concatenates the saved component IDs in reverse byte order.
+        for (unsigned byte : {3u, 2u, 1u}) {
+            const auto id = item[byte];
+            if (!id)
+                continue;
+            if (!row.name.empty())
+                row.name += ' ';
+            if (id < std::size(frua_item_components))
+                row.name += frua_item_components[id];
+            else
+                row.name += '[' + std::to_string(id) + ']';
+        }
+        if (row.name.empty())
+            row.name = item[0] == 'I' && !parent ? "Bundle" : "Item " + std::to_string(slot);
+        if (parent)
+            field(row, "Part of bundle record", parent);
+        field(row, "Stored record", slot);
+        field(row, "Item type", item[0]);
+        row.fields.emplace_back("Name component IDs", std::to_string(item[3]) + ", " +
+            std::to_string(item[2]) + ", " + std::to_string(item[1]));
+        field(row, "Weight", signed_word(word(item, 4)));
+        field(row, "Value", signed_word(word(item, 6)));
+        field(row, "Magic bonus", signed_byte(item[8]));
+        field(row, "Saving throw bonus", signed_byte(item[9]));
+        field(row, "Readied", item[10]);
+        field(row, "Unidentified name mask", item[11]);
+        field(row, "Cursed", item[12]);
+        field(row, item[0] == 'I' && !parent ? "Bundle contents" : "Quantity", item[13]);
+        rows.push_back(std::move(row));
+        return item;
+    };
+    for (unsigned i = 0; i < roots; ++i) {
+        const auto* root = next_item(0);
+        const auto parent = static_cast<unsigned>(current);
+        if (root[0] == 'I') {
+            for (unsigned child = 0; child < root[13]; ++child)
+                next_item(parent);
+        }
+    }
+    if (available != std::max<std::size_t>(current, padded_records))
+        throw std::runtime_error("FRUA vault size does not match its stored records");
+    field(rows.front(), "Records including bundle contents", current);
+    return rows;
+}
+
 std::vector<RecordRow> read_save_rows(const std::filesystem::path& path, RecordKind kind)
 {
     const auto bytes = read_save(path);
@@ -205,6 +282,10 @@ RecordKind record_kind(const std::filesystem::path& path)
     if (name == "MONITM.DAX") return RecordKind::inventory;
     if (name == "ITEM.DAX") return RecordKind::items;
     const auto extension = upper(path.extension().string());
+    const auto stem = upper(path.stem().string());
+    if (extension == ".DAT" && (stem == "VAULT" ||
+        (stem.size() == 6 && stem.compare(0, 5, "VAULT") == 0 && stem.back() >= 'A' && stem.back() <= 'Z')))
+        return RecordKind::vault;
     if (extension == ".SAV") return RecordKind::saved_character;
     if (extension == ".ITM") return RecordKind::saved_inventory;
     if (extension == ".SPC") return RecordKind::saved_effects;
@@ -216,6 +297,8 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
     const auto kind = record_kind(path);
     if (kind == RecordKind::none)
         throw std::runtime_error("Unrecognized DOS record archive");
+    if (kind == RecordKind::vault)
+        return read_vault(path);
     if (kind == RecordKind::saved_character || kind == RecordKind::saved_inventory ||
         kind == RecordKind::saved_effects)
         return read_save_rows(path, kind);
