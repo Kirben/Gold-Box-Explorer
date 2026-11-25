@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(GoldBoxExplorerPortable LANGUAGES CXX)
+project(GoldBoxExplorerPortable VERSION 0.1.0 LANGUAGES CXX)
 
 add_library(goldbox_pictures pictures.cpp geo.cpp walls.cpp records.cpp save_map.cpp tlb.cpp vace.cpp cmp.cpp
     ecl.cpp ecl_containers.cpp amiga_pictures.cpp c64.cpp pc98.cpp xmi.cpp disk_image.cpp)
@@ -22,6 +22,17 @@ if(GOLDBOX_BUILD_GUI)
         include(${wxWidgets_USE_FILE})
     endif()
     add_executable(goldbox-explorer WIN32 MACOSX_BUNDLE gallery.cpp apng.cpp)
+    # The original About dialog artwork, embedded for the standalone gallery.
+    set(about_logo "${CMAKE_CURRENT_SOURCE_DIR}/about-logo.png")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${about_logo}")
+    file(READ "${about_logo}" about_logo_hex HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," about_logo_bytes "${about_logo_hex}")
+    string(REPEAT "0x[0-9a-f][0-9a-f]," 16 about_logo_row)
+    string(REGEX REPLACE "(${about_logo_row})" "\\1\n" about_logo_bytes "${about_logo_bytes}")
+    file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/about_logo.inc"
+        CONTENT "${about_logo_bytes}")
+    target_include_directories(goldbox-explorer PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    target_compile_definitions(goldbox-explorer PRIVATE GOLDBOX_VERSION="${PROJECT_VERSION}")
     target_link_libraries(goldbox-explorer PRIVATE goldbox_pictures ${wxWidgets_LIBRARIES})
     install(TARGETS goldbox-explorer RUNTIME DESTINATION . BUNDLE DESTINATION .)
 endif()
@@ -38,6 +49,6 @@ endif()
 
 install(FILES ../LICENSE DESTINATION .)
 set(CPACK_PACKAGE_NAME "Gold-Box-Explorer-wx")
-set(CPACK_PACKAGE_VERSION "0.1.0")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
 set(CPACK_GENERATOR "ZIP")
 include(CPack)

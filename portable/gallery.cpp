@@ -20,6 +20,7 @@
 #include <wx/filename.h>
 #include <wx/listbox.h>
 #include <wx/listctrl.h>
+#include <wx/mstream.h>
 #include <wx/scrolwin.h>
 #include <wx/splitter.h>
 #include <wx/timer.h>
@@ -504,7 +505,11 @@ public:
         file_menu->Append(wxID_EXIT, "E&xit");
         auto* menu_bar = new wxMenuBar;
         menu_bar->Append(file_menu, "&File");
+        auto* help_menu = new wxMenu;
+        help_menu->Append(wxID_ABOUT, "&About Gold Box Explorer...");
+        menu_bar->Append(help_menu, "&Help");
         SetMenuBar(menu_bar);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { show_about(); }, wxID_ABOUT);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { Close(); }, wxID_EXIT);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) {
             wxFileDialog dialog(this, "Open disk image", {}, {},
@@ -648,6 +653,40 @@ public:
     }
 
 private:
+    void show_about()
+    {
+        static constexpr unsigned char logo[]{
+#include "about_logo.inc"
+        };
+        wxMemoryInputStream logo_stream(logo, sizeof(logo));
+        wxImage artwork(logo_stream, wxBITMAP_TYPE_PNG);
+        wxDialog dialog(this, wxID_ANY, "About Gold Box Explorer");
+        auto* content = new wxBoxSizer(wxHORIZONTAL);
+        content->Add(new wxStaticBitmap(&dialog, wxID_ANY, wxBitmap(artwork)),
+                     0, wxALL, dialog.FromDIP(9));
+
+        auto* details = new wxBoxSizer(wxVERTICAL);
+        details->Add(new wxStaticText(&dialog, wxID_ANY, "Gold Box Explorer"), 0, wxBOTTOM, dialog.FromDIP(8));
+        details->Add(new wxStaticText(&dialog, wxID_ANY, "Version " GOLDBOX_VERSION),
+                     0, wxBOTTOM, dialog.FromDIP(8));
+        details->Add(new wxStaticText(&dialog, wxID_ANY,
+                     wxString::FromUTF8("Copyright\xc2\xa9 Bil Simser 2010-2013\nCopyright\xc2\xa9 Marainein 2013-2015")),
+                     0, wxBOTTOM, dialog.FromDIP(8));
+        details->Add(new wxTextCtrl(&dialog, wxID_ANY,
+                     "A file explorer-like interface for viewing Gold Box game files from the 1990s. "
+                     "Kudos to Simeon Pilgrim for all his hard work on decrypting many files "
+                     "and reprogramming the DOS version of Curse of the Azure Bonds.",
+                     wxDefaultPosition, dialog.FromDIP(wxSize(270, 120)), wxTE_MULTILINE | wxTE_READONLY),
+                     1, wxEXPAND | wxBOTTOM, dialog.FromDIP(8));
+        auto* ok = new wxButton(&dialog, wxID_OK, "&OK");
+        details->Add(ok, 0, wxALIGN_RIGHT);
+        ok->SetDefault();
+        content->Add(details, 1, wxEXPAND | wxALL, dialog.FromDIP(9));
+        dialog.SetSizerAndFit(content);
+        dialog.CentreOnParent();
+        dialog.ShowModal();
+    }
+
     static wxSplitterWindow* make_splitter(wxWindow* parent)
     {
         auto* splitter = new wxSplitterWindow(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize,
