@@ -222,6 +222,33 @@ void tlb(const fs::path& dir)
     write(dir / "CPIC0001.TLB", tlb_library("TILE", {tlb_image(21, {32, 32, 32, 32})}));
     check(read_tlb(dir / "CPIC0001.TLB").frames[0].rgba[0] == 10,
           "FRUA combat icon did not load the companion palette");
+
+    const auto scene_archive = [](unsigned sets) {
+        Bytes ids{static_cast<std::uint8_t>(sets), 0};
+        std::vector<Bytes> members;
+        for (unsigned i = 1; i <= sets; ++i) {
+            const auto id = static_cast<std::uint8_t>(i);
+            ids.insert(ids.end(), {id, 0, id, 0});
+            const Bytes palette{5, 0, 32, 0, 1, 0, 0, 24, id, 0, 0};
+            auto overlay = tlb_image(21, {255, 4, 255, 255});
+            overlay[4] = overlay[5] = 255; // Signed X origin of -1.
+            members.push_back(tlb_library("TILE", {palette, tlb_image(16, {32, 32, 32, 32}), overlay}));
+        }
+        members.insert(members.begin(), std::move(ids));
+        return tlb_library("HLIB", members, true);
+    };
+    write(dir / "DQK.EXE", {});
+    write(dir / "TITLE.TLB", scene_archive(10));
+    const auto titles = read_tlb(dir / "TITLE.TLB");
+    check(titles.frames.size() == 8 && titles.frames[0].width == 320 &&
+          titles.frames[0].height == 200 && titles.frames[0].rgba[0] == 2 &&
+          titles.frames[0].rgba[8] == 171 && titles.frames[0].rgba[12] == 2,
+          "Dark Queen title did not compose the placed overlay with its palette");
+    write(dir / "FINAL.TLB", scene_archive(3));
+    const auto endings = read_tlb(dir / "FINAL.TLB");
+    check(endings.frames.size() == 6 && endings.frames[0].rgba[0] == 1 &&
+          endings.frames[1].rgba[8] == 171 && endings.frames[2].rgba[0] == 3 &&
+          endings.frames[4].rgba[0] == 2, "Dark Queen ending scene order or layer composition mismatch");
 }
 
 void geo_glb(const fs::path& dir)

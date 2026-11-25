@@ -264,13 +264,15 @@ Frame decode_image(Slice image, unsigned method, unsigned id, unsigned index, co
     return frame;
 }
 
-void draw_map_tile(Frame& map, const Frame& tile, int x, int y)
+void draw_layer(Frame& target, const Frame& layer, int x, int y)
 {
-    for (int row = std::max(0, -y); row < std::min(8, static_cast<int>(map.height) - y); ++row) {
-        for (int col = std::max(0, -x); col < std::min(8, static_cast<int>(map.width) - x); ++col) {
-            const auto* pixel = tile.rgba.data() + (row * 8 + col) * 4;
+    const auto right = std::min(static_cast<int>(layer.width), static_cast<int>(target.width) - x);
+    const auto bottom = std::min(static_cast<int>(layer.height), static_cast<int>(target.height) - y);
+    for (int row = std::max(0, -y); row < bottom; ++row) {
+        for (int col = std::max(0, -x); col < right; ++col) {
+            const auto* pixel = layer.rgba.data() + (row * layer.width + col) * 4;
             if (pixel[3])
-                std::copy_n(pixel, 4, map.rgba.data() + ((y + row) * map.width + x + col) * 4);
+                std::copy_n(pixel, 4, target.rgba.data() + ((y + row) * target.width + x + col) * 4);
         }
     }
 }
@@ -295,7 +297,7 @@ void place_glyph(const Library& library, unsigned item, int x, int y, const Pale
     case 25:
         for (unsigned i = 0, count = 1; i < count; ++i) {
             const auto part = image.part(8 + 6 * i, 6);
-            place_glyph(library, part.byte(0), x + part.signed_word(4),
+            place_glyph(library, part.byte(0) + library.first_item(), x + part.signed_word(4),
                         y + part.signed_word(2), palette, components, depth + 1);
             count = part.byte(1);
         }
@@ -332,16 +334,8 @@ Frame compose_glyph(const Library& library, unsigned item, unsigned id, unsigned
     if (width > 1024 || height > 1024)
         throw std::runtime_error("Invalid TLB composite dimensions");
     Frame frame{id, index, width, height, Bytes(width * height * 4)};
-    for (const auto& part : components) {
-        for (unsigned y = 0; y < part.frame.height; ++y) {
-            for (unsigned x = 0; x < part.frame.width; ++x) {
-                const auto* source = part.frame.rgba.data() + 4 * (y * part.frame.width + x);
-                const auto target = 4 * ((part.y - top + y) * width + part.x - left + x);
-                if (source[3])
-                    std::copy_n(source, 4, frame.rgba.data() + target);
-            }
-        }
-    }
+    for (const auto& part : components)
+        draw_layer(frame, part.frame, part.x - left, part.y - top);
     return frame;
 }
 
@@ -371,6 +365,84 @@ void read_tiles(const Library& library, bool external_only, Palette& palette,
             result.skipped_ids.push_back(id);
     }
 }
+
+Palette dark_queen_palette(const fs::path& folder)
+{
+    auto palette = default_palette();
+    std::fill(palette.begin() + 16, palette.end(), Color{0, 0, 0, 255});
+    if (const auto always = map_companion(folder, "DISK1", "ALWAYS.TLB")) {
+        const auto bytes = read_bytes(*always);
+        const Library system({bytes.data(), bytes.size()});
+        const auto colors = system.item(system.first_item());
+        if (!system.data.tag(12, "TILE") || colors.byte(7) != 24)
+            throw std::runtime_error("Invalid ALWAYS.TLB system palette");
+        apply_palette(colors, palette);
+    }
+    return palette;
+}
+
+Library scene_set(const Library& library, unsigned id)
+{
+    const auto entry = std::find_if(library.directory.begin(), library.directory.end(),
+                                    [id](const auto& item) { return item.first == id; });
+    if (entry == library.directory.end() || !entry->second || entry->second >= library.ids.size())
+        throw std::runtime_error("Missing Dark Queen TLB scene set");
+    Library set(library.item(entry->second));
+    if (!set.data.tag(12, "TILE") || set.ids.size() <= set.first_item() + 1)
+        throw std::runtime_error("Invalid Dark Queen TLB scene set");
+    return set;
+}
+
+void draw_scene_glyph(Frame& canvas, const Library& set, unsigned index, const Palette& palette)
+{
+    if (set.item(index).byte(7) == 24)
+        return;
+    std::vector<Component> parts;
+    place_glyph(set, index, 0, 0, palette, parts, 0);
+    for (const auto& part : parts)
+        draw_layer(canvas, part.frame, part.x, part.y);
+}
+
+PictureArchive read_dark_queen_scenes(const Library& library, const Palette& system, bool title)
+{
+    PictureArchive result;
+    if (title) {
+        for (unsigned scene = 1; scene <= 8; ++scene) {
+            const auto base = scene_set(library, scene <= 3 ? 1 : 5);
+            const auto overlay = scene_set(library, scene + (scene <= 3 ? 1 : 2));
+            auto palette = system;
+            apply_palette(base.item(base.first_item()), palette);
+            apply_palette(overlay.item(overlay.first_item()), palette);
+            Frame canvas{scene, 0, 320, 200, Bytes(320 * 200 * 4)};
+            draw_scene_glyph(canvas, base, base.first_item() + 1, palette);
+            for (unsigned i = overlay.first_item() + 1; i < overlay.ids.size(); ++i)
+                draw_scene_glyph(canvas, overlay, i, palette);
+            result.frames.push_back(std::move(canvas));
+        }
+    } else {
+        for (unsigned scene : {1u, 3u, 2u}) {
+            const auto set = scene_set(library, scene);
+            auto palette = system;
+            apply_palette(set.item(set.first_item()), palette);
+            const auto first = set.first_item() + 1;
+            const auto backdrop = set.item(first);
+            const auto width = backdrop.byte(6) * 4;
+            const auto height = backdrop.word(0);
+            if (!width || !height || width > 640 || height > 400)
+                throw std::runtime_error("Invalid Dark Queen ending backdrop");
+            Frame canvas{0, 0, width, height, Bytes(width * height * 4)};
+            draw_scene_glyph(canvas, set, first, palette);
+            for (auto i = first; i < set.ids.size(); ++i) {
+                auto frame = canvas;
+                frame.id = static_cast<unsigned>(result.frames.size() + 1);
+                if (i != first)
+                    draw_scene_glyph(frame, set, i, palette);
+                result.frames.push_back(std::move(frame));
+            }
+        }
+    }
+    return result;
+}
 }
 
 bool is_tlb_archive(const fs::path& path)
@@ -384,6 +456,13 @@ PictureArchive read_tlb(const fs::path& path)
     const Library library({bytes.data(), bytes.size()});
     auto palette = default_palette();
     const auto name = upper(path.filename().string());
+    if ((name == "TITLE.TLB" || name == "FINAL.TLB") && library.data.tag(12, "HLIB")) {
+        const auto folder = fs::absolute(path).parent_path();
+        const auto disk = upper(folder.filename().string());
+        const auto root = disk == "DISK1" || disk == "DISK2" || disk == "DISK3" ? folder.parent_path() : folder;
+        if (find_resource(root, "DQK.EXE"))
+            return read_dark_queen_scenes(library, dark_queen_palette(folder), name == "TITLE.TLB");
+    }
     const bool external_only = name.compare(0, 4, "CPIC") == 0 && name != "CPIC.TLB";
     if (external_only || name == "CBODY.TLB") {
         if (const auto companion = combat_palette_path(path))
@@ -428,17 +507,7 @@ PictureArchive read_geo_glb(const fs::path& path)
     if (!tile_set.data.tag(12, "TILE") || tile_set.ids.size() < tile_set.first_item() + 17)
         throw std::runtime_error("Invalid TOPVIEW.TLB map tile library");
 
-    auto palette = default_palette();
-    // The game draws the overhead tiles using the system colors in ALWAYS.TLB.
-    std::fill(palette.begin() + 16, palette.end(), Color{0, 0, 0, 255});
-    if (const auto always = map_companion(folder, "DISK1", "ALWAYS.TLB")) {
-        const auto system_bytes = read_bytes(*always);
-        const Library system({system_bytes.data(), system_bytes.size()});
-        const auto colors = system.item(system.first_item());
-        if (!system.data.tag(12, "TILE") || colors.byte(7) != 24)
-            throw std::runtime_error("Invalid ALWAYS.TLB system palette");
-        apply_palette(colors, palette);
-    }
+    const auto palette = dark_queen_palette(folder);
 
     constexpr unsigned tile_size = 8;
     std::array<Frame, 16> tiles;
@@ -470,7 +539,7 @@ PictureArchive read_geo_glb(const fs::path& path)
             const auto glyph = (ne[cell] > 15 ? 1 : 0) | ((ne[cell] & 15) ? 2 : 0) |
                                (sw[cell] > 15 ? 4 : 0) | ((sw[cell] & 15) ? 8 : 0);
             const auto [dx, dy] = offsets[glyph];
-            draw_map_tile(map, tiles[glyph], static_cast<int>(cell % cols * tile_size) + dx,
+            draw_layer(map, tiles[glyph], static_cast<int>(cell % cols * tile_size) + dx,
                           static_cast<int>(cell / cols * tile_size) + dy);
         }
         result.frames.push_back(std::move(map));
