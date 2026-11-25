@@ -735,6 +735,30 @@ private:
         return record_list_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
     }
 
+    template<typename MakeContent>
+    bool save_export(const fs::path& source, const wxString& title, const wxString& name,
+                     const wxString& filter, MakeContent make_content)
+    {
+        wxFileDialog dialog(this, title, {}, name, filter, wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+        if (dialog.ShowModal() != wxID_OK)
+            return false;
+        try {
+            std::error_code ec;
+            const auto destination = fs::u8path(dialog.GetPath().ToUTF8().data());
+            if (fs::equivalent(source, destination, ec))
+                throw std::runtime_error("Choose a destination other than the original file.");
+            const auto content = make_content();
+            wxTempFileOutputStream output(dialog.GetPath());
+            if (!output.IsOk() || output.Write(content.data(), content.size()).LastWrite() != content.size() ||
+                !output.Commit())
+                throw std::runtime_error("Could not save the export file.");
+            return true;
+        } catch (const std::exception& error) {
+            wxMessageBox(wxString::FromUTF8(error.what()), title, wxOK | wxICON_ERROR, this);
+            return false;
+        }
+    }
+
     void export_script_listing(bool all)
     {
         const auto archive_index = files_->GetSelection();
@@ -761,24 +785,10 @@ private:
             name += wxString::Format("-script-%02X.txt", script.id);
             goldbox::write_ecl_listing(listing, script);
         }
-        const auto text = listing.str();
-        wxFileDialog dialog(this, all ? "Export All Scripts" : "Export Selected Script", {}, name,
-                            "Text files (*.txt)|*.txt", wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
-        if (dialog.ShowModal() != wxID_OK)
-            return;
-        std::error_code ec;
-        const auto destination = fs::u8path(dialog.GetPath().ToUTF8().data());
-        if (fs::equivalent(archive, destination, ec)) {
-            wxMessageBox("Choose a text file other than the original ECL archive.", "Export Scripts",
-                         wxOK | wxICON_ERROR, this);
-            return;
-        }
-        wxTempFileOutputStream output(dialog.GetPath());
-        if (!output.IsOk() || output.Write(text.data(), text.size()).LastWrite() != text.size() || !output.Commit()) {
-            wxMessageBox("Could not save the script listing.", "Export Scripts", wxOK | wxICON_ERROR, this);
-            return;
-        }
-        SetStatusText(wxString::Format("Exported %zu %s", count, count == 1 ? "script" : "scripts"));
+        const auto title = all ? "Export All Scripts" : "Export Selected Script";
+        if (save_export(archive, title, name, "Text files (*.txt)|*.txt",
+                        [&listing] { return listing.str(); }))
+            SetStatusText(wxString::Format("Exported %zu %s", count, count == 1 ? "script" : "scripts"));
     }
 
     void export_audio(bool midi)
@@ -794,24 +804,12 @@ private:
                                    wxString::Format("-sample-%02u.wav", id);
         const auto name = wxString::FromUTF8(archive.stem().u8string()) + suffix;
         const auto title = midi ? "Export Selected Sequence" : "Export Selected Sample";
-        wxFileDialog dialog(this, title, {}, name,
-                            midi ? "MIDI files (*.mid)|*.mid" : "WAV audio (*.wav)|*.wav",
-                            wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
-        if (dialog.ShowModal() != wxID_OK)
-            return;
-        try {
-            std::error_code ec;
-            if (fs::equivalent(archive, fs::u8path(dialog.GetPath().ToUTF8().data()), ec))
-                throw std::runtime_error("Choose a destination other than the original audio file.");
-            const auto data = midi ? goldbox::xmi_sequence_midi(archive, id) : goldbox::sample_wav(archive, id);
-            wxTempFileOutputStream output(dialog.GetPath());
-            if (!output.IsOk() || output.Write(data.data(), data.size()).LastWrite() != data.size() || !output.Commit())
-                throw std::runtime_error("Could not save the converted audio file.");
+        const auto filter = midi ? "MIDI files (*.mid)|*.mid" : "WAV audio (*.wav)|*.wav";
+        if (save_export(archive, title, name, filter, [&] {
+                return midi ? goldbox::xmi_sequence_midi(archive, id) : goldbox::sample_wav(archive, id);
+            }))
             SetStatusText(midi ? wxString::Format("Exported sequence %u as MIDI", id + 1) :
                                  wxString::Format("Exported sample %u as WAV", id));
-        } catch (const std::exception& error) {
-            wxMessageBox(wxString::FromUTF8(error.what()), title, wxOK | wxICON_ERROR, this);
-        }
     }
 
     void browse(const fs::path& folder, const fs::path& selected)
