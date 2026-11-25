@@ -40,8 +40,9 @@ int main(int argc, char** argv)
                 continue;
             }
             const bool tlb = goldbox::is_tlb_archive(argv[arg]);
+            const bool glb = goldbox::is_geo_glb(argv[arg]);
             const bool vace = goldbox::is_vace_archive(argv[arg]);
-            if (!tlb && !vace && !goldbox::is_picture_archive(argv[arg])) {
+            if (!tlb && !glb && !vace && !goldbox::is_picture_archive(argv[arg])) {
                 const auto records = goldbox::read_dax(argv[arg]);
                 std::cout << argv[arg] << ": " << records.size() << " records\n";
                 for (const auto& record : records)
@@ -50,8 +51,9 @@ int main(int argc, char** argv)
                 continue;
             }
             const auto archive = tlb ? goldbox::read_tlb(argv[arg])
+                : glb ? goldbox::read_geo_glb(argv[arg])
                 : vace ? goldbox::read_vace(argv[arg]) : goldbox::read_pictures(argv[arg]);
-            std::cout << argv[arg] << ": " << archive.gallery_count() << " frames";
+            std::cout << argv[arg] << ": " << archive.gallery_count() << (glb ? " maps" : " frames");
             if (!archive.skipped_ids.empty()) {
                 std::cout << " (skipped record IDs:";
                 for (const auto id : archive.skipped_ids)

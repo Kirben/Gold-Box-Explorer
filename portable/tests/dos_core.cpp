@@ -223,6 +223,48 @@ void tlb(const fs::path& dir)
           "FRUA combat icon did not load the companion palette");
 }
 
+void geo_glb(const fs::path& dir)
+{
+    const auto disk1 = dir / "disk1";
+    const auto disk2 = dir / "Disk2";
+    const auto disk3 = dir / "DISK3";
+    for (const auto& disk : {disk1, disk2, disk3})
+        fs::create_directories(disk);
+
+    Bytes system_palette{5, 0, 32, 0, 16, 0, 0, 24};
+    std::vector<Bytes> tiles{{1, 0, 0, 0, 0, 0, 0, 24}};
+    for (unsigned i = 0; i < 16; ++i) {
+        system_palette.insert(system_palette.end(), {static_cast<std::uint8_t>(i * 16), 64, 0});
+        Bytes pixels(64, static_cast<std::uint8_t>(32 + i));
+        auto tile = tlb_image(16, pixels);
+        tile[0] = 8;
+        tile[6] = 2;
+        tiles.push_back(std::move(tile));
+    }
+    write(disk1 / "always.tlb", tlb_library("TILE", {system_palette}));
+    write(disk2 / "Topview.tlb", tlb_library("TILE", tiles));
+
+    Bytes area(8 + 4 * 4);
+    area[0] = area[1] = 2;
+    // N, E, S+W, and all walls.
+    area[8] = 0x10;
+    area[9] = 0x01;
+    area[11] = 0x11;
+    area[14] = 0x12;
+    area[15] = 0x34;
+    const auto path = disk3 / "geo.glb";
+    write(path, tlb_library("DATA", {{2, 0, 42, 0, 1, 0, 7, 0, 1, 0}, area}, true));
+    check(is_geo_glb(path) && !is_geo_glb("MONCHA.GLB"), "Unexpected GLB map routing");
+    const auto maps = read_geo_glb(path);
+    check(maps.gallery_count() == 2 && maps.frames[0].id == 42 && maps.frames[1].id == 7 &&
+          maps.frames[0].rgba == maps.frames[1].rgba, "GEO.GLB IDs or their order changed");
+    const auto& map = maps.frames[0];
+    check(map.width == 16 && map.height == 16, "GEO.GLB map dimensions are wrong");
+    check(map.rgba[0] == 16 && map.rgba[1] == 64 && map.rgba[3] == 255 &&
+          map.rgba[8 * 4] == 32 && map.rgba[8 * 16 * 4] == 192 &&
+          map.rgba[(8 * 16 + 8) * 4] == 240, "GEO.GLB tile order, wall mask or palette mismatch");
+}
+
 void vace(const fs::path& dir)
 {
     const Bytes first{64, 1, 200, 0, 0, 0, 128, 2, 3, 2, 1, 2, 255};
@@ -402,6 +444,7 @@ int main(int argc, char** argv)
         if (name == "pictures") pictures(dir);
         else if (name == "ending") ending(dir);
         else if (name == "tlb") tlb(dir);
+        else if (name == "geo-glb") geo_glb(dir);
         else if (name == "vace") vace(dir);
         else if (name == "geo") geo(dir);
         else if (name == "walls") walls(dir);

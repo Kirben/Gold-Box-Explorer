@@ -96,8 +96,10 @@ struct Library {
             table.part(2, 4 * entries);
             for (unsigned i = 0; i < entries; ++i) {
                 const auto index = table.word(4 + 4 * i);
+                const auto id = table.word(2 + 4 * i);
+                directory.emplace_back(id, index);
                 if (index < ids.size() && !ids[index])
-                    ids[index] = table.word(2 + 4 * i);
+                    ids[index] = id;
             }
         }
     }
@@ -112,6 +114,7 @@ struct Library {
     Slice data;
     std::vector<std::uint32_t> offsets;
     std::vector<std::optional<unsigned>> ids;
+    std::vector<std::pair<unsigned, unsigned>> directory;
 };
 
 Palette default_palette()
@@ -150,6 +153,34 @@ std::optional<fs::path> combat_palette_path(const fs::path& archive)
                 return it->path();
         }
     }
+    return {};
+}
+
+std::optional<fs::path> find_resource(const fs::path& folder, const char* name, bool directory = false)
+{
+    std::error_code error;
+    for (fs::directory_iterator it(folder, error), end; !error && it != end; it.increment(error)) {
+        std::error_code entry_error;
+        if (upper(it->path().filename().string()) == name &&
+            (directory ? it->is_directory(entry_error) : it->is_regular_file(entry_error)))
+            return it->path();
+    }
+    return {};
+}
+
+std::optional<fs::path> map_companion(const fs::path& folder, const char* disk, const char* resource)
+{
+    if (const auto local = find_resource(folder, resource))
+        return local;
+    const auto name = upper(folder.filename().string());
+    const auto root = name == "DISK1" || name == "DISK2" || name == "DISK3"
+        ? folder.parent_path() : folder;
+    if (root != folder) {
+        if (const auto flat = find_resource(root, resource))
+            return flat;
+    }
+    if (const auto directory = find_resource(root, disk, true))
+        return find_resource(*directory, resource);
     return {};
 }
 
@@ -231,6 +262,17 @@ Frame decode_image(Slice image, unsigned method, unsigned id, unsigned index, co
         std::copy(color.begin(), color.end(), frame.rgba.data() + 4 * i);
     }
     return frame;
+}
+
+void draw_map_tile(Frame& map, const Frame& tile, int x, int y)
+{
+    for (int row = std::max(0, -y); row < std::min(8, static_cast<int>(map.height) - y); ++row) {
+        for (int col = std::max(0, -x); col < std::min(8, static_cast<int>(map.width) - x); ++col) {
+            const auto* pixel = tile.rgba.data() + (row * 8 + col) * 4;
+            if (pixel[3])
+                std::copy_n(pixel, 4, map.rgba.data() + ((y + row) * map.width + x + col) * 4);
+        }
+    }
 }
 
 struct Component {
@@ -362,6 +404,77 @@ PictureArchive read_tlb(const fs::path& path)
     }
     if (result.frames.empty())
         throw std::runtime_error("The TLB library contains no supported graphics");
+    return result;
+}
+
+bool is_geo_glb(const fs::path& path)
+{
+    return upper(path.filename().string()) == "GEO.GLB";
+}
+
+PictureArchive read_geo_glb(const fs::path& path)
+{
+    const auto bytes = read_bytes(path);
+    const Library maps({bytes.data(), bytes.size()});
+    if (!maps.data.tag(12, "DATA") || maps.first_item() != 1 || maps.directory.empty())
+        throw std::runtime_error("Expected a GEO.GLB map directory");
+
+    const auto folder = fs::absolute(path).parent_path();
+    const auto tile_path = map_companion(folder, "DISK2", "TOPVIEW.TLB");
+    if (!tile_path)
+        throw std::runtime_error("GEO.GLB requires TOPVIEW.TLB in the same folder or on DISK2");
+    const auto tile_bytes = read_bytes(*tile_path);
+    const Library tile_set({tile_bytes.data(), tile_bytes.size()});
+    if (!tile_set.data.tag(12, "TILE") || tile_set.ids.size() < tile_set.first_item() + 17)
+        throw std::runtime_error("Invalid TOPVIEW.TLB map tile library");
+
+    auto palette = default_palette();
+    // The game draws the overhead tiles using the system colors in ALWAYS.TLB.
+    std::fill(palette.begin() + 16, palette.end(), Color{0, 0, 0, 255});
+    if (const auto always = map_companion(folder, "DISK1", "ALWAYS.TLB")) {
+        const auto system_bytes = read_bytes(*always);
+        const Library system({system_bytes.data(), system_bytes.size()});
+        const auto colors = system.item(system.first_item());
+        if (!system.data.tag(12, "TILE") || colors.byte(7) != 24)
+            throw std::runtime_error("Invalid ALWAYS.TLB system palette");
+        apply_palette(colors, palette);
+    }
+
+    constexpr unsigned tile_size = 8;
+    std::array<Frame, 16> tiles;
+    std::array<std::pair<int, int>, 16> offsets;
+    for (unsigned i = 0; i < tiles.size(); ++i) {
+        const auto glyph = tile_set.item(tile_set.first_item() + 1 + i);
+        const auto method = glyph.byte(7);
+        if (glyph.word(0) != tile_size || glyph.byte(6) * 4 != tile_size ||
+            (method != 16 && method != 17 && method != 18 && method != 21 && method != 23))
+            throw std::runtime_error("Invalid TOPVIEW map tile");
+        tiles[i] = decode_image(glyph, method, i, 0, palette);
+        offsets[i] = {-glyph.signed_word(4), -glyph.signed_word(2)};
+    }
+
+    PictureArchive result;
+    for (const auto& [id, index] : maps.directory) {
+        if (!index || index >= maps.ids.size())
+            throw std::runtime_error("Invalid GEO.GLB area index");
+        const auto area = maps.item(index);
+        const auto rows = area.byte(0);
+        const auto cols = area.byte(1);
+        const auto cells = rows * cols;
+        if (!cells || cells > 0x310 || area.size != 8 + 4 * cells)
+            throw std::runtime_error("Invalid GEO.GLB area dimensions");
+        const auto* ne = area.data + 8;
+        const auto* sw = ne + cells;
+        Frame map{id, 0, cols * tile_size, rows * tile_size, Bytes(cells * tile_size * tile_size * 4)};
+        for (unsigned cell = 0; cell < cells; ++cell) {
+            const auto glyph = (ne[cell] > 15 ? 1 : 0) | ((ne[cell] & 15) ? 2 : 0) |
+                               (sw[cell] > 15 ? 4 : 0) | ((sw[cell] & 15) ? 8 : 0);
+            const auto [dx, dy] = offsets[glyph];
+            draw_map_tile(map, tiles[glyph], static_cast<int>(cell % cols * tile_size) + dx,
+                          static_cast<int>(cell / cols * tile_size) + dy);
+        }
+        result.frames.push_back(std::move(map));
+    }
     return result;
 }
 }
