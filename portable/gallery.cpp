@@ -2,6 +2,7 @@
 #include "apng.h"
 #include "tlb.h"
 #include "vace.h"
+#include "cmp.h"
 #include "dax.h"
 #include "geo.h"
 #include "walls.h"
@@ -541,6 +542,7 @@ private:
                (goldbox::is_picture_archive(paths_.at(selected)) ||
                 goldbox::is_tlb_archive(paths_.at(selected)) ||
                 goldbox::is_geo_glb(paths_.at(selected)) ||
+                goldbox::is_cmp_archive(paths_.at(selected)) ||
                 goldbox::is_vace_archive(paths_.at(selected)));
     }
 
@@ -672,9 +674,10 @@ private:
         const bool wall = selected != wxNOT_FOUND && goldbox::is_wall_archive(paths_.at(selected));
         const bool tlb = selected != wxNOT_FOUND && goldbox::is_tlb_archive(paths_.at(selected));
         const bool glb = selected != wxNOT_FOUND && goldbox::is_geo_glb(paths_.at(selected));
+        const bool cmp = selected != wxNOT_FOUND && goldbox::is_cmp_archive(paths_.at(selected));
         const bool vace = selected != wxNOT_FOUND && goldbox::is_vace_archive(paths_.at(selected));
         const bool picture = selected != wxNOT_FOUND &&
-            (wall || tlb || glb || vace || goldbox::is_picture_archive(paths_.at(selected)));
+            (wall || tlb || glb || cmp || vace || goldbox::is_picture_archive(paths_.at(selected)));
         show_view(picture, selected != wxNOT_FOUND && !picture);
         SetStatusText("Choose a file to inspect.");
         if (selected != wxNOT_FOUND) {
@@ -742,6 +745,7 @@ private:
                 auto archive = wall ? goldbox::PictureArchive{goldbox::read_wall_pieces(path), {}}
                                     : tlb ? goldbox::read_tlb(path)
                                     : glb ? goldbox::read_geo_glb(path)
+                                    : cmp ? goldbox::read_cmp(path)
                                     : vace ? goldbox::read_vace(path) : goldbox::read_pictures(path);
                 if (archive.frames.empty())
                     throw std::runtime_error("Archive contains no wall pieces");
@@ -751,13 +755,15 @@ private:
                 for (std::size_t i = 0; i < count; ++i) {
                     const auto& frame = frames_[i];
                     const auto label = glb ? wxString::Format("Map %u", frame.id)
+                        : cmp && count > 1 ? wxString::Format("Tile %u", frame.id)
                         : vace ? wxString::Format("Frame %u", frame.index + 1)
                         : wxString::Format(wall ? "$%02X   Piece %u" : "$%02X   Frame %u",
                                            frame.id, frame.index + 1);
                     pictures_->Append(label);
                 }
                 pictures_->SetSelection(0);
-                auto status = wxString::Format(glb ? "%zu maps" : "%zu picture frames", count);
+                auto status = wxString::Format(glb ? "%zu maps" : cmp && count > 1 ? "%zu tiles" :
+                                               "%zu picture frames", count);
                 if (!clips_.empty())
                     status += wxString::Format("   |   %zu animations", clips_.size());
                 if (!archive.skipped_ids.empty())
@@ -765,7 +771,7 @@ private:
                 SetStatusText(status);
             } catch (const std::exception& error) {
                 auto message = wxString::FromUTF8(error.what());
-                if (archive_file || tlb || glb || vace || kind != goldbox::RecordKind::none || world) {
+                if (archive_file || tlb || glb || cmp || vace || kind != goldbox::RecordKind::none || world) {
                     try {
                         hex_->open(paths_.at(selected));
                         show_view(false, true);

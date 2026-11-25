@@ -6,6 +6,7 @@
 #include "walls.h"
 #include "tlb.h"
 #include "vace.h"
+#include "cmp.h"
 
 #include <algorithm>
 #include <fstream>
@@ -265,6 +266,41 @@ void geo_glb(const fs::path& dir)
           map.rgba[(8 * 16 + 8) * 4] == 240, "GEO.GLB tile order, wall mask or palette mismatch");
 }
 
+void cmp(const fs::path& dir)
+{
+    const auto file = [](unsigned order, Bytes runs) {
+        const auto length = runs.size() + 1;
+        Bytes result{static_cast<std::uint8_t>(length), static_cast<std::uint8_t>(length >> 8),
+                     static_cast<std::uint8_t>(order)};
+        result.insert(result.end(), runs.begin(), runs.end());
+        return result;
+    };
+    const auto title = dir / "title.cmp";
+    write(title, file(2, {1, 0x51, 255, 0x2c, 0, 0xfe, 0x7c, 0}));
+    check(is_cmp_archive(title) && !is_cmp_archive("unknown.cmp"), "Hillsfar CMP routing mismatch");
+    const auto picture = read_cmp(title);
+    const auto& frame = picture.frames.at(0);
+    check(frame.width == 320 && frame.height == 200 && frame.rgba[0] == 0 &&
+          frame.rgba[3] == 255 && frame.rgba[6] == 170 && frame.rgba[8 * 160 + 1] == 170 &&
+          frame.rgba[8] == 0, "CMP palette, run types or column order mismatch");
+
+    const auto maze = dir / "MAZE2.CMP";
+    write(maze, file(1, {0, 0x20, 0x01, 0x11, 0, 0xe0, 0x7b, 0x22}));
+    const auto tiles = read_cmp(maze);
+    check(tiles.gallery_count() == 48 && tiles.frames.front().width == 24 &&
+          tiles.frames.back().height == 24 && tiles.frames.back().id == 47 &&
+          tiles.frames[0].rgba[2] == 170 && tiles.frames[1].rgba[1] == 170,
+          "CMP maze tile count, stride or order mismatch");
+
+    write(title, file(2, {0, 0x01, 0x7d, 0}));
+    try {
+        read_cmp(title);
+    } catch (const std::runtime_error&) {
+        return;
+    }
+    throw std::runtime_error("CMP accepted a run beyond the raster");
+}
+
 void vace(const fs::path& dir)
 {
     const Bytes first{64, 1, 200, 0, 0, 0, 128, 2, 3, 2, 1, 2, 255};
@@ -445,6 +481,7 @@ int main(int argc, char** argv)
         else if (name == "ending") ending(dir);
         else if (name == "tlb") tlb(dir);
         else if (name == "geo-glb") geo_glb(dir);
+        else if (name == "cmp") cmp(dir);
         else if (name == "vace") vace(dir);
         else if (name == "geo") geo(dir);
         else if (name == "walls") walls(dir);
