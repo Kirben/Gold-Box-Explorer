@@ -472,7 +472,7 @@ void add_final_clip(const std::vector<DaxRecord>& records, PictureArchive& archi
 
 bool is_picture_archive(const std::filesystem::path& path)
 {
-    if (is_pc98_title(path))
+    if (is_pc98_title(path) || is_amiga_ilbm(path))
         return true;
     static const std::regex daa(
         R"((8X8D|BACK|BIGPIC|BODY|BORDERS?|COMSPR|CPIC|DUNGCOM|HEAD|HITEK|LOTEK|MARSCOM|PIC|RANDCOM|SHIPS|SKY|SPACETVL|SPRIT|VENUSCOM|WILDCOM)[0-9]*\.DAA)",
@@ -534,6 +534,8 @@ std::vector<DaxRecord> read_dax(const std::filesystem::path& path)
 
 PictureArchive read_pictures(const std::filesystem::path& path)
 {
+    if (is_amiga_ilbm(path))
+        return read_amiga_ilbm(path);
     if (is_pc98_title(path))
         return read_pc98_title(path);
     if (auto amiga = try_amiga_pictures(path))

@@ -984,6 +984,54 @@ void c64_assets(const fs::path& dir)
 }
 }
 
+static void ilbm(const fs::path& dir)
+{
+    auto fixture = [](unsigned masking, bool packed, const Bytes& pixels) {
+        Bytes file{'F','O','R','M',0,0,0,0,'I','L','B','M'};
+        auto chunk = [&](std::string_view id, const Bytes& data) {
+            file.insert(file.end(), id.begin(), id.end());
+            const auto n = static_cast<unsigned>(data.size());
+            for (unsigned shift : {24, 16, 8, 0})
+                file.push_back(static_cast<std::uint8_t>(n >> shift));
+            file.insert(file.end(), data.begin(), data.end());
+            if (n & 1)
+                file.push_back(0);
+        };
+        Bytes header{0,3,0,1,0,0,0,0,1,0,0,0,0,0,1,1,0,3,0,1};
+        header[9] = static_cast<std::uint8_t>(masking);
+        header[10] = packed;
+        chunk("BMHD", header);
+        chunk("ANNO", {'x'});
+        chunk("CMAP", {0,0,0,0xf0,0x90,0x80});
+        chunk("BODY", pixels);
+        const auto n = static_cast<unsigned>(file.size() - 8);
+        for (unsigned i = 0; i < 4; ++i)
+            file[4 + i] = static_cast<std::uint8_t>(n >> (24 - 8 * i));
+        return file;
+    };
+    const auto masked = dir / "masked.LBM";
+    write(masked, fixture(1, true, {128,1,0xa0,0, 255,0x60}));
+    check(is_picture_archive(masked), "ILBM was not routed to the picture gallery");
+    const auto image = read_pictures(masked);
+    const auto& frame = image.frames.at(0);
+    check(frame.width == 3 && frame.height == 1 &&
+          frame.rgba == Bytes{255,153,136,0, 0,0,0,255, 255,153,136,255},
+          "ILBM scanline padding, palette, or mask changed");
+    const auto keyed = dir / "keyed.iff";
+    write(keyed, fixture(2, false, {0xa0,0}));
+    check(read_pictures(keyed).frames.at(0).rgba ==
+          Bytes{255,153,136,255, 0,0,0,0, 255,153,136,255},
+          "ILBM transparent colour was not applied");
+    write(masked, fixture(1, true, {253,0}));
+    bool rejected = false;
+    try {
+        read_pictures(masked);
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    check(rejected, "ILBM accepted a ByteRun1 run crossing bitplane rows");
+}
+
 int main(int argc, char** argv)
 {
     try {
@@ -1003,6 +1051,7 @@ int main(int argc, char** argv)
         else if (name == "items") item_archives(dir);
         else if (name == "ecl") ecl_scripts(dir);
         else if (name == "c64") c64_assets(dir);
+        else if (name == "ilbm") ilbm(dir);
         else if (name == "vace") vace(dir);
         else if (name == "geo") geo(dir);
         else if (name == "walls") walls(dir);

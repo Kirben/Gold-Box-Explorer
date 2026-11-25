@@ -8,6 +8,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace goldbox {
 namespace {
@@ -146,11 +147,10 @@ void append_record(const DaxRecord& record, const Format& format, PictureArchive
                                         image.width_bytes / pieces, nullptr, palette, format.transparent));
 }
 
-Bytes expand_daa(const Bytes& file, std::size_t begin, std::size_t end, std::size_t limit,
-                 bool packbits)
+void append_amiga_runs(const Bytes& file, std::size_t& begin, std::size_t end,
+                       std::size_t limit, bool packbits, bool stop_at_limit, Bytes& bytes)
 {
-    Bytes bytes;
-    while (begin < end) {
+    while (begin < end && (!stop_at_limit || bytes.size() < limit)) {
         const auto command = file[begin++];
         if (packbits && command == 128)
             continue;
@@ -158,13 +158,20 @@ Bytes expand_daa(const Bytes& file, std::size_t begin, std::size_t end, std::siz
         const unsigned count = literal ? command + 1 : (packbits ? 257 : 256) - command;
         const unsigned stored = literal ? count : 1;
         if (stored > end - begin || count > limit - bytes.size())
-            throw std::runtime_error("Invalid Amiga DAA run");
+            throw std::runtime_error("Invalid Amiga picture run");
         if (literal)
             bytes.insert(bytes.end(), file.begin() + begin, file.begin() + begin + count);
         else
             bytes.insert(bytes.end(), count, file[begin]);
         begin += stored;
     }
+}
+
+Bytes expand_daa(const Bytes& file, std::size_t begin, std::size_t end, std::size_t limit,
+                 bool packbits)
+{
+    Bytes bytes;
+    append_amiga_runs(file, begin, end, limit, packbits, false, bytes);
     return bytes;
 }
 
@@ -309,6 +316,117 @@ PictureArchive read_daa(const std::filesystem::path& path, const std::string& st
     }
     return archive;
 }
+}
+
+bool is_amiga_ilbm(const std::filesystem::path& path)
+{
+    auto extension = path.extension().string();
+    for (auto& c : extension)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (extension != ".lbm" && extension != ".iff" && extension != ".ilbm")
+        return false;
+    std::ifstream stream(path, std::ios::binary);
+    std::array<char, 12> header{};
+    return stream.read(header.data(), header.size()) &&
+        std::string_view(header.data(), 4) == "FORM" &&
+        std::string_view(header.data() + 8, 4) == "ILBM";
+}
+
+PictureArchive read_amiga_ilbm(const std::filesystem::path& path)
+{
+    std::ifstream stream(path, std::ios::binary);
+    const Bytes file{std::istreambuf_iterator<char>(stream), {}};
+    if (file.size() < 12)
+        throw std::runtime_error("Truncated Amiga ILBM FORM");
+    const auto form_size = dword(file, 4);
+    if (form_size < 4 || form_size > file.size() - 8)
+        throw std::runtime_error("Invalid Amiga ILBM FORM size");
+    const auto form_end = std::size_t(8) + form_size;
+    std::size_t header = 0, body = 0, body_end = 0, palette = 0, palette_size = 0;
+    std::uint32_t mode = 0;
+    for (std::size_t at = 12; at < form_end;) {
+        if (form_end - at < 8)
+            throw std::runtime_error("Truncated Amiga ILBM chunk header");
+        const std::string_view tag(reinterpret_cast<const char*>(file.data() + at), 4);
+        const auto size = std::size_t(dword(file, at + 4));
+        at += 8;
+        if (size > form_end - at || (size & 1) > form_end - at - size)
+            throw std::runtime_error("Amiga ILBM chunk extends beyond FORM");
+        if (tag == "BMHD" && size >= 20)
+            header = at;
+        else if (tag == "CMAP" && size % 3 == 0) {
+            palette = at;
+            palette_size = size;
+        } else if (tag == "CAMG" && size == 4)
+            mode = dword(file, at);
+        else if (tag == "BODY") {
+            body = at;
+            body_end = at + size;
+            break;
+        }
+        at += size + (size & 1);
+    }
+    if (!header || !body)
+        throw std::runtime_error("Amiga ILBM requires BMHD and BODY chunks");
+    const unsigned width = word(file, header), height = word(file, header + 2);
+    const unsigned planes = file[header + 8], masking = file[header + 9], compression = file[header + 10];
+    if (!width || !height || std::uint64_t(width) * height > 16 * 1024 * 1024 ||
+        !planes || planes > 8 || masking > 2 || compression > 1 ||
+        ((planes == 6 || planes == 8) && (mode & 0x0800)))
+        throw std::runtime_error("Unsupported Amiga ILBM dimensions, masking, compression or display mode");
+
+    const unsigned colors = 1u << planes;
+    const bool half_brite = planes == 6 && (mode & 0x0080);
+    const unsigned base_colors = half_brite ? colors / 2 : colors;
+    // Early Deluxe Paint writes Amiga's 4-bit channels in the high nibble.
+    const bool four_bit = palette_size && std::all_of(file.begin() + palette,
+        file.begin() + palette + palette_size, [](auto channel) { return (channel & 15) == 0; });
+    std::array<std::array<std::uint8_t, 3>, 256> rgb{};
+    for (unsigned index = 0; index < base_colors; ++index)
+        for (unsigned c = 0; c < 3; ++c) {
+            const unsigned offset = index * 3 + c;
+            const unsigned channel = offset < palette_size ? file[palette + offset] :
+                (palette_size ? 0 : index * 255 / (base_colors - 1));
+            rgb[index][c] = static_cast<std::uint8_t>(four_bit ? channel | (channel >> 4) : channel);
+            if (half_brite)
+                rgb[index + base_colors][c] = static_cast<std::uint8_t>(
+                    four_bit ? (channel >> 5) * 17 : channel / 2);
+        }
+
+    const unsigned stride = ((width + 15) / 16) * 2;
+    const unsigned scanline_size = stride * (planes + (masking == 1));
+    const unsigned transparent = word(file, header + 12);
+    Frame frame{0, 0, width, height, Bytes(std::size_t(width) * height * 4)};
+    auto at = body;
+    Bytes row;
+    row.reserve(scanline_size);
+    for (unsigned y = 0; y < height; ++y) {
+        row.clear();
+        if (compression) {
+            for (unsigned limit = stride; limit <= scanline_size; limit += stride)
+                append_amiga_runs(file, at, body_end, limit, true, true, row);
+        } else if (scanline_size <= body_end - at) {
+            row.assign(file.begin() + at, file.begin() + at + scanline_size);
+            at += scanline_size;
+        }
+        if (row.size() != scanline_size)
+            throw std::runtime_error("Truncated Amiga ILBM scanline");
+        for (unsigned x = 0; x < width; ++x) {
+            const unsigned bit = 0x80 >> (x % 8);
+            unsigned index = 0;
+            for (unsigned plane = 0; plane < planes; ++plane)
+                if (row[plane * stride + x / 8] & bit)
+                    index |= 1u << plane;
+            auto* pixel = frame.rgba.data() + (std::size_t(y) * width + x) * 4;
+            std::copy(rgb[index].begin(), rgb[index].end(), pixel);
+            const bool visible = (masking != 1 || (row[planes * stride + x / 8] & bit)) &&
+                                 (masking != 2 || index != transparent);
+            pixel[3] = visible ? 255 : 0;
+        }
+    }
+    PictureArchive archive;
+    archive.frames.push_back(std::move(frame));
+    return archive;
 }
 
 std::optional<PictureArchive> try_amiga_pictures(const std::filesystem::path& path)
