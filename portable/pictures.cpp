@@ -1,4 +1,5 @@
 #include "pictures.h"
+#include "amiga_pictures.h"
 #include "dax.h"
 
 #include <algorithm>
@@ -504,6 +505,8 @@ std::vector<DaxRecord> read_dax(const std::filesystem::path& path)
 
 PictureArchive read_pictures(const std::filesystem::path& path)
 {
+    if (auto amiga = try_amiga_pictures(path))
+        return std::move(*amiga);
     PictureArchive archive;
     const auto filename = path.filename().string();
     static const std::regex animated_pictures(R"(PIC[0-9]*[A-Z]?\.DAX)", std::regex::icase);

@@ -1,4 +1,6 @@
 #include "walls.h"
+#include "amiga_pictures.h"
+#include "ecl_containers.h"
 
 #include <algorithm>
 #include <cctype>
@@ -15,6 +17,78 @@ std::string upper(std::string name)
     for (auto& c : name)
         c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     return name;
+}
+
+std::vector<Frame> compose_pieces(const DaxRecord& record, const std::vector<const Frame*>& bank, bool amiga)
+{
+    constexpr unsigned offsets[] = {0, 2, 6, 10, 22, 38, 54, 110, 132, 154};
+    constexpr unsigned widths[] = {1, 1, 1, 3, 2, 2, 7, 2, 2, 1};
+    constexpr unsigned heights[] = {2, 4, 4, 4, 8, 8, 8, 11, 11, 2};
+    std::vector<Frame> pieces;
+    for (std::size_t start = 0; start < record.bytes.size(); start += 156) {
+        for (unsigned view = 0; view < 10; ++view) {
+            Frame frame{record.id, static_cast<unsigned>(pieces.size()), widths[view] * 8, heights[view] * 8, {}};
+            frame.rgba.resize(frame.width * frame.height * 4);
+            for (unsigned row = 0; row < heights[view]; ++row) {
+                for (unsigned col = 0; col < widths[view]; ++col) {
+                    const auto index = record.bytes[start + offsets[view] + row * widths[view] + col];
+                    if (amiga && index >= bank.size())
+                        throw std::runtime_error("Amiga wall tile index outside its banks");
+                    for (unsigned y = 0; y < 8; ++y) {
+                        auto dest = frame.rgba.begin() + 4 * ((row * 8 + y) * frame.width + col * 8);
+                        if (index && index < bank.size())
+                            std::copy_n(bank[index]->rgba.begin() + y * 32, 32, dest);
+                        else if (!index && !amiga) {
+                            for (unsigned x = 0; x < 8; ++x) {
+                                *dest++ = 255; *dest++ = 82; *dest++ = 255; *dest++ = 255;
+                            }
+                        }
+                    }
+                }
+            }
+            pieces.push_back(std::move(frame));
+        }
+    }
+    return pieces;
+}
+
+std::vector<Frame> amiga_walls(const fs::path& path, const std::vector<DaxRecord>& records)
+{
+    const auto folder = path.has_parent_path() ? path.parent_path() : fs::path(".");
+    const auto name = "8X8D" + upper(path.filename().string()).substr(7);
+    for (const auto& file : fs::directory_iterator(folder)) {
+        if (upper(file.path().filename().string()) != name)
+            continue;
+        const auto pictures = try_amiga_pictures(file.path());
+        if (!pictures)
+            break;
+        std::map<unsigned, std::vector<const Frame*>> tiles;
+        for (const auto& tile : pictures->frames) {
+            if (tile.width != 8 || tile.height != 8)
+                throw std::runtime_error("Amiga wall tile is not 8x8");
+            tiles[tile.id].push_back(&tile);
+        }
+        std::vector<Frame> frames;
+        for (const auto& record : records) {
+            if (record.bytes.empty() || record.bytes.size() % 780)
+                throw std::runtime_error("Invalid Amiga wall definition size");
+            std::vector<const Frame*> bank{nullptr};
+            auto append = [&](unsigned id) {
+                const auto found = tiles.find(id);
+                if (found == tiles.end())
+                    throw std::runtime_error("Missing Amiga wall tile bank " + std::to_string(id));
+                bank.insert(bank.end(), found->second.begin(), found->second.end());
+            };
+            append(203);
+            const auto sets = record.bytes.size() / 780;
+            for (unsigned part = 0; part < sets; ++part)
+                append(sets == 1 ? record.id : (record.id ? record.id : 10) * 10 + part + 1);
+            auto pieces = compose_pieces(record, bank, true);
+            frames.insert(frames.end(), std::make_move_iterator(pieces.begin()), std::make_move_iterator(pieces.end()));
+        }
+        return frames;
+    }
+    throw std::runtime_error("Missing companion Amiga " + name);
 }
 
 class WallResources {
@@ -62,9 +136,6 @@ public:
 
     std::vector<Frame> assemble(const DaxRecord& record, const std::string& name)
     {
-        constexpr int offsets[] = {0, 2, 6, 10, 22, 38, 54, 110, 132, 154};
-        constexpr unsigned widths[] = {1, 1, 1, 3, 2, 2, 7, 2, 2, 1};
-        constexpr unsigned heights[] = {2, 4, 4, 4, 8, 8, 8, 11, 11, 2};
         constexpr unsigned slice = 156;
         if (record.bytes.empty() || record.bytes.size() % slice)
             throw std::runtime_error("Invalid wall definition record size");
@@ -93,31 +164,7 @@ public:
         if (bank.size() == 1)
             throw std::runtime_error("No matching 8X8D tiles found for the wall definition");
 
-        std::vector<Frame> pieces;
-        for (std::size_t start = 0; start < record.bytes.size(); start += slice) {
-            for (unsigned view = 0; view < 10; ++view) {
-                Frame frame{record.id, static_cast<unsigned>(pieces.size()),
-                            widths[view] * 8, heights[view] * 8, {}};
-                frame.rgba.resize(frame.width * frame.height * 4);
-                for (unsigned row = 0; row < heights[view]; ++row) {
-                    for (unsigned col = 0; col < widths[view]; ++col) {
-                        const auto index = record.bytes[start + offsets[view] + row * widths[view] + col];
-                        for (unsigned y = 0; y < 8; ++y) {
-                            auto dest = frame.rgba.begin() + 4 * ((row * 8 + y) * frame.width + col * 8);
-                            if (index && index < bank.size())
-                                std::copy_n(bank[index]->rgba.begin() + y * 32, 32, dest);
-                            else if (!index) {
-                                for (unsigned x = 0; x < 8; ++x) {
-                                    *dest++ = 255; *dest++ = 82; *dest++ = 255; *dest++ = 255;
-                                }
-                            }
-                        }
-                    }
-                }
-                pieces.push_back(std::move(frame));
-            }
-        }
-        return pieces;
+        return compose_pieces(record, bank, false);
     }
 
     bool wall_location(unsigned id, std::string& name, const DaxRecord*& record)
@@ -151,6 +198,8 @@ bool is_wall_archive(const fs::path& path)
 
 std::vector<Frame> read_wall_pieces(const fs::path& path)
 {
+    if (const auto amiga = try_amiga_dax(path); !amiga.empty())
+        return amiga_walls(path, amiga);
     WallResources resources(path.parent_path());
     std::vector<Frame> pieces;
     const auto name = upper(path.filename().string());

@@ -5,6 +5,9 @@
 #include "dax.h"
 #include "records.h"
 #include "ecl.h"
+#include "ecl_containers.h"
+#include "geo.h"
+#include "walls.h"
 #include "save_map.h"
 
 #include <iostream>
@@ -59,15 +62,20 @@ int main(int argc, char** argv)
             const bool anm = goldbox::is_anm_archive(argv[arg]);
             const bool packwall = goldbox::is_packwall_archive(argv[arg]);
             const bool vace = goldbox::is_vace_archive(argv[arg]);
-            if (!tlb && !glb && !cmp && !anm && !packwall && !vace && !goldbox::is_picture_archive(argv[arg])) {
-                const auto records = goldbox::read_dax(argv[arg]);
+            const bool wall = goldbox::is_wall_archive(argv[arg]);
+            if (!tlb && !glb && !cmp && !anm && !packwall && !vace && !wall && !goldbox::is_picture_archive(argv[arg])) {
+                auto records = goldbox::is_geo_archive(argv[arg]) ? goldbox::try_amiga_dax(argv[arg]) :
+                               std::vector<goldbox::DaxRecord>{};
+                if (records.empty())
+                    records = goldbox::read_dax(argv[arg]);
                 std::cout << argv[arg] << ": " << records.size() << " records\n";
                 for (const auto& record : records)
                     std::cout << record.id << ' ' << record.stored_size << " stored, "
                               << record.bytes.size() << " decoded\n";
                 continue;
             }
-            const auto archive = tlb ? goldbox::read_tlb(argv[arg])
+            const auto archive = wall ? goldbox::PictureArchive{goldbox::read_wall_pieces(argv[arg]), {}}
+                : tlb ? goldbox::read_tlb(argv[arg])
                 : glb ? goldbox::read_geo_glb(argv[arg])
                 : cmp ? goldbox::read_cmp(argv[arg])
                 : anm ? goldbox::read_anm(argv[arg])

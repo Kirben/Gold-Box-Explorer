@@ -383,7 +383,7 @@ std::vector<RecordRow> read_ecl_rows(const std::filesystem::path& path, std::str
             records.push_back({static_cast<unsigned>(std::stoul(path.stem().string().substr(3), nullptr, 16)),
                                static_cast<unsigned>(file.size()), std::move(file)});
         } else {
-            records = try_amiga_ecl(file);
+            records = try_amiga_dax(file);
             amiga_file = !records.empty();
             if (amiga_file) {
                 if (game.empty())

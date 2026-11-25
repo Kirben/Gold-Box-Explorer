@@ -5,6 +5,7 @@
 #include "cmp.h"
 #include "dax.h"
 #include "geo.h"
+#include "ecl_containers.h"
 #include "walls.h"
 #include "records.h"
 #include "save_map.h"
@@ -30,6 +31,24 @@
 
 namespace {
 namespace fs = std::filesystem;
+
+wxString amiga_map_label(unsigned id)
+{
+    static const char* const names[]{
+        "Civilized Area, New Phlan", "Buccaneer Base", "Cadorna Textile House",
+        "Valjevo Castle, North West", "Valjevo Castle, North East", "Valjevo Castle, South East",
+        "Valjevo Castle, South West", "Valjevo Castle, Inner Tower", nullptr, "Stojanow Gate",
+        "Valhingen Graveyard", nullptr, nullptr, "Kobold Caves", "Kovel Mansion", "Mendor's Library",
+        "Lizard Men Keep", "Nomad Camp", "Podal Plaza", nullptr, "Slums", "Sokal Keep",
+        "Sorcerer's Island, Level 1", "Sorcerer's Island, Level 2 and 3", "Temple of Bane",
+        "Western Wilderness Caves", "Central Wilderness Groves and Ruined Huts", "Eastern Wilderness Caves",
+        "Outpost of Zhentil Keep", "Kuto's Well", "Lizard Men Catacombs", "Wealthy Area",
+        "Kuto's Well Catacombs"
+    };
+    if (id < std::size(names) && names[id])
+        return wxString::FromUTF8(names[id]);
+    return wxString::Format("Map %u", id);
+}
 
 class RecordList : public wxListCtrl {
 public:
@@ -703,7 +722,7 @@ private:
         script_records_ = false;
         banks_.clear();
         preview_->Scroll(0, 0);
-        geo_ = false;
+        geo_ = amiga_geo_ = false;
         saved_map_.reset();
         original_map_->SetValue(false);
         const auto selected = files_->GetSelection();
@@ -758,17 +777,23 @@ private:
                         }
                     }
                     if (archive_file) {
-                        records_ = goldbox::read_dax(path);
+                        geo_ = goldbox::is_geo_archive(path);
+                        if (geo_) {
+                            records_ = goldbox::try_amiga_dax(path);
+                            amiga_geo_ = !records_.empty();
+                        }
+                        if (!amiga_geo_)
+                            records_ = goldbox::read_dax(path);
                         if (!records_.empty()) {
-                            geo_ = goldbox::is_geo_archive(path);
-                            if (geo_ && goldbox::has_geo_trailer(records_)) {
+                            if (geo_ && !amiga_geo_ && goldbox::has_geo_trailer(records_)) {
                                 records_.erase(std::remove_if(records_.begin(), records_.end(),
                                     [](const auto& record) { return record.id >= 253; }), records_.end());
                             }
                             if (!records_.empty()) {
                                 show_view(geo_, !geo_, true);
                                 for (const auto& record : records_)
-                                    pictures_->Append(geo_ ? wxString::Format("Map %u", record.id)
+                                    pictures_->Append(amiga_geo_ && path.stem().u8string().size() == 3
+                                                       ? amiga_map_label(record.id) : geo_ ? wxString::Format("Map %u", record.id)
                                                            : wxString::Format("Record $%02X", record.id));
                                 pictures_->SetSelection(0);
                                 render();
@@ -976,7 +1001,7 @@ private:
             try {
                 const auto map = goldbox::read_geo_map(record);
                 const auto entry = banks_.try_emplace(record.id);
-                if (entry.second) {
+                if (entry.second && !amiga_geo_) {
                     try {
                         entry.first->second = goldbox::load_map_walls(
                             paths_.at(files_->GetSelection()), record.id);
@@ -998,8 +1023,8 @@ private:
                     SetStatusText(wxString::Format("Map %u   |   Camera (%d, %d)   |   Click a square to move",
                                                    record.id, cursor_x_, cursor_y_));
                 } else {
-                    SetStatusText(wxString::Format("Map %u   |   16 x 16   |   No compatible wall set",
-                                                   record.id));
+                    SetStatusText(amiga_geo_ ? pictures_->GetString(selected) + "   |   16 x 16" :
+                        wxString::Format("Map %u   |   16 x 16   |   No compatible wall set", record.id));
                 }
             } catch (const std::exception& error) {
                 show_view(false, true, true);
@@ -1042,6 +1067,7 @@ private:
     std::vector<goldbox::PictureArchive::Clip> clips_;
     std::vector<goldbox::DaxRecord> records_;
     bool geo_ = false;
+    bool amiga_geo_ = false;
     int cursor_x_ = 8;
     int cursor_y_ = 8;
     int picture_width_ = 0;

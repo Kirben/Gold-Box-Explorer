@@ -1,6 +1,8 @@
 #include "ecl_containers.h"
 
 #include <algorithm>
+#include <fstream>
+#include <iterator>
 #include <set>
 #include <stdexcept>
 
@@ -113,7 +115,7 @@ private:
 };
 }
 
-std::vector<DaxRecord> try_amiga_ecl(const Bytes& file)
+std::vector<DaxRecord> try_amiga_dax(const Bytes& file)
 {
     if (file.size() < 12)
         return {};
@@ -177,5 +179,14 @@ std::vector<DaxRecord> try_amiga_glb(const Bytes& file)
         records.push_back({be16(file, at), last - first, Bytes(file.begin() + first, file.begin() + last)});
     }
     return records;
+}
+
+std::vector<DaxRecord> try_amiga_dax(const std::filesystem::path& path)
+{
+    std::ifstream input(path, std::ios::binary);
+    if (!input)
+        throw std::runtime_error("Cannot open DAX archive");
+    const Bytes bytes{std::istreambuf_iterator<char>(input), {}};
+    return try_amiga_dax(bytes);
 }
 }
