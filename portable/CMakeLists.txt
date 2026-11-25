@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(GoldBoxExplorerPortable LANGUAGES CXX)
 
 add_library(goldbox_pictures pictures.cpp geo.cpp walls.cpp records.cpp save_map.cpp tlb.cpp vace.cpp cmp.cpp
-    ecl.cpp ecl_containers.cpp amiga_pictures.cpp)
+    ecl.cpp ecl_containers.cpp amiga_pictures.cpp c64.cpp)
 target_compile_features(goldbox_pictures PUBLIC cxx_std_17)
 target_include_directories(goldbox_pictures PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 
@@ -26,7 +26,7 @@ include(CTest)
 if(BUILD_TESTING)
     add_executable(goldbox-dos-tests tests/dos_core.cpp)
     target_link_libraries(goldbox-dos-tests PRIVATE goldbox_pictures)
-    foreach(section IN ITEMS pictures geo walls records saves tlb vace ending geo-glb cmp packwall anm vault monsters items ecl)
+    foreach(section IN ITEMS pictures geo walls records saves tlb vace ending geo-glb cmp packwall anm vault monsters items ecl c64)
         add_test(NAME dos-${section} COMMAND goldbox-dos-tests
             ${section} "${CMAKE_CURRENT_BINARY_DIR}/fixtures/${section}")
     endforeach()

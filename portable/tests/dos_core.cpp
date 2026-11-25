@@ -3,6 +3,7 @@
 #include "pictures.h"
 #include "records.h"
 #include "ecl.h"
+#include "c64.h"
 #include "save_map.h"
 #include "walls.h"
 #include "tlb.h"
@@ -801,6 +802,38 @@ void ecl_scripts(const fs::path& dir)
 }
 }
 
+namespace {
+void c64_assets(const fs::path& dir)
+{
+    Bytes picture(58);
+    picture[1] = 0x50;
+    picture[2] = 'A';
+    picture[3] = 'B';
+    picture[34] = 6;
+    picture[35] = 12;
+    picture[47] = picture[48] = picture[51] = 1;
+    picture[49] = 8;
+    picture[55] = 5;
+    picture.insert(picture.end(), {1, 0x40, 0, 1, 8, 0, 1, 0x40, 0, 0});
+    const auto pic = dir / "PIC02.PRG";
+    write(pic, picture);
+    const auto gallery = read_c64_picture(pic);
+    check(gallery.frames.size() == 2 && gallery.clips.size() == 1 &&
+          gallery.frames[0].rgba[0] == 86 && gallery.frames[0].rgba[4] == 86 &&
+          gallery.frames[1].rgba[0] == 0 && gallery.frames[1].rgba[3] == 255 &&
+          gallery.clips[0].steps[1].duration_ms == 200,
+          "C64 multicolour or XOR animation regression");
+
+    Bytes item{0x10,0x27, 1,0,0,0, 0xff,0x80,0x87,0x80, 0x34,0x12,1,0,0,0,0,0};
+    const auto items = dir / "ITEMFILE02.PRG";
+    write(items, item);
+    const auto rows = read_record_rows(items);
+    check(rows.size() == 1 && rows[0].id == 2 && has_field(rows[0], {"Weight","4660"}) &&
+          has_field(rows[0], {"Magic bonus","-1"}) && has_field(rows[0], {"Hidden name mask","7"}),
+          "C64 native item record offsets or flags disagree");
+}
+}
+
 int main(int argc, char** argv)
 {
     try {
@@ -819,6 +852,7 @@ int main(int argc, char** argv)
         else if (name == "monsters") numbered_monsters(dir);
         else if (name == "items") item_archives(dir);
         else if (name == "ecl") ecl_scripts(dir);
+        else if (name == "c64") c64_assets(dir);
         else if (name == "vace") vace(dir);
         else if (name == "geo") geo(dir);
         else if (name == "walls") walls(dir);

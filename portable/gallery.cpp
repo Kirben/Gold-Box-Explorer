@@ -5,6 +5,7 @@
 #include "cmp.h"
 #include "dax.h"
 #include "geo.h"
+#include "c64.h"
 #include "ecl_containers.h"
 #include "walls.h"
 #include "records.h"
@@ -733,8 +734,9 @@ private:
         const bool anm = selected != wxNOT_FOUND && goldbox::is_anm_archive(paths_.at(selected));
         const bool packwall = selected != wxNOT_FOUND && goldbox::is_packwall_archive(paths_.at(selected));
         const bool vace = selected != wxNOT_FOUND && goldbox::is_vace_archive(paths_.at(selected));
+        const bool c64 = selected != wxNOT_FOUND && goldbox::is_c64_picture(paths_.at(selected));
         const bool picture = selected != wxNOT_FOUND &&
-            (wall || tlb || glb || cmp || anm || packwall || vace || goldbox::is_picture_archive(paths_.at(selected)));
+            (wall || tlb || glb || cmp || anm || packwall || vace || c64 || goldbox::is_picture_archive(paths_.at(selected)));
         show_view(picture, selected != wxNOT_FOUND && !picture);
         SetStatusText("Choose a file to inspect.");
         if (selected != wxNOT_FOUND) {
@@ -806,7 +808,8 @@ private:
                         static_cast<unsigned long long>(hex_->size())));
                     return;
                 }
-                auto archive = wall ? goldbox::read_wall_archive(path)
+                auto archive = c64 ? goldbox::read_c64_picture(path)
+                                    : wall ? goldbox::read_wall_archive(path)
                                     : tlb ? goldbox::read_tlb(path)
                                     : glb ? goldbox::read_geo_glb(path)
                                     : cmp ? goldbox::read_cmp(path)

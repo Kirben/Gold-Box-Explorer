@@ -1,4 +1,5 @@
 #include "records.h"
+#include "c64.h"
 #include "ecl.h"
 #include "ecl_containers.h"
 #include "item_names.h"
@@ -714,6 +715,8 @@ RecordKind record_kind(const std::filesystem::path& path)
 {
     if (is_ecl_archive(path))
         return RecordKind::ecl;
+    if (is_c64_record(path))
+        return RecordKind::c64;
     const auto name = upper(path.filename().string());
     if (name == "STRINGS.GLB") return RecordKind::amiga_text;
     if (name == "SOUNDS.GLB") return RecordKind::amiga_sound;
@@ -746,6 +749,8 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
         return read_vault(path);
     if (kind == RecordKind::ecl)
         return read_ecl_rows(path);
+    if (kind == RecordKind::c64)
+        return read_c64_records(path);
     if (kind == RecordKind::amiga_text || kind == RecordKind::amiga_sound) {
         const bool text = kind == RecordKind::amiga_text;
         const auto entries = read_amiga_glb(path, text ? "TEXT" : "DIG8");

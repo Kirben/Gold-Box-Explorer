@@ -1,4 +1,5 @@
 #include "pictures.h"
+#include "c64.h"
 #include "tlb.h"
 #include "vace.h"
 #include "cmp.h"
@@ -63,7 +64,8 @@ int main(int argc, char** argv)
             const bool packwall = goldbox::is_packwall_archive(argv[arg]);
             const bool vace = goldbox::is_vace_archive(argv[arg]);
             const bool wall = goldbox::is_wall_archive(argv[arg]);
-            if (!tlb && !glb && !cmp && !anm && !packwall && !vace && !wall && !goldbox::is_picture_archive(argv[arg])) {
+            const bool c64 = goldbox::is_c64_picture(argv[arg]);
+            if (!tlb && !glb && !cmp && !anm && !packwall && !vace && !wall && !c64 && !goldbox::is_picture_archive(argv[arg])) {
                 auto records = goldbox::is_geo_archive(argv[arg]) ? goldbox::try_amiga_dax(argv[arg]) :
                                std::vector<goldbox::DaxRecord>{};
                 if (records.empty())
@@ -74,7 +76,8 @@ int main(int argc, char** argv)
                               << record.bytes.size() << " decoded\n";
                 continue;
             }
-            const auto archive = wall ? goldbox::read_wall_archive(argv[arg])
+            const auto archive = c64 ? goldbox::read_c64_picture(argv[arg])
+                : wall ? goldbox::read_wall_archive(argv[arg])
                 : tlb ? goldbox::read_tlb(argv[arg])
                 : glb ? goldbox::read_geo_glb(argv[arg])
                 : cmp ? goldbox::read_cmp(argv[arg])
