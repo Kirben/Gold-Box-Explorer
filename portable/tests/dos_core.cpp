@@ -63,6 +63,49 @@ void pictures(const fs::path& dir)
     const auto& steps = archive.clips[0].steps;
     check(steps.size() == 2 && steps[0].frame == 0 && steps[1].frame == 1 &&
           steps[0].duration_ms == 220 && steps[1].duration_ms == 439, "Unexpected DOS playback timing");
+
+    const auto sprite = dir / "SPRIT1.DAX";
+    dax(sprite, 7, data);
+    const auto variants = read_pictures(sprite);
+    check(variants.frames.size() == 2 && variants.clips.empty() &&
+          variants.frames[1].rgba[2] == 170 && variants.frames[1].rgba[4] == 170 &&
+          variants.frames[1].rgba[7] == 255 && variants.frames[1].rgba[11] == 0,
+          "Encounter sprites should show independent, transparent distance frames");
+
+    constexpr unsigned directory = 11 + 80 * 3 + 40 + 6;
+    Bytes extended(directory + 6);
+    extended[0] = extended[2] = extended[8] = 1;
+    extended[9] = 176;
+    extended[10] = 80;
+    extended[11] = 40;
+    extended[directory - 2] = 1;
+    extended[directory] = extended[directory + 3] = 2;
+    extended.insert(extended.end(), {249, 176, 249, 176});
+    dax(sprite, 8, extended);
+    const auto vga_sprite = read_pictures(sprite);
+    check(vga_sprite.frames.size() == 2 && vga_sprite.frames[0].rgba[3] == 0 &&
+          vga_sprite.frames[1].rgba[0] == 160 && vga_sprite.frames[1].rgba[3] == 255,
+          "Treasures VGA sprite key-frame, transparency or palette mismatch");
+
+    const auto body = dir / "CBODY.DAX";
+    Bytes chunky{1, 1, 0, 0, 0, 0, 1, 0, 32, 0, 63, 32, 1,
+                 32, 4, 4, 4, 4, 4, 4, 4};
+    dax(body, 3, chunky);
+    const auto colored = read_pictures(body);
+    check(colored.frames.size() == 1 && colored.frames[0].width == 8 &&
+          colored.frames[0].rgba[0] == 252 && colored.frames[0].rgba[1] == 128 &&
+          colored.frames[0].rgba[2] == 4 && colored.frames[0].rgba[4] == 170,
+          "Indexed DAX palette or pixels decoded incorrectly");
+
+    const auto tiles = dir / "8x8d1.dax";
+    dax(tiles, 4, {0x81, 0, 0, 0, 0, 0, 0, 0x18});
+    const auto mono = read_pictures(tiles);
+    check(mono.frames.size() == 1 && mono.frames[0].height == 8 &&
+          mono.frames[0].rgba[0] == 255 && mono.frames[0].rgba[4] == 0 &&
+          mono.frames[0].rgba[28] == 255, "Monochrome tile bit order is incorrect");
+    check(is_picture_archive(body) && is_picture_archive(tiles) && is_picture_archive("FINAL5.DAX") &&
+          !is_picture_archive("MONCHA.DAX") && !is_picture_archive("ECL2.DAX"),
+          "DAX graphics routing must retain distinct data handlers");
 }
 
 Bytes tlb_library(const char* type, const std::vector<Bytes>& records, bool has_ids = false)

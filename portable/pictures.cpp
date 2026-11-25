@@ -75,8 +75,13 @@ bool decode_picture(const Bytes& data, unsigned id, unsigned header, std::vector
     const auto packed_size = height * columns * 4;
     const bool legacy = header && !(flags & 0xcc) &&
         data.size() == pos + 8 + packed_size * count + 21 * (count - 1);
-    const bool planar = (flags & 0xcc) &&
-        (header || data.size() != pos + 8 + packed_size * count);
+    const bool custom_palette = (flags & 0xcc) != 0;
+    const auto planar_size = height * columns * 5;
+    const bool standard_strata = !header && count && !custom_palette &&
+        data.size() == pos + 8 + planar_size * count &&
+        data.size() != pos + 8 + packed_size * (count + 1);
+    const bool planar = standard_strata || (custom_palette &&
+        (header || data.size() != pos + 8 + packed_size * count));
     if (!planar) {
         pos += 8;
         const std::size_t size = height * columns * 4;
@@ -87,10 +92,10 @@ bool decode_picture(const Bytes& data, unsigned id, unsigned header, std::vector
                 return false;
         }
     } else {
-        ++pos;
-        if (flags & 1) pos += 8;
-        if (flags & 2) pos += 16;
-        if (flags & 8) {
+        pos += custom_palette ? 1 : 8;
+        if (custom_palette && (flags & 1)) pos += 8;
+        if (custom_palette && (flags & 2)) pos += 16;
+        if (custom_palette && (flags & 8)) {
             if (pos + 24 > data.size())
                 return false;
             for (unsigned index = 18; index < 32; ++index) {
@@ -104,8 +109,7 @@ bool decode_picture(const Bytes& data, unsigned id, unsigned header, std::vector
         } else {
             std::fill(colors.begin() + 18, colors.end(), Color{0,0,0,255});
         }
-        const auto size = height * columns * 5;
-        if (!count || pos + size * count + (header ? 14 * (count - 1) : 0) > data.size())
+        if (!count || pos + planar_size * count + (header ? 14 * (count - 1) : 0) > data.size())
             return false;
     }
 
@@ -143,7 +147,83 @@ bool decode_picture(const Bytes& data, unsigned id, unsigned header, std::vector
     return true;
 }
 
-bool decode_vga_sprite(const Bytes& data, unsigned id, std::vector<Frame>& out)
+bool decode_vga_indexed(const Bytes& data, unsigned id, std::vector<Frame>& out)
+{
+    if (data.size() < 20)
+        return false;
+    const unsigned height = data[0];
+    const unsigned width = data[1] * 8;
+    const auto count = word(data, 6);
+    const unsigned first_color = data[8];
+    const unsigned colors = data[9] + 1;
+    const auto frame_size = width * height;
+    if (!width || width > 320 || !height || height > 200 || !count ||
+        first_color + colors > 256 || count > data.size() / frame_size)
+        return false;
+    const auto start = data.size() - frame_size * count;
+    const auto palette_end = 10 + colors * 3;
+    if (start < palette_end ||
+        !std::all_of(data.begin() + 10, data.begin() + palette_end, [](auto value) { return value < 64; }))
+        return false;
+    std::array<Color, 256> palette;
+    for (unsigned i = 0; i < palette.size(); ++i)
+        palette[i] = ega[i % ega.size()];
+    for (unsigned i = 0; i < colors; ++i) {
+        const auto* rgb = data.data() + 10 + i * 3;
+        for (unsigned channel = 0; channel < 3; ++channel)
+            palette[first_color + i][channel] = static_cast<std::uint8_t>(rgb[channel] * 4);
+    }
+    for (unsigned i = 0; i < count; ++i) {
+        Frame frame{id, i, width, height, Bytes(frame_size * 4)};
+        for (unsigned pixel = 0; pixel < frame_size; ++pixel) {
+            const auto& color = palette[data[start + i * frame_size + pixel]];
+            std::copy(color.begin(), color.end(), frame.rgba.data() + pixel * 4);
+        }
+        out.push_back(std::move(frame));
+    }
+    return true;
+}
+
+bool decode_mono_tiles(const Bytes& data, unsigned id, std::vector<Frame>& out)
+{
+    if (data.empty() || data.size() % 8)
+        return false;
+    for (unsigned i = 0; i < data.size() / 8; ++i) {
+        Frame frame{id, i, 8, 8, Bytes(8 * 8 * 4)};
+        for (unsigned y = 0; y < 8; ++y) {
+            for (unsigned x = 0; x < 8; ++x) {
+                const auto& color = ega[data[i * 8 + y] & (0x80 >> x) ? 15 : 0];
+                std::copy(color.begin(), color.end(), frame.rgba.data() + (y * 8 + x) * 4);
+            }
+        }
+        out.push_back(std::move(frame));
+    }
+    return true;
+}
+
+bool unpack_vga_runs(const Bytes& data, std::size_t pos, std::size_t end,
+                     std::size_t limit, Bytes& pixels)
+{
+    while (pos < end) {
+        const auto control = data[pos++];
+        const unsigned count = control < 128 ? control + 1 : 257 - control;
+        if (count > limit - pixels.size())
+            return false;
+        if (control < 128) {
+            if (count > end - pos)
+                return false;
+            pixels.insert(pixels.end(), data.begin() + pos, data.begin() + pos + count);
+            pos += count;
+        } else {
+            if (pos == end)
+                return false;
+            pixels.insert(pixels.end(), count, data[pos++]);
+        }
+    }
+    return true;
+}
+
+bool decode_vga_sprite(const Bytes& data, unsigned id, std::vector<Frame>& out, bool encounter = false)
 {
     if (data.size() < 132 || data[1] || !data[0] || data[0] > 200 ||
         !data[2] || data[2] > 40 || !data[9] || !data[10] || data[9] + data[10] > 256)
@@ -151,8 +231,11 @@ bool decode_vga_sprite(const Bytes& data, unsigned id, std::vector<Frame>& out)
     const unsigned width = data[2] * 8;
     const unsigned height = data[0];
     const unsigned frame_size = width * height;
-    const unsigned header = 132 + 3 * data[10];
-    std::size_t pos = header + 3 * data[8];
+    // Treasures stores a nibble map and variable-sized frame directory after the palette.
+    const bool extended = encounter && data[9] == 176 && data[10] == 80 && data[8] < 9;
+    const unsigned header = extended ? 17 + 3 * data[10] + data[10] / 2 : 129 + 3 * data[10];
+    const unsigned declared_count = data[8] + 1;
+    std::size_t pos = header + 3 * declared_count;
     if (pos >= data.size())
         return false;
     std::array<Color, 256> palette{};
@@ -167,24 +250,30 @@ bool decode_vga_sprite(const Bytes& data, unsigned id, std::vector<Frame>& out)
         }
     }
     Bytes pixels;
-    while (pos < data.size()) {
-        const auto control = data[pos++];
-        if (control < 128) {
-            const std::size_t count = control + 1;
-            if (count > data.size() - pos)
+    if (extended) {
+        for (unsigned frame = 0; frame < declared_count; ++frame) {
+            const auto length = word(data, header + 3 * frame);
+            if (length > data.size() - pos ||
+                !unpack_vga_runs(data, pos, pos + length, (frame + 1) * frame_size, pixels) ||
+                pixels.size() != (frame + 1) * frame_size)
                 return false;
-            pixels.insert(pixels.end(), data.begin() + pos, data.begin() + pos + count);
-            pos += count;
-        } else {
-            if (pos == data.size())
-                return false;
-            pixels.insert(pixels.end(), 257 - control, data[pos++]);
+            pos += length;
         }
+        if (pos != data.size())
+            return false;
+    } else if (!unpack_vga_runs(data, pos, data.size(), 256 * frame_size, pixels)) {
+        return false;
     }
     const auto count = pixels.size() / frame_size;
-    const unsigned master = data[header - 5];
+    if (!count)
+        return false;
+    const auto master = encounter && !extended ? count - 1 : data[header - 2];
     if (pixels.size() % frame_size || master >= count)
         return false;
+    if (encounter) {
+        palette[0] = {0, 0, 0, 0};
+        palette[13] = ega[0];
+    }
     for (unsigned index = 0; index < count; ++index) {
         Frame frame{id, index, width, height, Bytes(frame_size * 4)};
         for (unsigned i = 0; i < frame_size; ++i) {
@@ -212,7 +301,8 @@ int dos_delay(unsigned raw, std::uint64_t& tick)
     return static_cast<int>(std::min<std::uint64_t>(rounded, std::numeric_limits<int>::max()));
 }
 
-bool decode_ega_animation(const Bytes& data, unsigned id, PictureArchive& archive)
+bool decode_ega_animation(const Bytes& data, unsigned id, PictureArchive& archive,
+                          bool xor_frames, bool add_clip, bool encounter)
 {
     if (data.empty() || !data[0] || data[0] > 8)
         return false;
@@ -232,7 +322,7 @@ bool decode_ega_animation(const Bytes& data, unsigned id, PictureArchive& archiv
         if (!width || width > 320 || !height || height > 200 || x > 320 || y > 200)
             return false;
         const auto size = width * height / 2;
-        if (size > data.size() - position || (index && size > master_size))
+        if (size > data.size() - position)
             return false;
         if (!index) {
             master = position;
@@ -243,8 +333,12 @@ bool decode_ega_animation(const Bytes& data, unsigned id, PictureArchive& archiv
         for (unsigned row = 0; row < height; ++row) {
             for (unsigned col = 0; col < width; ++col) {
                 const auto at = (row * width + col) / 2;
-                const auto packed = data[position + at] ^ (index ? data[master + at] : 0);
-                const auto& color = ega[(packed >> (col % 2 ? 0 : 4)) & 15];
+                const auto packed = data[position + at] ^
+                    (xor_frames && index && at < master_size ? data[master + at] : 0);
+                const auto pixel = (packed >> (col % 2 ? 0 : 4)) & 15;
+                if (encounter && pixel == 0)
+                    continue;
+                const auto& color = ega[encounter && pixel == 13 ? 0 : pixel];
                 std::copy(color.begin(), color.end(),
                           frame.rgba.begin() + 4 * ((row + y) * frame.width + col + x));
             }
@@ -255,7 +349,7 @@ bool decode_ega_animation(const Bytes& data, unsigned id, PictureArchive& archiv
     }
     if (position != data.size())
         return false;
-    if (clip.steps.size() > 1)
+    if (add_clip && clip.steps.size() > 1)
         archive.clips.push_back(std::move(clip));
     archive.frames.insert(archive.frames.end(), std::make_move_iterator(frames.begin()),
                           std::make_move_iterator(frames.end()));
@@ -283,7 +377,9 @@ void add_vga_clip(const Bytes& data, unsigned id, std::size_t first, PictureArch
 
 bool is_picture_archive(const std::filesystem::path& path)
 {
-    static const std::regex name(R"(PIC[0-9]*[A-Z]?\.DAX)", std::regex::icase);
+    static const std::regex name(
+        R"(((PIC|SPRIT)[0-9]*[A-Z]?|(8X8D|BACK|BACPAC|BIGPIC|BODY|BORD(ERS?)?|CBODY|CHEAD|COMSPR|CPIC|CURSOR|DUNGCOM|FINAL|HEAD|ICON|OVER|RANDCOM|SKY|SKYGRND|SQRPACI|TILES|TITLE|WILDCOM)[0-9]*)\.DAX)",
+        std::regex::icase);
     return std::regex_match(path.filename().string(), name);
 }
 
@@ -316,19 +412,31 @@ std::vector<DaxRecord> read_dax(const std::filesystem::path& path)
 PictureArchive read_pictures(const std::filesystem::path& path)
 {
     PictureArchive archive;
+    const auto filename = path.filename().string();
+    static const std::regex animated_pictures(R"(PIC[0-9]*[A-Z]?\.DAX)", std::regex::icase);
+    static const std::regex endings(R"(FINAL[0-9]*\.DAX)", std::regex::icase);
+    static const std::regex sprites(R"(SPRIT[0-9]*[A-Z]?\.DAX)", std::regex::icase);
+    static const std::regex tiles(R"(8X8D[0-9]*\.DAX)", std::regex::icase);
+    const bool play_pictures = std::regex_match(filename, animated_pictures);
+    const bool xor_frames = play_pictures || std::regex_match(filename, endings);
+    const bool encounter = std::regex_match(filename, sprites);
+    const bool mono_tiles = std::regex_match(filename, tiles);
     for (const auto& record : read_dax(path)) {
         if (!record.stored_size)
             continue;
         const auto& block = record.bytes;
-        if (decode_ega_animation(block, record.id, archive))
+        if (decode_ega_animation(block, record.id, archive, xor_frames, play_pictures, encounter))
             continue;
         const auto first = archive.frames.size();
-        if (decode_vga_sprite(block, record.id, archive.frames)) {
-            add_vga_clip(block, record.id, first, archive);
+        if (decode_vga_sprite(block, record.id, archive.frames, encounter)) {
+            if (play_pictures)
+                add_vga_clip(block, record.id, first, archive);
             continue;
         }
         if (!decode_picture(block, record.id, 5, archive.frames) &&
-            !decode_picture(block, record.id, 0, archive.frames))
+            !decode_vga_indexed(block, record.id, archive.frames) &&
+            !decode_picture(block, record.id, 0, archive.frames) &&
+            !(mono_tiles && decode_mono_tiles(block, record.id, archive.frames)))
             archive.skipped_ids.push_back(record.id);
     }
     if (archive.frames.empty())
@@ -339,7 +447,8 @@ PictureArchive read_pictures(const std::filesystem::path& path)
 std::vector<Frame> decode_picture_record(const Bytes& bytes, unsigned id)
 {
     std::vector<Frame> frames;
-    if (!decode_vga_sprite(bytes, id, frames) && !decode_picture(bytes, id, 5, frames))
+    if (!decode_vga_sprite(bytes, id, frames) && !decode_picture(bytes, id, 5, frames) &&
+        !decode_vga_indexed(bytes, id, frames))
         decode_picture(bytes, id, 0, frames);
     return frames;
 }
