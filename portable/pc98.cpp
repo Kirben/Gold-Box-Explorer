@@ -57,6 +57,84 @@ Frame planar(const Bytes& bytes, std::size_t offset, unsigned id, unsigned index
         }
     return frame;
 }
+
+bool pc98_picture_sequence(const std::string& family, const Bytes& bytes)
+{
+    return family == "PIC" ||
+        (family == "FINAL" && bytes.size() >= 3 && word(bytes, 0) > 640);
+}
+
+constexpr unsigned pc98_first_bank_frames = 3;
+constexpr unsigned pc98_max_frames = 6;
+// MEGDOS.SYS $1225 returns the CLOCK device time. The supplied IO98.SYS
+// driver zeros the hundredths field at $205B, so consecutive values of
+// GetTicks (GAME.EXE $5332) are one second apart.
+constexpr unsigned pc98_clock_step_ms = 1000;
+constexpr unsigned pc98_default_speed = 5;
+
+using PictureBlocks = std::array<std::vector<std::size_t>, 256>;
+
+void draw_pc98_ending_layer(Frame& destination, const Frame& source, unsigned x, unsigned y)
+{
+    const auto width = std::min(source.width, destination.width - x);
+    const auto height = std::min(source.height, destination.height - y);
+    for (unsigned row = 0; row < height; ++row)
+        std::copy_n(source.rgba.data() + row * source.width * 4, width * 4,
+                    destination.rgba.data() + ((y + row) * destination.width + x) * 4);
+}
+
+void add_pc98_ending(const PictureBlocks& blocks, PictureArchive& archive)
+{
+    constexpr unsigned scene_size = 240;
+    struct Scene {
+        unsigned picture, background, top, transitions;
+    };
+    constexpr unsigned first_scenes_transitions = (10 - pc98_default_speed) * 5 / 2;
+    constexpr Scene scenes[]{
+        {2, 1, 64, first_scenes_transitions},
+        {7, 3, 0, first_scenes_transitions},
+        {8, 3, 0, 6},
+    };
+    if (std::any_of(blocks.begin() + 1, blocks.begin() + 9,
+                    [](const auto& block) { return block.empty(); }))
+        return;
+    for (const auto& scene : scenes) {
+        const auto& background = archive.frames[blocks[scene.background].front()];
+        if (background.width != scene_size || background.height != scene_size ||
+            blocks[scene.picture].size() != (scene.picture == 2 ? 4 : 6))
+            return;
+    }
+
+    const auto gallery_count = archive.frames.size();
+    PictureArchive::Clip clip{0, {}, true, true};
+    // GAME.OVR $2254E checks for a changed clock value after drawing each
+    // frame. $2290E and $22B28 pass (10 - speed) * 5 div 2 (speed defaults
+    // to 5 at $ED54), and $22BBF passes 6. Dialogue waits are omitted.
+    for (const auto& scene : scenes) {
+        auto background = archive.frames[blocks[scene.background].front()];
+        if (scene.background == 3) {
+            draw_pc98_ending_layer(background, archive.frames[blocks[4].front()], 0, 176);
+            draw_pc98_ending_layer(background, archive.frames[blocks[5].front()], 208, 144);
+            draw_pc98_ending_layer(background, archive.frames[blocks[6].front()], 0, 144);
+        }
+        const auto& pictures = blocks[scene.picture];
+        const auto first = archive.frames.size();
+        for (std::size_t i = 0; i < pictures.size(); ++i) {
+            auto frame = background;
+            frame.id = scene.picture;
+            frame.index = static_cast<unsigned>(i);
+            draw_pc98_ending_layer(frame, archive.frames[pictures[i]], 32, scene.top);
+            archive.frames.push_back(std::move(frame));
+        }
+        for (unsigned i = 0; i < scene.transitions; ++i)
+            clip.steps.push_back({first + i % pictures.size(), pc98_clock_step_ms});
+    }
+    // GAME.OVR $22BC2 calls the speed-scaled runtime busy wait three
+    // times. Use its nominal duration in the portable preview.
+    clip.steps.back().duration_ms += 3 * pc98_default_speed * 200;
+    archive.playback_only_frames = archive.frames.size() - gallery_count;
+    archive.clips.push_back(std::move(clip));
+}
 }
 
 std::optional<Bytes> expand_pc98(const std::uint8_t* packed, std::size_t length, unsigned size)
@@ -206,6 +284,11 @@ PictureArchive read_pc98_pictures(const std::filesystem::path& path, const std::
         family == "ICON" || family == "CHEAD" || family == "CBODY";
     const unsigned planes = masked ? 4 : 3;
     PictureArchive result;
+    std::array<const DaxRecord*, 256> by_id{};
+    PictureBlocks blocks;
+    std::array<bool, 256> sequences{};
+    for (const auto& record : records)
+        by_id[record.id] = &record;
     for (const auto& record : records) {
         const auto& bytes = record.bytes;
         const auto first = result.frames.size();
@@ -216,12 +299,23 @@ PictureArchive read_pc98_pictures(const std::filesystem::path& path, const std::
                                      std::make_move_iterator(tiles.end()));
                 continue;
             }
-            bool sequence = family == "PIC" || encounter;
-            if (family == "FINAL" && bytes.size() >= 3 && word(bytes, 0) > 640)
-                sequence = true;
+            const bool animated = pc98_picture_sequence(family, bytes);
+            const bool sequence = animated || encounter;
             std::size_t at = sequence ? 1 : 0;
             const std::uint8_t* base = nullptr;
             unsigned base_width = 0, base_height = 0;
+            const auto* primary = record.id >= 128 ? by_id[record.id - 128] : nullptr;
+            // GAME.OVR $33E2C opens id + 128; $34016 XORs those frames
+            // against the base retained from the first record.
+            if (animated && primary && primary->bytes.size() >= 10 &&
+                pc98_picture_sequence(family, primary->bytes) &&
+                primary->bytes.front() > pc98_first_bank_frames &&
+                primary->bytes.front() == bytes.front()) {
+                base_width = word(primary->bytes, 1);
+                base_height = word(primary->bytes, 3);
+                if (base_width / 8 * base_height * planes <= primary->bytes.size() - 10)
+                    base = primary->bytes.data() + 10;
+            }
             while (at < bytes.size()) {
                 if (bytes.size() - at < 9)
                     throw std::runtime_error("Truncated PC-98 picture header");
@@ -236,7 +330,7 @@ PictureArchive read_pc98_pictures(const std::filesystem::path& path, const std::
                     const auto index = static_cast<unsigned>(result.frames.size() - first);
                     result.frames.push_back(planar(bytes, at, record.id, index, width, height, planes,
                         sequence && !encounter && width == base_width && height == base_height ? base : nullptr));
-                    if (!index && sequence) {
+                    if (!index && animated && !base) {
                         base = bytes.data() + at;
                         base_width = width;
                         base_height = height;
@@ -244,12 +338,9 @@ PictureArchive read_pc98_pictures(const std::filesystem::path& path, const std::
                     at += size;
                 } while (tile_bank && at < bytes.size());
             }
-            if (!encounter && result.frames.size() - first > 1 && sequence) {
-                PictureArchive::Clip clip{record.id, {}};
-                for (auto i = first; i < result.frames.size(); ++i)
-                    clip.steps.push_back({i, 200});
-                result.clips.push_back(std::move(clip));
-            }
+            for (auto i = first; i < result.frames.size(); ++i)
+                blocks[record.id].push_back(i);
+            sequences[record.id] = animated;
         } catch (const std::runtime_error&) {
             result.frames.resize(first);
             result.skipped_ids.push_back(record.id);
@@ -257,6 +348,36 @@ PictureArchive read_pc98_pictures(const std::filesystem::path& path, const std::
     }
     if (result.frames.empty())
         throw std::runtime_error("No supported PC-98 pictures in archive");
+    if (family == "PIC" || family == "FINAL") {
+        for (unsigned id = 0; id < 128; ++id) {
+            if (!sequences[id] || blocks[id].empty())
+                continue;
+            const auto count = std::min<unsigned>(by_id[id]->bytes.front(), pc98_max_frames);
+            auto& block = blocks[id];
+            const auto& continuation = blocks[id + 128];
+            const bool split = count > pc98_first_bank_frames && sequences[id + 128] &&
+                by_id[id + 128]->bytes.front() == by_id[id]->bytes.front();
+            if (split)
+                block.insert(block.end(), continuation.begin(), continuation.end());
+            if (block.size() > count)
+                block.resize(count);
+            if (family == "PIC" && block.size() > 1) {
+                PictureArchive::Clip clip{id, {}};
+                // GAME.OVR $32656 advances when elapsed centiseconds exceed three
+                // times the delay of five loaded at $33BAA and $33EF7.
+                // A single clock change already exceeds that threshold.
+                for (const auto frame : block)
+                    clip.steps.push_back({frame, pc98_clock_step_ms});
+                result.clips.push_back(clip);
+                if (split && !continuation.empty()) {
+                    clip.id = id + 128;
+                    result.clips.push_back(std::move(clip));
+                }
+            }
+        }
+        if (family == "FINAL")
+            add_pc98_ending(blocks, result);
+    }
     return result;
 }
 }
