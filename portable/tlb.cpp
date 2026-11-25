@@ -491,6 +491,22 @@ bool is_geo_glb(const fs::path& path)
     return upper(path.filename().string()) == "GEO.GLB";
 }
 
+std::vector<DaxRecord> read_hlib_data(const fs::path& path)
+{
+    const auto bytes = read_bytes(path);
+    const Library library({bytes.data(), bytes.size()});
+    if (!library.data.tag(12, "DATA") || library.first_item() != 1 || library.directory.empty())
+        throw std::runtime_error("Expected an indexed HLIB DATA library");
+    std::vector<DaxRecord> records;
+    for (const auto& [id, index] : library.directory) {
+        if (!index || index >= library.ids.size())
+            throw std::runtime_error("Invalid HLIB DATA entry index");
+        const auto item = library.item(index);
+        records.push_back({id, static_cast<unsigned>(item.size), Bytes(item.data, item.data + item.size)});
+    }
+    return records;
+}
+
 PictureArchive read_geo_glb(const fs::path& path)
 {
     const auto bytes = read_bytes(path);

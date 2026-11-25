@@ -4,19 +4,32 @@
 #include "cmp.h"
 #include "dax.h"
 #include "records.h"
+#include "ecl.h"
 #include "save_map.h"
 
 #include <iostream>
 
 int main(int argc, char** argv)
 {
-    if (argc < 2) {
-        std::cerr << "Usage: goldbox-inspect ARCHIVE [ARCHIVE ...]\n";
+    const bool override_game = argc > 1 && std::string_view(argv[1]) == "--ecl-game";
+    const int first = override_game ? 3 : 1;
+    if (argc <= first) {
+        std::cerr << "Usage: goldbox-inspect [--ecl-game PROFILE] ARCHIVE [ARCHIVE ...]\n";
         return 2;
     }
     int status = 0;
-    for (int arg = 1; arg < argc; ++arg) {
+    for (int arg = first; arg < argc; ++arg) {
         try {
+            if (goldbox::is_ecl_archive(argv[arg])) {
+                const auto scripts = goldbox::read_ecl_rows(argv[arg], override_game ? argv[2] : "");
+                std::cout << argv[arg] << ": " << scripts.size() << " scripts\n";
+                for (const auto& script : scripts) {
+                    std::cout << script.name << '\n';
+                    for (const auto& field : script.fields)
+                        std::cout << field.first << '\t' << field.second << '\n';
+                }
+                continue;
+            }
             if (goldbox::is_saved_world(argv[arg])) {
                 const auto save = goldbox::read_saved_map(argv[arg]);
                 std::cout << argv[arg] << ": disk " << save.disk << ", script " << save.script

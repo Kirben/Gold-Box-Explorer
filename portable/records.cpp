@@ -1,4 +1,5 @@
 #include "records.h"
+#include "ecl.h"
 #include "item_names.h"
 #include "frua_item_names.h"
 
@@ -409,6 +410,8 @@ std::vector<RecordRow> read_save_rows(const std::filesystem::path& path, RecordK
 
 RecordKind record_kind(const std::filesystem::path& path)
 {
+    if (is_ecl_archive(path))
+        return RecordKind::ecl;
     const auto name = upper(path.filename().string());
     static const std::regex monster_name(R"(MON[0-9]*(CHA|ITM|SPC)\.DAX)");
     std::smatch match;
@@ -437,6 +440,8 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
         throw std::runtime_error("Unrecognized DOS record archive");
     if (kind == RecordKind::vault)
         return read_vault(path);
+    if (kind == RecordKind::ecl)
+        return read_ecl_rows(path);
     if (kind == RecordKind::saved_character || kind == RecordKind::saved_inventory ||
         kind == RecordKind::saved_effects)
         return read_save_rows(path, kind);

@@ -2,6 +2,7 @@
 #include "geo.h"
 #include "pictures.h"
 #include "records.h"
+#include "ecl.h"
 #include "save_map.h"
 #include "walls.h"
 #include "tlb.h"
@@ -688,6 +689,67 @@ void saves(const fs::path& dir)
 }
 }
 
+namespace {
+void ecl_scripts(const fs::path& dir)
+{
+    Bytes script{0x88, 0x13};
+    for (unsigned i = 0; i < 5; ++i)
+        script.insert(script.end(), {1, 1, 0x14, 0x99});
+    script.insert(script.end(), {0x16, 0x2d, 1, 6, 8, 0x11, 0x80, 3, 0x04, 0x20, 0xc4, 0, 0xff});
+    const auto c64 = dir / "ECL1E.PRG";
+    write(c64, script);
+    const auto rows = read_record_rows(c64);
+    check(rows.size() == 1 && rows[0].id == 30 && has_field(rows[0], {"Profile", "c64"}),
+          "C64 PRG lost hexadecimal script ID or dialect");
+    check(has_field(rows[0], {"$9915", "$2D  CALL byte[$0806] [Redraw view frame]"}) &&
+          has_field(rows[0], {"$9919", "$11  PRINT \"ABCD\""}) &&
+          has_field(rows[0], {"$9920", "DATA FF"}), "C64 VM decoding or branch traversal disagrees with fixture");
+    const auto por = dir / "ECL1.DAX";
+    dax(por, 30, script);
+    const auto pc = read_ecl_rows(por, "por");
+    check(pc.size() == 1 && has_field(pc[0], {"$9915", "$2D  CALL byte[$0806]"}),
+          "A C64 native call name leaked into the DOS dialect");
+    for (unsigned i = 0; i < 5; ++i)
+        script[5 + 4 * i] = 0x80;
+    script.resize(22);
+    script.insert(script.end(), {0x08, 4, 0x78, 0x56, 0x34, 0x12, 5, 0, 0x90, 0});
+    dax(por, 7, script);
+    for (auto dialect : {"countdown", "matrix"}) {
+        const auto buck = read_ecl_rows(por, dialect);
+        check(has_field(buck[0], {"$8014", "$08  RANDOM $12345678, long[$9000]"}),
+              "Buck Rogers long operands were not decoded");
+    }
+    const auto buck_dir = dir / "buck_rogers";
+    fs::create_directories(buck_dir);
+    script[0] = 0;
+    script[1] = 0x40;
+    script.resize(22);
+    script.insert(script.end(), {0x1f, 1, 0x61, 0x4c, 0, 1, 0, 0x32, 0, 0x12, 0});
+    const auto buck_file = buck_dir / "ECL22.PRG";
+    write(buck_file, script);
+    const auto buck = read_record_rows(buck_file);
+    check(has_field(buck[0], {"Profile", "countdown"}) &&
+          has_field(buck[0], {"$8014", "$1F  SHIP_COMBAT byte[$4C61], $01, $32, $12"}) &&
+          has_field(buck[0], {"$801E", "$00  EXIT"}), "C64 Countdown ship combat lost operand alignment");
+    script[0] = 0x88;
+    script[1] = 0x13;
+    dax(por, 34, script);
+    for (auto dialect : {"countdown", "matrix"})
+        check(has_field(read_ecl_rows(por, dialect)[0], {"$801E", "$00  EXIT"}),
+              "DOS ship combat lost operand alignment");
+    const auto amiga_path = buck_dir / "ECL.GLB";
+    const auto glib_size = static_cast<std::uint8_t>(34 + script.size() - 2);
+    Bytes amiga{'G','L','I','B', 0,0,0,glib_size, 0,2,0,1, 'D','A','T','A',
+                0,0,0,28, 0,0,0,34, 0,0,0,glib_size, 0,1,0,34,0,1};
+    amiga.insert(amiga.end(), script.begin() + 2, script.end());
+    write(amiga_path, amiga);
+    const auto amiga_rows = read_record_rows(amiga_path);
+    check(amiga_rows.size() == 1 && amiga_rows[0].id == 34 &&
+          has_field(amiga_rows[0], {"Platform", "Amiga"}) &&
+          has_field(amiga_rows[0], {"$801E", "$00  EXIT"}), "Amiga GLIB directory or script offsets disagree");
+}
+}
+
 int main(int argc, char** argv)
 {
     try {
@@ -705,6 +767,7 @@ int main(int argc, char** argv)
         else if (name == "vault") vault(dir);
         else if (name == "monsters") numbered_monsters(dir);
         else if (name == "items") item_archives(dir);
+        else if (name == "ecl") ecl_scripts(dir);
         else if (name == "vace") vace(dir);
         else if (name == "geo") geo(dir);
         else if (name == "walls") walls(dir);

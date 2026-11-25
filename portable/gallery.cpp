@@ -65,6 +65,42 @@ private:
     std::vector<goldbox::RecordRow> rows_;
 };
 
+class RecordDetails : public wxListCtrl {
+public:
+    explicit RecordDetails(wxWindow* parent)
+        : wxListCtrl(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                     wxLC_REPORT | wxLC_VIRTUAL | wxLC_SINGLE_SEL)
+    {
+        AppendColumn("Field", wxLIST_FORMAT_LEFT, FromDIP(205));
+        AppendColumn("Value", wxLIST_FORMAT_LEFT, FromDIP(220));
+    }
+
+    void load(const std::vector<goldbox::Field>* fields, bool scripts = false)
+    {
+        SetItemCount(0);
+        fields_ = fields;
+        wxListItem column;
+        column.SetText(scripts ? "Address" : "Field");
+        SetColumn(0, column);
+        column.SetText(scripts ? "Instruction or data" : "Value");
+        SetColumn(1, column);
+        SetColumnWidth(0, FromDIP(scripts ? 90 : 205));
+        SetColumnWidth(1, FromDIP(scripts ? 800 : 220));
+        if (fields_)
+            SetItemCount(static_cast<long>(fields_->size()));
+    }
+
+private:
+    wxString OnGetItemText(long index, long column) const override
+    {
+        if (!fields_ || index < 0 || static_cast<std::size_t>(index) >= fields_->size())
+            return {};
+        const auto& field = (*fields_)[index];
+        return wxString::FromUTF8(column ? field.second : field.first);
+    }
+    const std::vector<goldbox::Field>* fields_ = nullptr;
+};
+
 class HexView : public wxListCtrl {
 public:
     explicit HexView(wxWindow* parent)
@@ -391,10 +427,7 @@ public:
         hex_->Hide();
         tables_ = make_splitter(content);
         record_list_ = new RecordList(tables_);
-        details_ = new wxListCtrl(tables_, wxID_ANY, wxDefaultPosition, wxDefaultSize,
-                                  wxLC_REPORT | wxLC_SINGLE_SEL);
-        details_->AppendColumn("Field", wxLIST_FORMAT_LEFT, 205);
-        details_->AppendColumn("Value", wxLIST_FORMAT_LEFT, 220);
+        details_ = new RecordDetails(tables_);
         tables_->SplitVertically(record_list_, details_, FromDIP(245));
         tables_->Hide();
         content_layout->Add(preview_split_, 1, wxEXPAND);
@@ -665,8 +698,9 @@ private:
         frames_.clear();
         hex_->clear();
         records_.clear();
+        details_->load(nullptr);
         record_list_->load({});
-        details_->DeleteAllItems();
+        script_records_ = false;
         banks_.clear();
         preview_->Scroll(0, 0);
         geo_ = false;
@@ -716,6 +750,7 @@ private:
                     if (kind != goldbox::RecordKind::none) {
                         auto rows = goldbox::read_record_rows(path);
                         if (!rows.empty()) {
+                            script_records_ = kind == goldbox::RecordKind::ecl;
                             record_list_->load(std::move(rows));
                             show_view(false, false, false, false, true);
                             show_fields(0);
@@ -898,14 +933,9 @@ private:
         if (index >= rows.size())
             return;
         const auto& record = rows[index];
-        details_->Freeze();
-        details_->DeleteAllItems();
-        for (const auto& field : record.fields) {
-            const auto line = details_->InsertItem(details_->GetItemCount(), wxString::FromUTF8(field.first));
-            details_->SetItem(line, 1, wxString::FromUTF8(field.second));
-        }
-        details_->Thaw();
-        SetStatusText(wxString::Format("Record %zu of %zu   |   ", index + 1, rows.size())
+        details_->load(&record.fields, script_records_);
+        SetStatusText(wxString::Format("%s %zu of %zu   |   ", script_records_ ? "Script" : "Record",
+                                      index + 1, rows.size())
                       + wxString::FromUTF8(record.name));
     }
 
@@ -1005,7 +1035,8 @@ private:
     HexView* hex_;
     wxSplitterWindow* tables_;
     RecordList* record_list_;
-    wxListCtrl* details_;
+    RecordDetails* details_;
+    bool script_records_ = false;
     std::vector<fs::path> paths_;
     std::vector<goldbox::Frame> frames_;
     std::vector<goldbox::PictureArchive::Clip> clips_;
