@@ -1122,6 +1122,27 @@ static void frua_records(const fs::path& dir)
           has_field(party[0], {"Dungeon column", "12"}), "FRUA binary saved party offsets failed");
 }
 
+static void luck_records(const fs::path& dir)
+{
+    const Bytes text{2,' ',3,13,10,12,13,10,5,' ',8,26,0};
+    const auto dos = dir / "LUCK.DAX";
+    dax(dos, 101, text);
+    const auto size = static_cast<std::uint8_t>(34 + text.size());
+    Bytes library{'G','L','I','B',0,0,0,size,0,2,0,1,'T','I','L','E',
+                  0,0,0,28,0,0,0,34,0,0,0,size,0,1,0,101,0,1};
+    library.insert(library.end(), text.begin(), text.end());
+    const auto amiga = dir / "Luck.glb";
+    write(amiga, library);
+    for (const auto& path : {dos, amiga}) {
+        const auto rows = read_record_rows(path);
+        check(rows.size() == 1 && rows[0].id == 101 && rows[0].name == "Romance 101" &&
+              has_field(rows[0], {"Line 1", "{stronger name} {weaker name}"}) &&
+              has_field(rows[0], {"Page break", "Wait for Continue"}) &&
+              has_field(rows[0], {"Line 2", "{party member name} {weaker pronoun}"}) &&
+              rows[0].fields.size() == 5, "LUCK dialogue, page break or substitutions changed");
+    }
+}
+
 int main(int argc, char** argv)
 {
     try {
@@ -1143,6 +1164,7 @@ int main(int argc, char** argv)
         else if (name == "c64") c64_assets(dir);
         else if (name == "ilbm") ilbm(dir);
         else if (name == "frua-records") frua_records(dir);
+        else if (name == "luck") luck_records(dir);
         else if (name == "vace") vace(dir);
         else if (name == "geo") geo(dir);
         else if (name == "walls") walls(dir);

@@ -96,17 +96,19 @@ public:
         AppendColumn("Value", wxLIST_FORMAT_LEFT, FromDIP(220));
     }
 
-    void load(const std::vector<goldbox::Field>* fields, bool scripts = false)
+    void load(const std::vector<goldbox::Field>* fields, goldbox::RecordKind kind = goldbox::RecordKind::none)
     {
+        const bool scripts = kind == goldbox::RecordKind::ecl;
+        const bool dialogue = kind == goldbox::RecordKind::luck;
         SetItemCount(0);
         fields_ = fields;
         wxListItem column;
         column.SetText(scripts ? "Address" : "Field");
         SetColumn(0, column);
-        column.SetText(scripts ? "Instruction or data" : "Value");
+        column.SetText(scripts ? "Instruction or data" : dialogue ? "Dialogue" : "Value");
         SetColumn(1, column);
-        SetColumnWidth(0, FromDIP(scripts ? 90 : 205));
-        SetColumnWidth(1, FromDIP(scripts ? 800 : 220));
+        SetColumnWidth(0, FromDIP(scripts || dialogue ? 90 : 205));
+        SetColumnWidth(1, FromDIP(scripts ? 800 : dialogue ? 500 : 220));
         if (fields_)
             SetItemCount(static_cast<long>(fields_->size()));
     }
@@ -732,7 +734,7 @@ private:
         records_.clear();
         details_->load(nullptr);
         record_list_->load({});
-        script_records_ = false;
+        record_kind_ = goldbox::RecordKind::none;
         banks_.clear();
         preview_->Scroll(0, 0);
         geo_ = amiga_geo_ = false;
@@ -783,7 +785,7 @@ private:
                     if (kind != goldbox::RecordKind::none) {
                         auto rows = goldbox::read_record_rows(path);
                         if (!rows.empty()) {
-                            script_records_ = kind == goldbox::RecordKind::ecl;
+                            record_kind_ = kind;
                             record_list_->load(std::move(rows));
                             show_view(false, false, false, false, true);
                             show_fields(0);
@@ -983,8 +985,8 @@ private:
         if (index >= rows.size())
             return;
         const auto& record = rows[index];
-        details_->load(&record.fields, script_records_);
-        SetStatusText(wxString::Format("%s %zu of %zu   |   ", script_records_ ? "Script" : "Record",
+        details_->load(&record.fields, record_kind_);
+        SetStatusText(wxString::Format("%s %zu of %zu   |   ", record_kind_ == goldbox::RecordKind::ecl ? "Script" : "Record",
                                       index + 1, rows.size())
                       + wxString::FromUTF8(record.name));
     }
@@ -1086,7 +1088,7 @@ private:
     wxSplitterWindow* tables_;
     RecordList* record_list_;
     RecordDetails* details_;
-    bool script_records_ = false;
+    goldbox::RecordKind record_kind_ = goldbox::RecordKind::none;
     std::vector<fs::path> paths_;
     std::vector<goldbox::Frame> frames_;
     std::vector<goldbox::PictureArchive::Clip> clips_;

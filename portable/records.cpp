@@ -848,6 +848,65 @@ std::vector<RecordRow> read_frua_save(const std::filesystem::path& path)
     return {std::move(row)};
 }
 
+std::vector<RecordRow> read_luck(const std::filesystem::path& path)
+{
+    auto records = upper(path.extension().string()) == ".GLB" ? read_amiga_glb(path, "TILE")
+                                                               : try_amiga_dax(path);
+    if (records.empty() && upper(path.extension().string()) == ".DAX")
+        records = read_dax(path);
+    if (records.empty())
+        throw std::runtime_error("No dialogue records in LUCK archive");
+    constexpr const char* substitutions[]{
+        "{stronger name}", "{weaker name}", "{NPC name}", "{party member name}",
+        "{other party member name}", "{stronger pronoun}", "{weaker pronoun}",
+    };
+    std::vector<RecordRow> rows;
+    rows.reserve(records.size());
+    for (const auto& record : records) {
+        const auto id = record.id;
+        const bool romance = id >= 101;
+        const char* group = romance ? "Romance" : id >= 51 ? "Lucky paper" : "Crown hint";
+        RecordRow row{id, 0, std::string(group) + " " + std::to_string(id), {}};
+        field(row, "Record ID", id);
+        row.fields.emplace_back("Category", group);
+        std::string line;
+        unsigned number = 0;
+        auto append_line = [&] {
+            row.fields.emplace_back("Line " + std::to_string(++number), std::move(line));
+            line.clear();
+        };
+        for (std::size_t i = 0; i < record.bytes.size(); ++i) {
+            const auto byte = record.bytes[i];
+            if (byte == 26)
+                break;
+            if (byte == 12) {
+                if (!line.empty())
+                    append_line();
+                row.fields.emplace_back("Page break", "Wait for Continue");
+                // The source usually puts a line ending immediately after the page marker.
+                if (i + 1 < record.bytes.size() && record.bytes[i + 1] == 13)
+                    ++i;
+                if (i + 1 < record.bytes.size() && record.bytes[i + 1] == 10)
+                    ++i;
+            } else if (byte == 10 || byte == 13) {
+                if (byte == 13 && i + 1 < record.bytes.size() && record.bytes[i + 1] == 10)
+                    ++i;
+                append_line();
+            } else if (romance && byte >= 2 && byte <= 8) {
+                line += substitutions[byte - 2];
+            } else if (byte >= 32 && byte <= 126) {
+                line += static_cast<char>(byte);
+            } else {
+                line += "{$" + raw_bytes(&byte, 0, 1) + '}';
+            }
+        }
+        if (!line.empty())
+            append_line();
+        rows.push_back(std::move(row));
+    }
+    return rows;
+}
+
 std::vector<RecordRow> read_vault(const std::filesystem::path& path)
 {
     constexpr unsigned header_size = 16;
@@ -973,6 +1032,7 @@ RecordKind record_kind(const std::filesystem::path& path)
     if (is_c64_record(path))
         return RecordKind::c64;
     const auto name = upper(path.filename().string());
+    if (name == "LUCK.DAX" || name == "LUCK.GLB") return RecordKind::luck;
     if (name == "ITEMS" || name == "ITEMS.1") return RecordKind::base_items;
     if (name == "ITEM.DAT" || name == "ITEMS.DAT") return RecordKind::frua_items;
     if (name == "GAME001.DAT") return RecordKind::frua_design;
@@ -1019,6 +1079,8 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
         return read_frua_geo(path);
     if (kind == RecordKind::frua_save)
         return read_frua_save(path);
+    if (kind == RecordKind::luck)
+        return read_luck(path);
     if (kind == RecordKind::ecl)
         return read_ecl_rows(path);
     if (kind == RecordKind::c64)
