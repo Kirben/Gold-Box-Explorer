@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
 
@@ -864,6 +865,13 @@ void ecl_scripts(const fs::path& dir)
     check(has_field(rows[0], {"$9915", "$2D  CALL byte[$0806] [Redraw view frame]"}) &&
           has_field(rows[0], {"$9919", "$11  PRINT \"ABCD\""}) &&
           has_field(rows[0], {"$9920", "DATA FF"}), "C64 VM decoding or branch traversal disagrees with fixture");
+    std::ostringstream listing;
+    write_ecl_listing(listing, rows.front());
+    const auto text = listing.str();
+    check(text.find("Script 30\n") == 0 &&
+          text.find("$9915\t$2D  CALL byte[$0806] [Redraw view frame]\n") != std::string::npos &&
+          text.find("$9919\t$11  PRINT \"ABCD\"\n") != std::string::npos &&
+          text.find("$9920\tDATA FF\n") != std::string::npos, "ECL text listing dropped script content");
     const auto por = dir / "ECL1.DAX";
     dax(por, 30, script);
     const auto pc = read_ecl_rows(por, "por");

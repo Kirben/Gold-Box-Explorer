@@ -27,11 +27,8 @@ int main(int argc, char** argv)
             if (goldbox::is_ecl_archive(argv[arg])) {
                 const auto scripts = goldbox::read_ecl_rows(argv[arg], override_game ? argv[2] : "");
                 std::cout << argv[arg] << ": " << scripts.size() << " scripts\n";
-                for (const auto& script : scripts) {
-                    std::cout << script.name << '\n';
-                    for (const auto& field : script.fields)
-                        std::cout << field.first << '\t' << field.second << '\n';
-                }
+                for (const auto& script : scripts)
+                    goldbox::write_ecl_listing(std::cout, script);
                 continue;
             }
             if (goldbox::is_saved_world(argv[arg])) {

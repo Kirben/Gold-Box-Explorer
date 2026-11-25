@@ -6,6 +6,7 @@
 #include "dax.h"
 #include "geo.h"
 #include "c64.h"
+#include "ecl.h"
 #include "ecl_containers.h"
 #include "walls.h"
 #include "records.h"
@@ -30,6 +31,7 @@
 #include <functional>
 #include <limits>
 #include <set>
+#include <sstream>
 
 namespace {
 namespace fs = std::filesystem;
@@ -489,6 +491,9 @@ public:
         file_menu->Append(export_frames_id, "Export All Frames...");
         file_menu->Append(export_animation_id, "Export Animation...");
         file_menu->AppendSeparator();
+        file_menu->Append(export_script_id, "Export Selected Script...");
+        file_menu->Append(export_scripts_id, "Export All Scripts...");
+        file_menu->AppendSeparator();
         file_menu->Append(wxID_EXIT, "E&xit");
         auto* menu_bar = new wxMenuBar;
         menu_bar->Append(file_menu, "&File");
@@ -506,6 +511,14 @@ public:
             event.Enable(selected_clip() != nullptr);
         }, export_animation_id);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { export_animation(); }, export_animation_id);
+        Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent& event) {
+            event.Enable(selected_script() >= 0);
+        }, export_script_id);
+        Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent& event) {
+            event.Enable(record_kind_ == goldbox::RecordKind::ecl && !record_list_->rows().empty());
+        }, export_scripts_id);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { export_script_listing(false); }, export_script_id);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { export_script_listing(true); }, export_scripts_id);
         for (auto* pane : {preview_, perspective_}) {
             pane->Bind(wxEVT_CONTEXT_MENU, [this, pane](wxContextMenuEvent&) {
                 if (!pane->can_export())
@@ -591,6 +604,8 @@ private:
     static constexpr int export_png_id = wxID_HIGHEST + 1;
     static constexpr int export_frames_id = wxID_HIGHEST + 2;
     static constexpr int export_animation_id = wxID_HIGHEST + 3;
+    static constexpr int export_script_id = wxID_HIGHEST + 4;
+    static constexpr int export_scripts_id = wxID_HIGHEST + 5;
 
     wxString export_name(const wxString& suffix) const
     {
@@ -698,6 +713,59 @@ private:
                             wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
         if (dialog.ShowModal() == wxID_OK && !image.SaveFile(dialog.GetPath(), wxBITMAP_TYPE_PNG))
             wxMessageBox("Could not save the PNG image.", "Export PNG", wxOK | wxICON_ERROR, this);
+    }
+
+    long selected_script() const
+    {
+        if (record_kind_ != goldbox::RecordKind::ecl)
+            return -1;
+        return record_list_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
+    }
+
+    void export_script_listing(bool all)
+    {
+        const auto archive_index = files_->GetSelection();
+        const auto selected = selected_script();
+        const auto& scripts = record_list_->rows();
+        if (record_kind_ != goldbox::RecordKind::ecl || archive_index == wxNOT_FOUND ||
+            scripts.empty() || (!all && (selected < 0 || static_cast<std::size_t>(selected) >= scripts.size())))
+            return;
+
+        const auto archive = paths_.at(archive_index);
+        auto name = wxString::FromUTF8(archive.stem().u8string());
+        const auto count = all ? scripts.size() : 1;
+        std::ostringstream listing;
+        listing << archive.filename().u8string() << '\n' << '\n';
+        if (all) {
+            name += "-scripts.txt";
+            for (std::size_t i = 0; i < scripts.size(); ++i) {
+                if (i)
+                    listing << '\n';
+                goldbox::write_ecl_listing(listing, scripts[i]);
+            }
+        } else {
+            const auto& script = scripts[static_cast<std::size_t>(selected)];
+            name += wxString::Format("-script-%02X.txt", script.id);
+            goldbox::write_ecl_listing(listing, script);
+        }
+        const auto text = listing.str();
+        wxFileDialog dialog(this, all ? "Export All Scripts" : "Export Selected Script", {}, name,
+                            "Text files (*.txt)|*.txt", wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+        if (dialog.ShowModal() != wxID_OK)
+            return;
+        std::error_code ec;
+        const auto destination = fs::u8path(dialog.GetPath().ToUTF8().data());
+        if (fs::equivalent(archive, destination, ec)) {
+            wxMessageBox("Choose a text file other than the original ECL archive.", "Export Scripts",
+                         wxOK | wxICON_ERROR, this);
+            return;
+        }
+        wxTempFileOutputStream output(dialog.GetPath());
+        if (!output.IsOk() || output.Write(text.data(), text.size()).LastWrite() != text.size() || !output.Commit()) {
+            wxMessageBox("Could not save the script listing.", "Export Scripts", wxOK | wxICON_ERROR, this);
+            return;
+        }
+        SetStatusText(wxString::Format("Exported %zu %s", count, count == 1 ? "script" : "scripts"));
     }
 
     void browse(const fs::path& folder, const fs::path& selected)

@@ -431,4 +431,11 @@ std::vector<RecordRow> read_ecl_rows(const std::filesystem::path& path, std::str
         rows.push_back(read_script(std::move(records[i]), i, game, extension != ".GLB", extension == ".PRG", amiga_file));
     return rows;
 }
+
+void write_ecl_listing(std::ostream& output, const RecordRow& script)
+{
+    output << script.name << '\n';
+    for (const auto& [address, text] : script.fields)
+        output << address << '\t' << text << '\n';
+}
 }
