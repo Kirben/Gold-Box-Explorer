@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <iterator>
+#include <optional>
 #include <regex>
 #include <stdexcept>
 
@@ -19,6 +20,36 @@ std::string upper(std::string name)
     for (auto& c : name)
         c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     return name;
+}
+
+std::optional<std::array<unsigned, 3>> pc98_wall_selection(const std::vector<DaxRecord>& scripts,
+                                                           unsigned map_id)
+{
+    // Map 5 enters from script 3 and map 7 from script 5. They retain the
+    // castle banks loaded in script 3. Map 23 likewise retains script 22's
+    // banks. The other three maps are loaded by the indicated foreign scripts.
+    struct Route { unsigned map, script, pieces; };
+    constexpr Route routes[]{
+        {5, 3, 0x9c29}, {7, 3, 0x9c29}, {23, 22, 0x9c38},
+        {30, 16, 0x9da8}, {31, 24, 0xb939}, {32, 29, 0x9c82}
+    };
+    for (const auto& route : routes) {
+        if (route.map != map_id)
+            continue;
+        for (const auto& script : scripts) {
+            if (!script.pc98 || script.id != route.script)
+                continue;
+            const auto& bytes = script.bytes;
+            if (bytes.size() < 2 || bytes[0] != 0x88 || bytes[1] != 0x13)
+                return {};
+            const auto at = route.pieces - 0x9900 + 2;
+            if (at + 7 > bytes.size() || bytes[at] != 0x37 || bytes[at+1] ||
+                bytes[at+3] || bytes[at+5])
+                return {};
+            return std::array<unsigned, 3>{bytes[at+2], bytes[at+4], bytes[at+6]};
+        }
+    }
+    return {};
 }
 
 std::vector<Frame> compose_pieces(const DaxRecord& record, const std::vector<const Frame*>& bank, bool amiga)
@@ -347,36 +378,49 @@ WallBanks load_map_walls(const fs::path& geo_path, unsigned map_id)
 {
     WallResources resources(geo_path.parent_path());
     const auto companion = "ECL" + upper(geo_path.filename().string()).substr(3);
-    for (const auto& script : resources.archive(companion)) {
+    const auto& scripts = resources.archive(companion);
+    const auto assemble = [&](const std::array<unsigned, 3>& selection, bool pc98) -> std::optional<WallBanks> {
+        WallBanks result;
+        for (unsigned i = 0; i < result.size();) {
+            const auto value = selection[i];
+            if (pc98 && value == 255) {
+                ++i;
+                continue;
+            }
+            std::string name;
+            const DaxRecord* record = nullptr;
+            const auto id = value == 127 || value == 255 ? (pc98 ? 0u : map_id) : value;
+            if (!resources.wall_location(id, name, record))
+                return {};
+            auto frames = resources.assemble(*record, name);
+            if (pc98) {
+                // GAME.OVR copies one 780-byte definition into each successive slot.
+                constexpr unsigned views_per_slot = 50;
+                for (std::size_t first = 0; first < frames.size() && i < result.size(); first += views_per_slot, ++i)
+                    result[i].assign(std::make_move_iterator(frames.begin() + first),
+                                     std::make_move_iterator(frames.begin() + first + views_per_slot));
+                if (value == 127)
+                    break;
+            } else {
+                result[i++] = std::move(frames);
+            }
+        }
+        if (std::any_of(result.begin(), result.end(), [](const auto& bank) { return !bank.empty(); }))
+            return result;
+        return {};
+    };
+    if (const auto original = pc98_wall_selection(scripts, map_id))
+        if (auto result = assemble(*original, true))
+            return std::move(*result);
+    for (const auto& script : scripts) {
         if (script.id != map_id)
             continue;
         const auto& bytes = script.bytes;
         for (std::size_t pos = 0; pos + 7 <= bytes.size(); ++pos) {
             if (bytes[pos] != 0x37 || bytes[pos + 1] || bytes[pos + 3] || bytes[pos + 5])
                 continue;
-            WallBanks result;
-            bool found = true;
-            for (unsigned i = 0; i < result.size();) {
-                const auto value = bytes[pos + 2 + 2 * i];
-                if (script.pc98 && value == 255) {
-                    ++i;
-                    continue;
-                }
-                std::string name;
-                const DaxRecord* record = nullptr;
-                const auto id = value == 127 || value == 255 ? (script.pc98 ? 0u : map_id) : value;
-                if (!resources.wall_location(id, name, record)) {
-                    found = false;
-                    break;
-                }
-                result[i] = resources.assemble(*record, name);
-                // One multipart PC-98 definition can supply consecutive wall slots.
-                if (script.pc98 && value == 127)
-                    break;
-                i += script.pc98 ? std::max<std::size_t>(1, record->bytes.size() / 780) : 1;
-            }
-            if (found && std::any_of(result.begin(), result.end(), [](const auto& bank) { return !bank.empty(); }))
-                return result;
+            if (auto result = assemble({bytes[pos+2], bytes[pos+4], bytes[pos+6]}, script.pc98))
+                return std::move(*result);
         }
     }
     throw std::runtime_error("No matching DOS wall sets found in the companion ECL archive");
@@ -404,9 +448,11 @@ Frame wall_perspective(const GeoMap& map, const WallBanks& banks, int x, int y, 
             return;
         const Frame* piece = nullptr;
         for (const auto& bank : banks) {
-            const auto count = bank.size() / 10;
+            const auto count = scale == 2 ? 5 : bank.size() / 10;
             if (type <= count) {
-                piece = &bank[(type - 1) * 10 + view];
+                const auto index = (type - 1) * 10 + view;
+                if (index < bank.size())
+                    piece = &bank[index];
                 break;
             }
             type -= count;

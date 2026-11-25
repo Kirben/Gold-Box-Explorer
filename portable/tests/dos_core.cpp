@@ -566,6 +566,24 @@ void walls(const fs::path& dir)
     const auto pixel = (20 * 88 + 40) * 4;
     check(view.rgba.at(pixel) == 173 && view.rgba.at(pixel + 1) == 0,
           "Front wall is missing from the perspective");
+
+    WallBanks pc98;
+    pc98[2].resize(50);
+    for (auto& piece : pc98[2])
+        piece = {3, 0, 16, 16, Bytes(16 * 16 * 4, 255)};
+    auto& front = pc98[2][6];
+    front.width = 112;
+    front.height = 128;
+    front.rgba.resize(front.width * front.height * 4);
+    for (std::size_t at = 0; at < front.rgba.size(); at += 4) {
+        front.rgba[at + 1] = 0;
+        front.rgba[at + 2] = 0;
+        front.rgba[at + 3] = 255;
+    }
+    map[8 * 16 + 8].walls[0] = 11;
+    const auto slot_three = wall_perspective(map, pc98, 8, 8, 0);
+    check(slot_three.width == 176 && slot_three.rgba.at((40 * 176 + 80) * 4 + 1) == 0,
+          "PC-98 map preview collapsed empty wall slots");
 }
 
 Bytes character()
