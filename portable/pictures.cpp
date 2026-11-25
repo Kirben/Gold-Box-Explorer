@@ -1,6 +1,7 @@
 #include "pictures.h"
 #include "amiga_pictures.h"
 #include "dax.h"
+#include "pc98.h"
 
 #include <algorithm>
 #include <array>
@@ -471,6 +472,8 @@ void add_final_clip(const std::vector<DaxRecord>& records, PictureArchive& archi
 
 bool is_picture_archive(const std::filesystem::path& path)
 {
+    if (is_pc98_title(path))
+        return true;
     static const std::regex daa(
         R"((8X8D|BACK|BIGPIC|BODY|BORDERS?|COMSPR|CPIC|DUNGCOM|HEAD|HITEK|LOTEK|MARSCOM|PIC|RANDCOM|SHIPS|SKY|SPACETVL|SPRIT|VENUSCOM|WILDCOM)[0-9]*\.DAA)",
         std::regex::icase);
@@ -494,21 +497,45 @@ std::vector<DaxRecord> read_dax(const std::filesystem::path& path)
     if (table_size % 9 || start > file.size())
         throw std::runtime_error("Invalid DAX directory");
 
-    std::vector<DaxRecord> records;
+    struct Entry {
+        unsigned id, raw, packed;
+        std::size_t offset;
+    };
+    std::vector<Entry> directory;
+    bool pc98 = true, saw_type5 = false;
     for (std::size_t entry = 2; entry < start; entry += 9) {
         const std::size_t offset = word(file, entry + 1) | (word(file, entry + 3) << 16);
         const auto raw = word(file, entry + 5);
         const auto packed = word(file, entry + 7);
         if (offset > file.size() - start || packed > file.size() - start - offset)
             throw std::runtime_error("DAX directory entry points outside the archive");
-        records.push_back({file[entry], packed,
-                           packed ? unpack(file, start + offset, packed, raw) : Bytes{}});
+        directory.push_back({file[entry], raw, packed, start + offset});
+        pc98 &= packed && (file[start + offset] == 5 || file[start + offset] == 0xff);
+        saw_type5 |= packed && file[start + offset] == 5;
     }
+    std::vector<DaxRecord> records;
+    records.reserve(directory.size());
+    if (pc98 && saw_type5) {
+        for (const auto& entry : directory) {
+            auto raw = expand_pc98(file.data() + entry.offset, entry.packed, entry.raw);
+            if (!raw)
+                break;
+            records.push_back({entry.id, entry.packed, std::move(*raw), true});
+        }
+        if (records.size() == directory.size())
+            return records;
+        records.clear();
+    }
+    for (const auto& entry : directory)
+        records.push_back({entry.id, entry.packed,
+            entry.packed ? unpack(file, entry.offset, entry.packed, entry.raw) : Bytes{}});
     return records;
 }
 
 PictureArchive read_pictures(const std::filesystem::path& path)
 {
+    if (is_pc98_title(path))
+        return read_pc98_title(path);
     if (auto amiga = try_amiga_pictures(path))
         return std::move(*amiga);
     PictureArchive archive;
@@ -523,6 +550,8 @@ PictureArchive read_pictures(const std::filesystem::path& path)
     const bool encounter = std::regex_match(filename, sprites);
     const bool mono_tiles = std::regex_match(filename, tiles);
     const auto records = read_dax(path);
+    if (!records.empty() && records.front().pc98)
+        return read_pc98_pictures(path, records);
     for (const auto& record : records) {
         if (!record.stored_size)
             continue;

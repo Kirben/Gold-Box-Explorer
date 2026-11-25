@@ -840,6 +840,22 @@ void ecl_scripts(const fs::path& dir)
     check(amiga_rows.size() == 1 && amiga_rows[0].id == 34 &&
           has_field(amiga_rows[0], {"Platform", "Amiga"}) &&
           has_field(amiga_rows[0], {"$801E", "$00  EXIT"}), "Amiga GLIB directory or script offsets disagree");
+
+    Bytes japanese{0x88, 0x13};
+    for (unsigned i = 0; i < 5; ++i)
+        japanese.insert(japanese.end(), {1, 1, 0x14, 0x99});
+    japanese.insert(japanese.end(), {0x11, 0x80, 0x82, 0xa0, 0x6f, 0, 0});
+    const auto pc98 = dir / "ECL2.DAX";
+    Bytes packed{18,0,3,0,0,0,0,29,0,32,0,4,32,0,0,0,29,0,30,0,5,0,29};
+    packed.insert(packed.end(), japanese.begin(), japanese.end());
+    packed.push_back(0xff);
+    packed.insert(packed.end(), japanese.begin(), japanese.end());
+    write(pc98, packed);
+    const auto localized = read_ecl_rows(pc98);
+    check(localized.size() == 2 && has_field(localized[0], {"Platform", "PC-98"}) &&
+          has_field(localized[0], {"$9914", "$11  PRINT \"\xe3\x81\x82\xe3\x83\x89\""}) &&
+          has_field(localized[1], {"$991A", "$00  EXIT"}),
+          "PC-98 DAX literal/raw records or zero-terminated Shift-JIS broke ECL alignment");
 }
 }
 

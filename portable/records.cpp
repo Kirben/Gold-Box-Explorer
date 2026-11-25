@@ -4,6 +4,7 @@
 #include "ecl_containers.h"
 #include "item_names.h"
 #include "frua_item_names.h"
+#include "pc98.h"
 
 #include <algorithm>
 #include <cctype>
@@ -27,10 +28,13 @@ std::string upper(std::string name)
     return name;
 }
 
-std::string name_at(const std::uint8_t* data, unsigned capacity)
+std::string name_at(const std::uint8_t* data, unsigned capacity, bool pc98 = false)
 {
+    const auto length = std::min<unsigned>(data[0], capacity);
+    if (pc98)
+        return pc98_text({reinterpret_cast<const char*>(data + 1), length});
     std::string name;
-    for (unsigned i = 1; i <= std::min<unsigned>(data[0], capacity); ++i) {
+    for (unsigned i = 1; i <= length; ++i) {
         const auto c = data[i];
         name += c >= 32 && c < 127 ? static_cast<char>(c) : '?';
     }
@@ -369,9 +373,9 @@ bool merged(const std::vector<DaxRecord>& records)
     });
 }
 
-RecordRow monster(unsigned id, const std::uint8_t* b)
+RecordRow monster(unsigned id, const std::uint8_t* b, bool pc98 = false)
 {
-    RecordRow row{id, 0, name_at(b, 15), {}};
+    RecordRow row{id, 0, name_at(b, 15, pc98), {}};
     if (row.name.empty())
         row.name = "Monster " + std::to_string(id);
     field(row, "Record ID", id);
@@ -432,7 +436,7 @@ RecordRow read_monster(const DaxRecord& record)
     const auto size = record.bytes.size();
     const auto* b = record.bytes.data();
     if (size == monster_size)
-        return monster(record.id, b);
+        return monster(record.id, b, record.pc98);
     if (!known_monster_size(size))
         throw std::runtime_error("Unsupported DOS monster record size: " + std::to_string(size));
     RecordRow row{record.id, 0, name_at(b, 15), {}};
@@ -484,9 +488,10 @@ RecordRow read_monster(const DaxRecord& record)
     return row;
 }
 
-RecordRow item(unsigned id, unsigned slot, const std::uint8_t* b, const std::string* owner, bool pool_names = true)
+RecordRow item(unsigned id, unsigned slot, const std::uint8_t* b, const std::string* owner,
+               bool pool_names = true, bool pc98 = false)
 {
-    RecordRow row{id, slot, name_at(b, 40), {}};
+    RecordRow row{id, slot, name_at(b, 40, pc98), {}};
     std::string resolved;
     for (unsigned offset : {49, 48, 47}) {
         const auto component = pool_names ? item_components[b[offset]] : std::string_view{};
@@ -806,7 +811,7 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
                     } else if (!amiga && known_monster_size(record.bytes.size())) {
                         owner_size = record.bytes.size();
                         if (kind != RecordKind::items)
-                            owners.emplace(record.id, name_at(record.bytes.data(), 15));
+                            owners.emplace(record.id, name_at(record.bytes.data(), 15, record.pc98));
                     }
                 }
             } catch (const std::exception&) {
@@ -869,7 +874,7 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
                     rows.push_back(compact_item(record.id, slot, b, stride, owner));
                 else
                     rows.push_back(item(record.id, slot, b, owner, owner_size == monster_size ||
-                        (!owner_size && (kind != RecordKind::items || filename == "ITEM.DAX"))));
+                        (!owner_size && (kind != RecordKind::items || filename == "ITEM.DAX")), record.pc98));
             }
         }
     }

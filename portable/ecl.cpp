@@ -1,6 +1,7 @@
 #include "ecl.h"
 #include "ecl_containers.h"
 #include "ecl_ops.h"
+#include "pc98.h"
 #include "tlb.h"
 
 #include <algorithm>
@@ -97,11 +98,32 @@ struct Operand {
     std::string text;
 };
 
-Operand operand(const Bytes& bytes, std::size_t& offset, bool buck)
+Operand operand(const Bytes& bytes, std::size_t& offset, bool buck, bool pc98)
 {
     Operand result;
     result.tag = little(bytes, offset++, 1);
     if (result.tag == 0x80) {
+        if (pc98) {
+            const auto start = bytes.begin() + offset;
+            const auto end = std::find(start, bytes.end(), 0);
+            if (end == bytes.end())
+                throw std::runtime_error("unterminated PC-98 string");
+            result.text = "\"";
+            for (char c : pc98_text({reinterpret_cast<const char*>(bytes.data() + offset),
+                                     static_cast<std::size_t>(end - start)})) {
+                if (c == '"' || c == '\\')
+                    result.text += '\\';
+                if (c == '\n')
+                    result.text += "\\n";
+                else if (c == '\r')
+                    result.text += "\\r";
+                else
+                    result.text += c;
+            }
+            result.text += '"';
+            offset += end - start + 1;
+            return result;
+        }
         const unsigned length = little(bytes, offset++, 1);
         if (length > bytes.size() - offset)
             throw std::runtime_error("truncated packed string");
@@ -183,7 +205,7 @@ struct Instruction {
     std::vector<Operand> args;
 };
 
-Instruction decode(const Bytes& bytes, std::size_t offset, const ecl::Opcodes& ops, bool buck)
+Instruction decode(const Bytes& bytes, std::size_t offset, const ecl::Opcodes& ops, bool buck, bool pc98)
 {
     Instruction result;
     result.code = little(bytes, offset++, 1);
@@ -191,13 +213,13 @@ Instruction decode(const Bytes& bytes, std::size_t offset, const ecl::Opcodes& o
     if (!op.name)
         throw std::runtime_error("unknown opcode " + hex(result.code, 2));
     for (unsigned i = 0; i < op.count; ++i)
-        result.args.push_back(operand(bytes, offset, buck));
+        result.args.push_back(operand(bytes, offset, buck, pc98));
     if (op.list) {
         const auto count = result.args.back();
         if (count.tag != 0 && count.tag != 2 && count.tag != 4)
             throw std::runtime_error("operand list has a runtime-dependent length");
         for (unsigned i = 0; i < count.value; ++i)
-            result.args.push_back(operand(bytes, offset, buck));
+            result.args.push_back(operand(bytes, offset, buck, pc98));
     }
     result.end = offset;
     return result;
@@ -208,6 +230,8 @@ RecordRow read_script(DaxRecord record, unsigned slot, std::string game, bool pr
 {
     RecordRow row{record.id, slot, "Script " + std::to_string(record.id), {}};
     auto& bytes = record.bytes;
+    if (record.pc98 && game.empty())
+        game = "por";
     if ((c64_file || prefixed) && bytes.size() >= 2 &&
         (c64_file || little(bytes, 0, 2) == 0x1388))
         bytes.erase(bytes.begin(), bytes.begin() + 2);
@@ -224,6 +248,8 @@ RecordRow read_script(DaxRecord record, unsigned slot, std::string game, bool pr
         row.fields.emplace_back("Platform", "Commodore 64");
     if (amiga_file && game != "amiga")
         row.fields.emplace_back("Platform", "Amiga");
+    if (record.pc98)
+        row.fields.emplace_back("Platform", "PC-98");
     const bool buck = game == "countdown" || game == "matrix";
     auto ops = ecl::opcodes(game);
     if (game.empty()) {
@@ -252,7 +278,7 @@ RecordRow read_script(DaxRecord record, unsigned slot, std::string game, bool pr
             continue;
         const auto address = hex(base + static_cast<unsigned>(offset));
         try {
-            const auto ins = decode(bytes, offset, ops, buck);
+            const auto ins = decode(bytes, offset, ops, buck, record.pc98);
             if (std::find(occupied.begin() + offset, occupied.begin() + ins.end, true) != occupied.begin() + ins.end)
                 throw std::runtime_error("instruction overlaps previously decoded bytes");
             std::fill(occupied.begin() + offset, occupied.begin() + ins.end, true);
@@ -288,7 +314,7 @@ RecordRow read_script(DaxRecord record, unsigned slot, std::string game, bool pr
             const bool conditional = ins.code >= 0x16 && ins.code <= 0x1b;
             if (conditional || skip) {
                 try {
-                    pending.push_back(decode(bytes, ins.end, ops, buck).end);
+                    pending.push_back(decode(bytes, ins.end, ops, buck, record.pc98).end);
                 } catch (const std::runtime_error&) {
                     line += " [could not decode skipped instruction]";
                 }

@@ -1,6 +1,7 @@
 #include "walls.h"
 #include "amiga_pictures.h"
 #include "ecl_containers.h"
+#include "pc98.h"
 #include "tlb.h"
 
 #include <algorithm>
@@ -25,20 +26,23 @@ std::vector<Frame> compose_pieces(const DaxRecord& record, const std::vector<con
     constexpr unsigned offsets[] = {0, 2, 6, 10, 22, 38, 54, 110, 132, 154};
     constexpr unsigned widths[] = {1, 1, 1, 3, 2, 2, 7, 2, 2, 1};
     constexpr unsigned heights[] = {2, 4, 4, 4, 8, 8, 8, 11, 11, 2};
+    const auto first_tile = std::find_if(bank.begin(), bank.end(), [](const auto* tile) { return tile; });
+    const auto tile_size = first_tile == bank.end() ? 8u : (*first_tile)->width;
     std::vector<Frame> pieces;
     for (std::size_t start = 0; start < record.bytes.size(); start += 156) {
         for (unsigned view = 0; view < 10; ++view) {
-            Frame frame{record.id, static_cast<unsigned>(pieces.size()), widths[view] * 8, heights[view] * 8, {}};
+            Frame frame{record.id, static_cast<unsigned>(pieces.size()), widths[view] * tile_size,
+                        heights[view] * tile_size, {}};
             frame.rgba.resize(frame.width * frame.height * 4);
             for (unsigned row = 0; row < heights[view]; ++row) {
                 for (unsigned col = 0; col < widths[view]; ++col) {
                     const auto index = record.bytes[start + offsets[view] + row * widths[view] + col];
-                    for (unsigned y = 0; y < 8; ++y) {
-                        auto dest = frame.rgba.begin() + 4 * ((row * 8 + y) * frame.width + col * 8);
+                    for (unsigned y = 0; y < tile_size; ++y) {
+                        auto dest = frame.rgba.begin() + 4 * ((row * tile_size + y) * frame.width + col * tile_size);
                         if (index && index < bank.size() && bank[index])
-                            std::copy_n(bank[index]->rgba.begin() + y * 32, 32, dest);
+                            std::copy_n(bank[index]->rgba.begin() + y * tile_size * 4, tile_size * 4, dest);
                         else if (amiga && index) {
-                            for (unsigned x = 0; x < 8; ++x) {
+                            for (unsigned x = 0; x < tile_size; ++x) {
                                 const bool light = ((x / 2) + (y / 2)) % 2;
                                 *dest++ = light ? 255 : 80;
                                 *dest++ = 0;
@@ -47,7 +51,7 @@ std::vector<Frame> compose_pieces(const DaxRecord& record, const std::vector<con
                             }
                         }
                         else if (!index && !amiga) {
-                            for (unsigned x = 0; x < 8; ++x) {
+                            for (unsigned x = 0; x < tile_size; ++x) {
                                 *dest++ = 255; *dest++ = 82; *dest++ = 255; *dest++ = 255;
                             }
                         }
@@ -128,6 +132,12 @@ public:
         for (const auto& record : archive(name)) {
             if (record.id != id)
                 continue;
+            if (record.pc98) {
+                auto frames = decode_pc98_wall_tiles(record);
+                result.insert(result.end(), std::make_move_iterator(frames.begin()),
+                              std::make_move_iterator(frames.end()));
+                continue;
+            }
             for (auto& tile : decode_picture_record(record.bytes, id)) {
                 if (tile.width != 8 || tile.height != 8)
                     throw std::runtime_error("Wall tile bank contains a picture larger or smaller than 8x8");
@@ -172,7 +182,7 @@ public:
         if (bank.size() == 1)
             throw std::runtime_error("No matching 8X8D tiles found for the wall definition");
 
-        return compose_pieces(record, bank, false);
+        return compose_pieces(record, bank, record.pc98);
     }
 
     bool wall_location(unsigned id, std::string& name, const DaxRecord*& record)
@@ -346,17 +356,26 @@ WallBanks load_map_walls(const fs::path& geo_path, unsigned map_id)
                 continue;
             WallBanks result;
             bool found = true;
-            for (unsigned i = 0; i < result.size(); ++i) {
+            for (unsigned i = 0; i < result.size();) {
                 const auto value = bytes[pos + 2 + 2 * i];
+                if (script.pc98 && value == 255) {
+                    ++i;
+                    continue;
+                }
                 std::string name;
                 const DaxRecord* record = nullptr;
-                if (!resources.wall_location(value == 127 || value == 255 ? map_id : value, name, record)) {
+                const auto id = value == 127 || value == 255 ? (script.pc98 ? 0u : map_id) : value;
+                if (!resources.wall_location(id, name, record)) {
                     found = false;
                     break;
                 }
                 result[i] = resources.assemble(*record, name);
+                // One multipart PC-98 definition can supply consecutive wall slots.
+                if (script.pc98 && value == 127)
+                    break;
+                i += script.pc98 ? std::max<std::size_t>(1, record->bytes.size() / 780) : 1;
             }
-            if (found)
+            if (found && std::any_of(result.begin(), result.end(), [](const auto& bank) { return !bank.empty(); }))
                 return result;
         }
     }
@@ -365,7 +384,11 @@ WallBanks load_map_walls(const fs::path& geo_path, unsigned map_id)
 
 Frame wall_perspective(const GeoMap& map, const WallBanks& banks, int x, int y, int direction)
 {
-    Frame result{0, 0, 88, 88, std::vector<std::uint8_t>(88 * 88 * 4, 255)};
+    const auto nonempty = std::find_if(banks.begin(), banks.end(), [](const auto& bank) { return !bank.empty(); });
+    const auto scale = nonempty == banks.end() ? 1 : static_cast<int>(nonempty->front().width / 8);
+    const auto size = 88 * scale;
+    Frame result{0, 0, static_cast<unsigned>(size), static_cast<unsigned>(size),
+                 std::vector<std::uint8_t>(size * size * 4, 255)};
     constexpr int dx[] = {0, 1, 0, -1};
     constexpr int dy[] = {-1, 0, 1, 0};
     const auto right = (direction + 1) % 4;
@@ -390,14 +413,16 @@ Frame wall_perspective(const GeoMap& map, const WallBanks& banks, int x, int y, 
         }
         if (!piece)
             return;
+        px *= scale;
+        py *= scale;
         for (int row = 0; row < static_cast<int>(piece->height); ++row) {
             for (int col = 0; col < static_cast<int>(piece->width); ++col) {
-                if (row + py < 0 || row + py >= 88 || col + px < 0 || col + px >= 88)
+                if (row + py < 0 || row + py >= size || col + px < 0 || col + px >= size)
                     continue;
                 const auto pixel = piece->rgba.data() + 4 * (row * piece->width + col);
                 if (!pixel[3] || (pixel[0] == 255 && pixel[1] == 82 && pixel[2] == 255))
                     continue;
-                std::copy_n(pixel, 4, result.rgba.data() + 4 * ((row + py) * 88 + col + px));
+                std::copy_n(pixel, 4, result.rgba.data() + 4 * ((row + py) * size + col + px));
             }
         }
     };
