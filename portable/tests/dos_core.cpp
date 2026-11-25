@@ -5,6 +5,7 @@
 #include "save_map.h"
 #include "walls.h"
 #include "tlb.h"
+#include "vace.h"
 
 #include <algorithm>
 #include <fstream>
@@ -117,6 +118,48 @@ void tlb(const fs::path& dir)
     write(dir / "CPIC0001.TLB", tlb_library("TILE", {tlb_image(21, {32, 32, 32, 32})}));
     check(read_tlb(dir / "CPIC0001.TLB").frames[0].rgba[0] == 10,
           "FRUA combat icon did not load the companion palette");
+}
+
+void vace(const fs::path& dir)
+{
+    const Bytes first{64, 1, 200, 0, 0, 0, 128, 2, 3, 2, 1, 2, 255};
+    const Bytes delta{64, 1, 200, 0, 0, 1, 128, 1, 2, 0, 3, 255};
+    const auto size = static_cast<std::uint8_t>(14 + first.size() + delta.size());
+    Bytes bma{size, 0, 0, 0, 2, 0, 14, 0, 0, 0,
+              static_cast<std::uint8_t>(14 + first.size()), 0, 0, 0};
+    bma.insert(bma.end(), first.begin(), first.end());
+    bma.insert(bma.end(), delta.begin(), delta.end());
+    const Bytes acf{6, 2, 63, 1, 0, 0, 6, 2, 0, 2, 63, 0, 6, 2, 0, 3, 0, 63,
+                    2, 3, 2, 12, 2, 11, 4, 0, 16, 0, 2, 3, 8, 5, 0, 0, 2, 0, size, 0, 2, 1};
+    const auto picture = dir / "intro.bma";
+    const auto control = dir / "INTRO.ACF";
+    write(picture, bma);
+    write(control, acf);
+    check(is_vace_archive(picture) && is_vace_archive(control), "VACE filename recognition failed");
+    const auto archive = read_vace(control);
+    check(archive.gallery_count() == 2 && archive.frames.size() == 3 && archive.clips.size() == 1,
+          "VACE gallery or playback frame count is wrong");
+    const auto& a = archive.frames[0];
+    const auto& b = archive.frames[1];
+    const Bytes colors{255, 0, 0, 255, 0, 0, 255, 255};
+    const Bytes next{0, 0, 0, 255, 0, 255, 0, 255};
+    check(a.width == 320 && a.height == 200 && std::equal(colors.begin(), colors.end(), a.rgba.begin()) &&
+          std::equal(next.begin(), next.end(), b.rgba.begin()), "VACE palette, span or clear mismatch");
+    const auto& steps = archive.clips[0].steps;
+    check(steps.size() == 4 && steps[0].frame == 0 && steps[0].duration_ms == 14 &&
+          steps[1].frame == 0 && steps[1].duration_ms == 2000 &&
+          steps[2].frame == 2 && steps[2].duration_ms == 15 &&
+          steps[3].frame == 1 && steps[3].duration_ms == 229, "VACE scene order or preview timing mismatch");
+    check(read_vace(picture).frames[1].rgba == b.rgba, "Both halves of a VACE pair should open the same gallery");
+    auto corrupt = acf;
+    corrupt[corrupt.size() - 4] = size - 1;
+    write(control, corrupt);
+    try {
+        read_vace(picture);
+    } catch (const std::runtime_error&) {
+        return;
+    }
+    throw std::runtime_error("VACE accepted a mismatched group table");
 }
 
 void geo(const fs::path& dir)
@@ -255,6 +298,7 @@ int main(int argc, char** argv)
         fs::create_directories(dir);
         if (name == "pictures") pictures(dir);
         else if (name == "tlb") tlb(dir);
+        else if (name == "vace") vace(dir);
         else if (name == "geo") geo(dir);
         else if (name == "walls") walls(dir);
         else if (name == "records") records(dir);

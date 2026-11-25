@@ -1,5 +1,6 @@
 #include "pictures.h"
 #include "tlb.h"
+#include "vace.h"
 #include "dax.h"
 #include "records.h"
 #include "save_map.h"
@@ -39,7 +40,8 @@ int main(int argc, char** argv)
                 continue;
             }
             const bool tlb = goldbox::is_tlb_archive(argv[arg]);
-            if (!tlb && !goldbox::is_picture_archive(argv[arg])) {
+            const bool vace = goldbox::is_vace_archive(argv[arg]);
+            if (!tlb && !vace && !goldbox::is_picture_archive(argv[arg])) {
                 const auto records = goldbox::read_dax(argv[arg]);
                 std::cout << argv[arg] << ": " << records.size() << " records\n";
                 for (const auto& record : records)
@@ -47,8 +49,9 @@ int main(int argc, char** argv)
                               << record.bytes.size() << " decoded\n";
                 continue;
             }
-            const auto archive = tlb ? goldbox::read_tlb(argv[arg]) : goldbox::read_pictures(argv[arg]);
-            std::cout << argv[arg] << ": " << archive.frames.size() << " frames";
+            const auto archive = tlb ? goldbox::read_tlb(argv[arg])
+                : vace ? goldbox::read_vace(argv[arg]) : goldbox::read_pictures(argv[arg]);
+            std::cout << argv[arg] << ": " << archive.gallery_count() << " frames";
             if (!archive.skipped_ids.empty()) {
                 std::cout << " (skipped record IDs:";
                 for (const auto id : archive.skipped_ids)
@@ -58,12 +61,17 @@ int main(int argc, char** argv)
             std::cout << '\n';
             for (const auto& clip : archive.clips) {
                 std::cout << "Animation " << clip.id << ':';
-                for (const auto& step : clip.steps)
-                    std::cout << ' ' << archive.frames[step.frame].index + 1 << '@'
-                              << step.duration_ms << "ms";
+                for (const auto& step : clip.steps) {
+                    if (step.frame < archive.gallery_count())
+                        std::cout << ' ' << archive.frames[step.frame].index + 1;
+                    else
+                        std::cout << " clear";
+                    std::cout << '@' << step.duration_ms << "ms";
+                }
                 std::cout << '\n';
             }
-            for (const auto& frame : archive.frames) {
+            for (std::size_t i = 0; i < archive.gallery_count(); ++i) {
+                const auto& frame = archive.frames[i];
                 std::uint64_t hash = 14695981039346656037ull;
                 for (auto byte : frame.rgba) {
                     hash ^= byte;

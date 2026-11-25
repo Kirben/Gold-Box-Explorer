@@ -1,6 +1,7 @@
 #include "pictures.h"
 #include "apng.h"
 #include "tlb.h"
+#include "vace.h"
 #include "dax.h"
 #include "geo.h"
 #include "walls.h"
@@ -509,7 +510,8 @@ private:
         const auto selected = files_->GetSelection();
         return !frames_.empty() && selected != wxNOT_FOUND &&
                (goldbox::is_picture_archive(paths_.at(selected)) ||
-                goldbox::is_tlb_archive(paths_.at(selected)));
+                goldbox::is_tlb_archive(paths_.at(selected)) ||
+                goldbox::is_vace_archive(paths_.at(selected)));
     }
 
     void export_frames()
@@ -524,8 +526,10 @@ private:
 
         std::set<wxString> names;
         std::vector<wxString> targets;
-        targets.reserve(frames_.size());
-        for (const auto& frame : frames_) {
+        const auto count = static_cast<std::size_t>(pictures_->GetCount());
+        targets.reserve(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto& frame = frames_[i];
             const auto suffix = frame_suffix(frame);
             auto name = export_name(suffix);
             for (unsigned copy = 2; !names.insert(name).second; ++copy)
@@ -540,7 +544,7 @@ private:
             targets.push_back(std::move(path));
         }
 
-        for (std::size_t i = 0; i < frames_.size(); ++i) {
+        for (std::size_t i = 0; i < count; ++i) {
             wxFile file;
             bool saved = false;
             if (file.Create(targets[i], false)) {
@@ -555,12 +559,12 @@ private:
             }
             if (!saved) {
                 wxMessageBox(wxString::Format("Export stopped after saving %zu of %zu frames.\n", i,
-                                              frames_.size()) + targets[i],
+                                              count) + targets[i],
                              "Export All Frames", wxOK | wxICON_ERROR, this);
                 return;
             }
         }
-        SetStatusText(wxString::Format("Exported %zu PNG frames", frames_.size()));
+        SetStatusText(wxString::Format("Exported %zu PNG frames", count));
     }
 
     void export_animation()
@@ -636,8 +640,9 @@ private:
         const auto selected = files_->GetSelection();
         const bool wall = selected != wxNOT_FOUND && goldbox::is_wall_archive(paths_.at(selected));
         const bool tlb = selected != wxNOT_FOUND && goldbox::is_tlb_archive(paths_.at(selected));
+        const bool vace = selected != wxNOT_FOUND && goldbox::is_vace_archive(paths_.at(selected));
         const bool picture = selected != wxNOT_FOUND &&
-            (wall || tlb || goldbox::is_picture_archive(paths_.at(selected)));
+            (wall || tlb || vace || goldbox::is_picture_archive(paths_.at(selected)));
         show_view(picture, selected != wxNOT_FOUND && !picture);
         SetStatusText("Choose a file to inspect.");
         if (selected != wxNOT_FOUND) {
@@ -703,16 +708,22 @@ private:
                     return;
                 }
                 auto archive = wall ? goldbox::PictureArchive{goldbox::read_wall_pieces(path), {}}
-                                    : tlb ? goldbox::read_tlb(path) : goldbox::read_pictures(path);
+                                    : tlb ? goldbox::read_tlb(path)
+                                    : vace ? goldbox::read_vace(path) : goldbox::read_pictures(path);
                 if (archive.frames.empty())
                     throw std::runtime_error("Archive contains no wall pieces");
+                const auto count = archive.gallery_count();
                 frames_ = std::move(archive.frames);
                 clips_ = std::move(archive.clips);
-                for (const auto& frame : frames_)
-                    pictures_->Append(wxString::Format(wall ? "$%02X   Piece %u" : "$%02X   Frame %u",
-                                                       frame.id, frame.index + 1));
+                for (std::size_t i = 0; i < count; ++i) {
+                    const auto& frame = frames_[i];
+                    const auto label = vace ? wxString::Format("Frame %u", frame.index + 1)
+                        : wxString::Format(wall ? "$%02X   Piece %u" : "$%02X   Frame %u",
+                                           frame.id, frame.index + 1);
+                    pictures_->Append(label);
+                }
                 pictures_->SetSelection(0);
-                auto status = wxString::Format("%zu picture frames", frames_.size());
+                auto status = wxString::Format("%zu picture frames", count);
                 if (!clips_.empty())
                     status += wxString::Format("   |   %zu animations", clips_.size());
                 if (!archive.skipped_ids.empty())
@@ -720,7 +731,7 @@ private:
                 SetStatusText(status);
             } catch (const std::exception& error) {
                 auto message = wxString::FromUTF8(error.what());
-                if (archive_file || tlb || kind != goldbox::RecordKind::none || world) {
+                if (archive_file || tlb || vace || kind != goldbox::RecordKind::none || world) {
                     try {
                         hex_->open(paths_.at(selected));
                         show_view(false, true);

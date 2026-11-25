@@ -25,6 +25,8 @@ struct PictureArchive {
         std::vector<Step> steps;
     };
     std::vector<Clip> clips;
+    std::size_t playback_only_frames = 0; // Synthetic frames appended after the gallery frames.
+    std::size_t gallery_count() const { return frames.size() - playback_only_frames; }
 };
 
 bool is_picture_archive(const std::filesystem::path& path);
