@@ -41,14 +41,14 @@ std::string name_at(const std::uint8_t* data, unsigned capacity, bool pc98 = fal
     return name;
 }
 
-std::vector<std::uint8_t> read_save(const std::filesystem::path& path)
+std::vector<std::uint8_t> read_record_file(const std::filesystem::path& path)
 {
     std::ifstream file(path, std::ios::binary);
     if (!file)
-        throw std::runtime_error("Unable to open DOS save component");
+        throw std::runtime_error("Unable to open record file");
     std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(file), {}};
     if (file.bad())
-        throw std::runtime_error("Unable to read DOS save component");
+        throw std::runtime_error("Unable to read record file");
     return bytes;
 }
 
@@ -598,12 +598,63 @@ RecordRow effect(unsigned id, unsigned slot, const std::uint8_t* b, const std::s
     return row;
 }
 
+std::vector<RecordRow> read_base_items(const std::filesystem::path& path)
+{
+    const auto bytes = read_record_file(path);
+    constexpr unsigned gold_box_count = 128, buck_rogers_count = 39;
+    constexpr unsigned gold_box_stride = 16, gateway_stride = 24, buck_rogers_stride = 9;
+    const bool gateway = bytes.size() == 2 + gold_box_count * gateway_stride;
+    const bool buck_rogers = bytes.size() == buck_rogers_count * buck_rogers_stride;
+    const bool has_header = gateway || bytes.size() == 2 + gold_box_count * gold_box_stride;
+    if (!has_header && !buck_rogers && bytes.size() != gold_box_count * gold_box_stride)
+        throw std::runtime_error("Unrecognized standalone ITEMS table size");
+    const unsigned stride = gateway ? gateway_stride : buck_rogers ? buck_rogers_stride : gold_box_stride;
+    const unsigned count = buck_rogers ? buck_rogers_count : gold_box_count;
+    std::vector<RecordRow> rows;
+    rows.reserve(count);
+    for (unsigned id = 0; id < count; ++id) {
+        const unsigned offset = (has_header ? 2 : 0) + id * stride;
+        const auto* item = bytes.data() + offset;
+        RecordRow row{id, 0, "Base item " + std::to_string(id), {}};
+        field(row, "Base item type", id);
+        field(row, "File offset", offset);
+        field(row, "Equipment slot", item[0]);
+        if (buck_rogers) {
+            field(row, "Attacks per round (doubled)", item[1]);
+            field(row, "Weapon class / armour class code", item[2]);
+            field(row, "Heavy equipment", item[3]);
+            field(row, "Damage dice count", item[4]);
+            field(row, "Damage die sides", item[5]);
+            field(row, "Damage modifier", signed_byte(item[6]));
+            field(row, "Range", item[7]);
+            field(row, "Consumable", item[8]);
+        } else {
+            field(row, "Hands required", item[1]);
+            field(row, "Large target damage dice count", item[2]);
+            field(row, "Large target damage die sides", item[3]);
+            field(row, "Large target damage modifier", signed_byte(item[4]));
+            field(row, "Rate of fire (doubled)", item[5]);
+            field(row, "Armour class descriptor", item[6]);
+            field(row, "Weapon class / damage type flags", item[7]);
+            field(row, "Small or medium target damage dice count", item[9]);
+            field(row, "Small or medium target damage die sides", item[10]);
+            field(row, "Small or medium target damage modifier", signed_byte(item[11]));
+            field(row, "Range (stored)", item[12]);
+            field(row, "Class usability mask", item[13]);
+            field(row, "Weapon property flags", item[14]);
+        }
+        row.fields.emplace_back("Stored bytes", raw_bytes(item, 0, stride));
+        rows.push_back(std::move(row));
+    }
+    return rows;
+}
+
 std::vector<RecordRow> read_vault(const std::filesystem::path& path)
 {
     constexpr unsigned header_size = 16;
     constexpr unsigned record_size = 18;
     constexpr unsigned padded_records = 50;
-    const auto bytes = read_save(path);
+    const auto bytes = read_record_file(path);
     const auto* data = bytes.data();
     if (bytes.size() < header_size + padded_records * record_size ||
         (bytes.size() - header_size) % record_size != 0 || word(data, 12) != 0xffff)
@@ -675,7 +726,7 @@ std::vector<RecordRow> read_vault(const std::filesystem::path& path)
 
 std::vector<RecordRow> read_save_rows(const std::filesystem::path& path, RecordKind kind)
 {
-    const auto bytes = read_save(path);
+    const auto bytes = read_record_file(path);
     if (kind == RecordKind::saved_character) {
         if (bytes.size() != monster_size)
             throw std::runtime_error("Expected a 285-byte Pool of Radiance DOS character save");
@@ -695,7 +746,7 @@ std::vector<RecordRow> read_save_rows(const std::filesystem::path& path, RecordK
         if (upper(entry.path().filename().string()) != companion)
             continue;
         try {
-            const auto character = read_save(entry.path());
+            const auto character = read_record_file(entry.path());
             if (character.size() == monster_size)
                 owner = name_at(character.data(), 15);
         } catch (const std::exception&) {
@@ -723,6 +774,7 @@ RecordKind record_kind(const std::filesystem::path& path)
     if (is_c64_record(path))
         return RecordKind::c64;
     const auto name = upper(path.filename().string());
+    if (name == "ITEMS" || name == "ITEMS.1") return RecordKind::base_items;
     if (name == "STRINGS.GLB") return RecordKind::amiga_text;
     if (name == "SOUNDS.GLB") return RecordKind::amiga_sound;
     static const std::regex monster_name(R"(MON[0-9]*(CHA|ITM|SPC)\.(DAX|GLB))");
@@ -752,6 +804,8 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
         throw std::runtime_error("Unrecognized DOS record archive");
     if (kind == RecordKind::vault)
         return read_vault(path);
+    if (kind == RecordKind::base_items)
+        return read_base_items(path);
     if (kind == RecordKind::ecl)
         return read_ecl_rows(path);
     if (kind == RecordKind::c64)

@@ -662,6 +662,30 @@ void item_archives(const fs::path& dir)
     check(gear.size() == 127 && has_field(gear[0], {"Equipped", "1"}) &&
           has_field(gear[0], {"Weight", "34"}) && has_field(gear[0], {"Value (credits)", "5"}),
           "Wrong Buck Rogers item template layout");
+
+    const auto base_path = dir / "ITEMS";
+    for (const unsigned header : {0, 2}) {
+        Bytes base(header + 128 * 16);
+        base[header + 16 + 4] = 0xfd;
+        base[header + 16 + 13] = 0x40;
+        write(base_path, base);
+        const auto rows = read_record_rows(base_path);
+        check(rows.size() == 128 && rows[1].id == 1 &&
+              has_field(rows[1], {"File offset", std::to_string(header + 16)}) &&
+              has_field(rows[1], {"Large target damage modifier", "-3"}) &&
+              has_field(rows[1], {"Class usability mask", "64"}), "Wrong standalone Gold Box ITEMS layout");
+    }
+    const auto gateway_path = dir / "ITEMS.1";
+    write(gateway_path, Bytes(2 + 128 * 24));
+    const auto gateway = read_record_rows(gateway_path);
+    check(gateway.size() == 128 && has_field(gateway[1], {"File offset", "26"}),
+          "Wrong Gateway ITEMS.1 stride");
+    Bytes buck_types(39 * 9);
+    buck_types[9 + 6] = 0xfe;
+    write(base_path, buck_types);
+    const auto types = read_record_rows(base_path);
+    check(types.size() == 39 && has_field(types[1], {"File offset", "9"}) &&
+          has_field(types[1], {"Damage modifier", "-2"}), "Wrong Buck Rogers ITEMS layout");
 }
 
 void numbered_monsters(const fs::path& dir)
