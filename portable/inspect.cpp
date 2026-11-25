@@ -60,9 +60,15 @@ int main(int argc, char** argv)
             }
             std::cout << '\n';
             for (const auto& clip : archive.clips) {
-                std::cout << "Animation " << clip.id << ':';
+                if (clip.whole_archive)
+                    std::cout << "Ending:";
+                else
+                    std::cout << "Animation " << clip.id << ':';
                 for (const auto& step : clip.steps) {
-                    if (step.frame < archive.gallery_count())
+                    if (clip.whole_archive) {
+                        const auto& frame = archive.frames[step.frame];
+                        std::cout << ' ' << frame.id << '.' << frame.index + 1;
+                    } else if (step.frame < archive.gallery_count())
                         std::cout << ' ' << archive.frames[step.frame].index + 1;
                     else
                         std::cout << " clear";

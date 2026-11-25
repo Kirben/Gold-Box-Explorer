@@ -108,6 +108,66 @@ void pictures(const fs::path& dir)
           "DAX graphics routing must retain distinct data handlers");
 }
 
+void ending(const fs::path& dir)
+{
+    const auto still = [](unsigned side, std::uint8_t color) {
+        Bytes bytes(17 + side * side / 2, color);
+        std::fill_n(bytes.begin(), 17, 0);
+        bytes[0] = static_cast<std::uint8_t>(side);
+        bytes[2] = static_cast<std::uint8_t>(side / 8);
+        bytes[8] = 1;
+        return bytes;
+    };
+    const auto animated = [](std::uint8_t master, std::uint8_t delta) {
+        Bytes bytes{2};
+        for (auto color : {master, delta}) {
+            Bytes frame(21 + 88 * 44, color);
+            std::fill_n(frame.begin(), 21, 0);
+            frame[0] = 5;
+            frame[4] = 88;
+            frame[6] = 11;
+            bytes.insert(bytes.end(), frame.begin(), frame.end());
+        }
+        return bytes;
+    };
+    const std::vector<Bytes> blocks{still(120, 0x11), animated(0x44, 0x40),
+        still(120, 0x22), still(8, 0x33), still(8, 0x55), still(8, 0x66),
+        animated(0x77, 0x07), animated(0x99, 0x09)};
+    Bytes archive{72, 0};
+    unsigned offset = 0;
+    for (unsigned i = 0; i < blocks.size(); ++i) {
+        const auto length = blocks[i].size();
+        archive.push_back(static_cast<std::uint8_t>(i + 1));
+        for (unsigned shift = 0; shift < 32; shift += 8)
+            archive.push_back(static_cast<std::uint8_t>(offset >> shift));
+        archive.insert(archive.end(), {0, 0, static_cast<std::uint8_t>(length),
+                                      static_cast<std::uint8_t>(length >> 8)});
+        offset += static_cast<unsigned>(length);
+    }
+    for (const auto& block : blocks)
+        archive.insert(archive.end(), block.begin(), block.end());
+    const auto path = dir / "FINAL5.DAX";
+    write(path, archive);
+    const auto ending = read_pictures(path);
+    check(ending.gallery_count() == 11 && ending.playback_only_frames == 10 &&
+          ending.clips.size() == 1 && ending.clips[0].whole_archive,
+          "FINAL gallery frames and assembled frames were not separated");
+    const auto& steps = ending.clips[0].steps;
+    check(steps.size() == 91 && steps[0].duration_ms == 220 &&
+          ending.frames.at(steps[0].frame).id == 2 && ending.frames.at(steps[44].frame).id == 7 &&
+          ending.frames.at(steps[88].frame).id == 8 && steps[90].frame == steps[89].frame &&
+          steps[90].duration_ms == 675, "FINAL scene order, repeats or timing mismatch");
+    const auto& first = ending.frames.at(steps[1].frame);
+    const auto& later = ending.frames.at(steps[44].frame);
+    check(first.width == 120 && first.height == 120 && first.rgba[2] == 170 &&
+          first.rgba[(32 * 120 + 16) * 4] == 170 && later.rgba[(72 * 120 + 104) * 4] == 170,
+          "FINAL background, black-key overlay or party layer mismatch");
+
+    dax(path, 2, blocks[1]);
+    const auto partial = read_pictures(path);
+    check(partial.gallery_count() == 2 && partial.clips.empty(), "Incomplete FINAL must stay browsable");
+}
+
 Bytes tlb_library(const char* type, const std::vector<Bytes>& records, bool has_ids = false)
 {
     Bytes bytes(16 + 4 * (records.size() + 1));
@@ -340,6 +400,7 @@ int main(int argc, char** argv)
         const fs::path dir(argv[2]);
         fs::create_directories(dir);
         if (name == "pictures") pictures(dir);
+        else if (name == "ending") ending(dir);
         else if (name == "tlb") tlb(dir);
         else if (name == "vace") vace(dir);
         else if (name == "geo") geo(dir);

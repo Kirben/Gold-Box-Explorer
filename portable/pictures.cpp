@@ -287,10 +287,10 @@ bool decode_vga_sprite(const Bytes& data, unsigned id, std::vector<Frame>& out, 
     return true;
 }
 
-int dos_delay(unsigned raw, std::uint64_t& tick)
+int dos_interval(std::uint64_t hundredths, std::uint64_t& tick)
 {
     constexpr std::uint64_t numerator = 54925, denominator = 10000;
-    const auto target = tick * numerator / denominator + 10ull * raw;
+    const auto target = tick * numerator / denominator + hundredths;
     const auto next = std::max<std::uint64_t>(tick + 1,
         (target * denominator + numerator - 1) / numerator);
     const auto scaled = (next - tick) * numerator;
@@ -299,6 +299,11 @@ int dos_delay(unsigned raw, std::uint64_t& tick)
     const auto remainder = scaled % 1000;
     const auto rounded = whole + (remainder > 500 || (remainder == 500 && (whole & 1)));
     return static_cast<int>(std::min<std::uint64_t>(rounded, std::numeric_limits<int>::max()));
+}
+
+int dos_delay(unsigned raw, std::uint64_t& tick)
+{
+    return dos_interval(10ull * raw, tick);
 }
 
 bool decode_ega_animation(const Bytes& data, unsigned id, PictureArchive& archive,
@@ -373,6 +378,94 @@ void add_vga_clip(const Bytes& data, unsigned id, std::size_t first, PictureArch
     if (clip.steps.size() > 1)
         archive.clips.push_back(std::move(clip));
 }
+
+constexpr unsigned ending_size = 120;
+
+// Draw into the game's ending window, whose top-left screen coordinate is (8, 8).
+void draw_ending_layer(Frame& canvas, const Frame& layer, unsigned x, unsigned y, bool black_key = false)
+{
+    for (unsigned row = 0; row < layer.height && y + row < canvas.height; ++row) {
+        for (unsigned col = 0; col < layer.width && x + col < canvas.width; ++col) {
+            const auto* source = layer.rgba.data() + (row * layer.width + col) * 4;
+            if (source[3] == 0 || (black_key && !(source[0] | source[1] | source[2])))
+                continue;
+            auto* target = canvas.rgba.data() + ((y + row) * canvas.width + x + col) * 4;
+            std::copy_n(source, 4, target);
+        }
+    }
+}
+
+void add_final_clip(const std::vector<DaxRecord>& records, PictureArchive& archive)
+{
+    constexpr unsigned scene_ids[]{2, 7, 8};
+    std::array<std::vector<std::size_t>, 9> blocks;
+    for (std::size_t i = 0; i < archive.frames.size(); ++i) {
+        const auto id = archive.frames[i].id;
+        if (id > 0 && id < blocks.size())
+            blocks[id].push_back(i);
+    }
+    if (std::any_of(blocks.begin() + 1, blocks.end(), [](const auto& block) { return block.empty(); }))
+        return;
+    for (const auto id : {1, 3}) {
+        const auto& frame = archive.frames[blocks[id].front()];
+        if (frame.width != ending_size || frame.height != ending_size)
+            return;
+    }
+    std::array<std::vector<unsigned>, 3> delays;
+    constexpr unsigned stride = 21 + 88 * 11 * 4;
+    for (unsigned scene = 0; scene < delays.size(); ++scene) {
+        const auto id = scene_ids[scene];
+        const auto& block = blocks[id];
+        const auto record = std::find_if(records.begin(), records.end(), [id](const auto& r) { return r.id == id; });
+        if (block.size() < 2 || record == records.end() || record->bytes.size() != 1 + stride * block.size() ||
+            record->bytes[0] != block.size())
+            return;
+        for (std::size_t i = 0; i < block.size(); ++i) {
+            const auto& frame = archive.frames[block[i]];
+            if (frame.width != 88 || frame.height != 88)
+                return;
+            const auto offset = 1 + stride * i;
+            delays[scene].push_back(word(record->bytes, offset) | (word(record->bytes, offset + 2) << 16));
+        }
+    }
+
+    const auto gallery_count = archive.frames.size();
+    PictureArchive::Clip clip{0, {}, true};
+    std::uint64_t bios_tick = 0;
+    for (unsigned scene = 0; scene < delays.size(); ++scene) {
+        const auto id = scene_ids[scene];
+        const auto& block = blocks[id];
+        const unsigned top = scene == 0 ? 32 : 0;
+        // WinGame uses (10 - gameDelay) * 5 div 2 passes for the first two scenes.
+        constexpr unsigned default_game_delay = 1;
+        const unsigned passes = scene == 2 ? 1 : (10 - default_game_delay) * 5 / 2;
+        Frame canvas{id, 0, ending_size, ending_size, Bytes(ending_size * ending_size * 4)};
+        draw_ending_layer(canvas, archive.frames[blocks[scene == 0 ? 1 : 3].front()], 0, 0);
+        if (scene != 0) {
+            draw_ending_layer(canvas, archive.frames[blocks[4].front()], 0, 88);
+            draw_ending_layer(canvas, archive.frames[blocks[5].front()], 104, 72);
+            draw_ending_layer(canvas, archive.frames[blocks[6].front()], 0, 72);
+        }
+        draw_ending_layer(canvas, archive.frames[block.front()], 16, top);
+        std::vector<std::size_t> loop(block.size());
+        for (unsigned pass = 0; pass < passes; ++pass) {
+            for (std::size_t i = 0; i < block.size(); ++i) {
+                if (pass < 2) {
+                    draw_ending_layer(canvas, archive.frames[block[i]], 16, top, true);
+                    loop[i] = archive.frames.size();
+                    canvas.index = static_cast<unsigned>(pass * block.size() + i);
+                    archive.frames.push_back(canvas);
+                }
+                // PlayFinalAnim advances only after the elapsed centiseconds exceed this delay.
+                const auto delay = (default_game_delay + 3ull) * delays[scene][i] + 1;
+                clip.steps.push_back({loop[i], dos_interval(delay, bios_tick)});
+            }
+        }
+    }
+    clip.steps.push_back({clip.steps.back().frame, 3 * 225});
+    archive.playback_only_frames = archive.frames.size() - gallery_count;
+    archive.clips.push_back(std::move(clip));
+}
 }
 
 bool is_picture_archive(const std::filesystem::path& path)
@@ -418,10 +511,12 @@ PictureArchive read_pictures(const std::filesystem::path& path)
     static const std::regex sprites(R"(SPRIT[0-9]*[A-Z]?\.DAX)", std::regex::icase);
     static const std::regex tiles(R"(8X8D[0-9]*\.DAX)", std::regex::icase);
     const bool play_pictures = std::regex_match(filename, animated_pictures);
-    const bool xor_frames = play_pictures || std::regex_match(filename, endings);
+    const bool ending = std::regex_match(filename, endings);
+    const bool xor_frames = play_pictures || ending;
     const bool encounter = std::regex_match(filename, sprites);
     const bool mono_tiles = std::regex_match(filename, tiles);
-    for (const auto& record : read_dax(path)) {
+    const auto records = read_dax(path);
+    for (const auto& record : records) {
         if (!record.stored_size)
             continue;
         const auto& block = record.bytes;
@@ -441,6 +536,8 @@ PictureArchive read_pictures(const std::filesystem::path& path)
     }
     if (archive.frames.empty())
         throw std::runtime_error("The archive contains no supported picture frames");
+    if (ending)
+        add_final_clip(records, archive);
     return archive;
 }
 

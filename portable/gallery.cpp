@@ -177,8 +177,19 @@ public:
             PrepareDC(dc);
             dc.SetBackground(wxBrush(wxColour(28, 29, 33)));
             dc.Clear();
-            if (bitmap_.IsOk())
-                dc.DrawBitmap(bitmap_, 12, 12, true);
+            if (bitmap_.IsOk()) {
+                const auto size = GetClientSize();
+                const auto x = fit_ ? (size.x - bitmap_.GetWidth()) / 2 : 12;
+                const auto y = fit_ ? (size.y - bitmap_.GetHeight()) / 2 : 12;
+                dc.DrawBitmap(bitmap_, x, y, true);
+            }
+        });
+        Bind(wxEVT_SIZE, [this](wxSizeEvent& event) {
+            if (fit_) {
+                scale_to_fit();
+                Refresh();
+            }
+            event.Skip();
         });
     }
 
@@ -188,14 +199,19 @@ public:
         map_image_ = {};
         filename_ = filename;
         bitmap_ = wxNullBitmap;
+        fit_ = frame && zoom == 0;
         if (frame) {
-            auto image = frame_image(*frame);
-            bitmap_ = wxBitmap(zoom == 1 ? image : image.Scale(frame->width * zoom,
-                               frame->height * zoom, wxIMAGE_QUALITY_NEAREST));
-            native_image_ = std::move(image);
+            native_image_ = frame_image(*frame);
+            if (fit_) {
+                Scroll(0, 0);
+                scale_to_fit();
+            } else {
+                bitmap_ = wxBitmap(zoom == 1 ? native_image_ : native_image_.Scale(
+                    frame->width * zoom, frame->height * zoom, wxIMAGE_QUALITY_NEAREST));
+            }
         }
-        SetVirtualSize(bitmap_.IsOk() ? wxSize(bitmap_.GetWidth() + 24, bitmap_.GetHeight() + 24)
-                                      : wxSize(0, 0));
+        SetVirtualSize(!fit_ && bitmap_.IsOk() ? wxSize(bitmap_.GetWidth() + 24, bitmap_.GetHeight() + 24)
+                                               : wxSize(0, 0));
         Refresh();
     }
 
@@ -205,6 +221,7 @@ public:
                   const goldbox::MapMask* changed = nullptr)
     {
         filename_ = filename;
+        fit_ = false;
         native_image_ = wxNullImage;
         if (zoom == 1) {
             map_image_ = {};
@@ -232,6 +249,17 @@ public:
     }
 
 private:
+    void scale_to_fit()
+    {
+        const auto size = GetClientSize();
+        const int width = native_image_.GetWidth();
+        const int height = native_image_.GetHeight();
+        const double scale = std::min(std::max(1, size.x - 24) / double(width),
+                                      std::max(1, size.y - 24) / double(height));
+        bitmap_ = wxBitmap(native_image_.Scale(std::max(1, int(width * scale)),
+                                               std::max(1, int(height * scale)), wxIMAGE_QUALITY_NEAREST));
+    }
+
     static wxBitmap draw_map(const goldbox::GeoMap& map, int zoom, int cursor_x, int cursor_y,
                              int facing, const goldbox::MapMask* visited,
                              const goldbox::MapMask* changed)
@@ -327,6 +355,7 @@ private:
     wxImage native_image_;
     std::function<wxImage()> map_image_;
     wxString filename_;
+    bool fit_ = false;
 };
 
 class Gallery : public wxFrame {
@@ -572,7 +601,8 @@ private:
         const auto* clip = selected_clip();
         if (!clip)
             return;
-        const auto name = export_name(wxString::Format("-%02X-animation", clip->id));
+        const auto name = export_name(clip->whole_archive ? wxString("-animation")
+                                                         : wxString::Format("-%02X-animation", clip->id));
         wxFileDialog dialog(this, "Export Animation", {}, name,
                             "Animated PNG (*.png)|*.png", wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
         if (dialog.ShowModal() != wxID_OK)
@@ -746,19 +776,23 @@ private:
         render();
     }
 
-    void show_view(bool picture, bool raw, bool records = false, bool perspective = false,
-                   bool fields = false, bool map_comparison = false)
+    void show_picture_list(bool show)
     {
-        const bool show_pictures = (picture && !saved_map_) || records;
-        if (show_pictures && !picture_split_->IsSplit()) {
+        if (show && !picture_split_->IsSplit()) {
             auto* content = picture_split_->GetWindow1();
             pictures_->Show();
             picture_split_->SplitVertically(pictures_, content,
                                             picture_width_ ? picture_width_ : FromDIP(135));
-        } else if (!show_pictures && picture_split_->IsSplit()) {
+        } else if (!show && picture_split_->IsSplit()) {
             picture_width_ = picture_split_->GetSashPosition();
             picture_split_->Unsplit(pictures_);
         }
+    }
+
+    void show_view(bool picture, bool raw, bool records = false, bool perspective = false,
+                   bool fields = false, bool map_comparison = false)
+    {
+        show_picture_list((picture && !saved_map_) || records);
         preview_split_->Show(picture);
         zoom_->Show(picture);
         play_->Show(picture && selected_clip());
@@ -785,13 +819,17 @@ private:
             return nullptr;
         const auto id = frames_[selected].id;
         const auto clip = std::find_if(clips_.begin(), clips_.end(),
-                                       [id](const auto& candidate) { return candidate.id == id; });
+            [id](const auto& candidate) { return candidate.whole_archive || candidate.id == id; });
         return clip == clips_.end() ? nullptr : &*clip;
     }
 
     void reset_playback()
     {
         playback_timer_.Stop();
+        if (active_ && !clips_.empty() && clips_.front().whole_archive) {
+            show_picture_list(true);
+            zoom_->Show();
+        }
         active_ = false;
         step_ = 0;
         play_->SetLabel("Play");
@@ -809,6 +847,11 @@ private:
             reset_playback();
             render();
         } else {
+            if (!active_ && clip->whole_archive) {
+                show_picture_list(false);
+                zoom_->Hide();
+                zoom_->GetParent()->Layout();
+            }
             active_ = true;
             show_playback_step(*clip);
         }
@@ -817,16 +860,16 @@ private:
     void show_playback_step(const goldbox::PictureArchive::Clip& clip)
     {
         const auto& step = clip.steps[step_];
-        show_frame(frames_.at(step.frame));
+        show_frame(frames_.at(step.frame), clip.whole_archive);
         play_->SetLabel(step.duration_ms ? "Pause" : "Gallery");
         if (step.duration_ms)
             playback_timer_.StartOnce(step.duration_ms);
     }
 
-    void show_frame(const goldbox::Frame& frame)
+    void show_frame(const goldbox::Frame& frame, bool fit = false)
     {
-        preview_->show(&frame, zoom_->GetSelection() + 1,
-                       export_name(frame_suffix(frame)));
+        const auto suffix = fit ? "-scene" + frame_suffix(frame) : frame_suffix(frame);
+        preview_->show(&frame, fit ? 0 : zoom_->GetSelection() + 1, export_name(suffix));
     }
 
     void show_fields(std::size_t index)
@@ -926,7 +969,7 @@ private:
         if (selected == wxNOT_FOUND)
             preview_->show(nullptr, 1);
         else
-            show_frame(frames_.at(index));
+            show_frame(frames_.at(index), active_ && clip && clip->whole_archive);
     }
 
     wxListBox* files_;

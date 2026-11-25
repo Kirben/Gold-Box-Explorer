@@ -23,6 +23,7 @@ struct PictureArchive {
     struct Clip {
         unsigned id;
         std::vector<Step> steps;
+        bool whole_archive = false;
     };
     std::vector<Clip> clips;
     std::size_t playback_only_frames = 0; // Synthetic frames appended after the gallery frames.
