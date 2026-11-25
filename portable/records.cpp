@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <regex>
 #include <stdexcept>
 
 namespace goldbox {
@@ -105,19 +106,93 @@ RecordRow monster(unsigned id, const std::uint8_t* b)
     return row;
 }
 
-RecordRow item(unsigned id, unsigned slot, const std::uint8_t* b, const std::string* owner)
+struct MonsterLayout {
+    unsigned size, thac0, race, age, max_hp, movement, alignment, attacks, ac, xp, items, current_thac0;
+};
+
+constexpr MonsterLayout later_monsters[]{
+    {422, 115, 116, 118, 120, 228, 283, 284, 292, 316, 332, 409},
+    {439, 106, 107, 110, 112, 237, 288, 289, 297, 334, 352, 426},
+    {510, 172, 173, 176, 178, 311, 359, 360, 368, 408, 422, 497},
+};
+
+bool known_monster_size(std::size_t size)
+{
+    return size == monster_size || size == 259 || size == 263 ||
+        std::any_of(std::begin(later_monsters), std::end(later_monsters),
+                    [size](const auto& layout) { return layout.size == size; });
+}
+
+RecordRow read_monster(const DaxRecord& record)
+{
+    const auto size = record.bytes.size();
+    const auto* b = record.bytes.data();
+    if (size == monster_size)
+        return monster(record.id, b);
+    if (!known_monster_size(size))
+        throw std::runtime_error("Unsupported DOS monster record size: " + std::to_string(size));
+    RecordRow row{record.id, 0, name_at(b, 15), {}};
+    if (row.name.empty())
+        row.name = "Monster " + std::to_string(record.id);
+    field(row, "Record ID", record.id);
+    field(row, "Record size", size);
+    if (size == 259 || size == 263) {
+        constexpr const char* stats[]{"Strength", "Dexterity", "Constitution", "Intelligence",
+                                     "Wisdom", "Charisma", "Tech"};
+        for (unsigned i = 0; i < 7; ++i) {
+            row.fields.emplace_back(std::string(stats[i]) + " (base)", std::to_string(b[16 + i]));
+            row.fields.emplace_back(std::string(stats[i]) + " (current)", std::to_string(b[23 + i]));
+        }
+        field(row, "Race code", signed_byte(b[0x27]));
+        field(row, "Career code", signed_byte(b[0x28]));
+        field(row, "Level", b[0x29]);
+        field(row, "Maximum HP", word(b, 0x45));
+        field(row, "Current HP", word(b, 0xe3));
+        field(row, "Base movement", b[0x36]);
+        field(row, "Current movement", b[0xe5]);
+        field(row, "XP award", word(b, 0xb2));
+        field(row, "Combat icon ID", b[0xb8]);
+        return row;
+    }
+    const auto& layout = *std::find_if(std::begin(later_monsters), std::end(later_monsters),
+                                     [size](const auto& entry) { return entry.size == size; });
+    constexpr const char* stats[]{"Strength", "Intelligence", "Wisdom", "Dexterity", "Constitution", "Charisma"};
+    for (unsigned i = 0; i < 6; ++i) {
+        row.fields.emplace_back(std::string(stats[i]) + " (base)", std::to_string(b[16 + 2 * i]));
+        row.fields.emplace_back(std::string(stats[i]) + " (current)", std::to_string(b[17 + 2 * i]));
+    }
+    field(row, "Exceptional strength", b[28]);
+    field(row, "Race code", signed_byte(b[layout.race]));
+    field(row, "Class code", signed_byte(b[layout.race + 1]));
+    field(row, "Age", word(b, layout.age));
+    field(row, "Maximum HP", b[layout.max_hp]);
+    field(row, "Current HP", b[size - 2]);
+    field(row, "Base THAC0", 60 - b[layout.thac0]);
+    field(row, "Current THAC0", 60 - b[layout.current_thac0]);
+    field(row, "Base AC", 60 - b[layout.ac]);
+    field(row, "Current AC", 60 - b[layout.current_thac0 + 1]);
+    field(row, "Base movement", b[layout.movement]);
+    field(row, "Current movement", b[size - 1]);
+    field(row, "Alignment code", b[layout.alignment]);
+    field(row, "Primary attacks (stored)", b[layout.attacks]);
+    field(row, "XP award", word(b, layout.xp));
+    field(row, "Inventory count (stored)", b[layout.items]);
+    return row;
+}
+
+RecordRow item(unsigned id, unsigned slot, const std::uint8_t* b, const std::string* owner, bool pool_names = true)
 {
     RecordRow row{id, slot, name_at(b, 40), {}};
     std::string resolved;
     for (unsigned offset : {49, 48, 47}) {
-        const auto component = item_components[b[offset]];
+        const auto component = pool_names ? item_components[b[offset]] : std::string_view{};
         if (!component.empty()) {
             if (!resolved.empty())
                 resolved += ' ';
             resolved += component;
         }
     }
-    const auto base = b[46] < std::size(item_templates) ? item_templates[b[46]] : std::string_view{};
+    const auto base = pool_names && b[46] < std::size(item_templates) ? item_templates[b[46]] : std::string_view{};
     if (row.name.empty()) {
         row.name = resolved;
         if (row.name.empty())
@@ -145,6 +220,65 @@ RecordRow item(unsigned id, unsigned slot, const std::uint8_t* b, const std::str
     field(row, "Charges / first spell", b[60]);
     field(row, "Effect / second spell", b[61]);
     field(row, "Special ID / third spell", b[62]);
+    return row;
+}
+
+RecordRow compact_item(unsigned id, unsigned slot, const std::uint8_t* b, unsigned stride,
+                       const std::string* owner)
+{
+    const bool buck = stride == 62;
+    RecordRow row{id, slot, buck ? name_at(b, 40) : std::string{}, {}};
+    if (buck)
+        b += 46;
+    else {
+        for (unsigned offset : {3u, 2u, 1u}) {
+            const auto code = b[offset];
+            if (!code)
+                continue;
+            if (!row.name.empty())
+                row.name += ' ';
+            // The two 510-byte engines share these words. ID 115 is game-specific.
+            if (code <= 125 && code != 115)
+                row.name += frua_item_components[code];
+            else
+                row.name += '[' + std::to_string(code) + ']';
+        }
+    }
+    if (row.name.empty())
+        row.name = "Item type " + std::to_string(b[0]);
+    if (owner)
+        row.fields.emplace_back("Owner", *owner);
+    field(row, "Record ID", id);
+    field(row, "Item slot", slot + 1);
+    field(row, "Base item type", b[0]);
+    row.fields.emplace_back("Name component IDs", std::to_string(b[3]) + ", " +
+                            std::to_string(b[2]) + ", " + std::to_string(b[1]));
+    field(row, "Magic bonus", signed_byte(b[4]));
+    field(row, "Saving throw bonus", signed_byte(b[5]));
+    field(row, "Equipped", buck ? (b[6] & 128) != 0 : b[6]);
+    field(row, "Unidentified name mask", b[7]);
+    if (!buck)
+        field(row, "Cursed", b[8]);
+    field(row, "Weight", word(b, buck ? 8 : 9));
+    field(row, "Quantity", b[buck ? 10 : 11]);
+    field(row, buck ? "Value (credits)" : "Value", word(b, buck ? 11 : 12));
+    for (unsigned i = 0; i < 3; ++i)
+        row.fields.emplace_back("Special byte " + std::to_string(i + 1), std::to_string(b[(buck ? 13 : 14) + i]));
+    return row;
+}
+
+constexpr unsigned effect_size = 9;
+
+RecordRow effect(unsigned id, unsigned slot, const std::uint8_t* b, const std::string* owner)
+{
+    RecordRow row{id, slot, "Effect " + std::to_string(b[0]), {}};
+    if (owner)
+        row.fields.emplace_back("Owner", *owner);
+    field(row, "Effect ID", b[0]);
+    field(row, "Duration (stored)", word(b, 1));
+    row.fields.emplace_back("Timing", word(b, 1) ? "Timed or effect-specific" : "Permanent");
+    field(row, "Strength / effect data", b[3]);
+    field(row, "Run handler on removal", b[4]);
     return row;
 }
 
@@ -234,7 +368,6 @@ std::vector<RecordRow> read_save_rows(const std::filesystem::path& path, RecordK
         return {std::move(row)};
     }
     const bool effects = kind == RecordKind::saved_effects;
-    constexpr unsigned effect_size = 9;
     const auto stride = effects ? effect_size : item_size;
     if (bytes.size() % stride)
         throw std::runtime_error(effects ? "Expected 9-byte Pool of Radiance DOS effect entries"
@@ -261,15 +394,7 @@ std::vector<RecordRow> read_save_rows(const std::filesystem::path& path, RecordK
             rows.push_back(item(0, slot, b, owner.empty() ? nullptr : &owner));
             continue;
         }
-        RecordRow row{b[0], slot, "Effect " + std::to_string(b[0]), {}};
-        if (!owner.empty())
-            row.fields.emplace_back("Owner", owner);
-        field(row, "Effect ID", b[0]);
-        field(row, "Duration (stored)", word(b, 1));
-        row.fields.emplace_back("Timing", word(b, 1) ? "Timed or effect-specific" : "Permanent");
-        field(row, "Strength / effect data", b[3]);
-        field(row, "Run handler on removal", b[4]);
-        rows.push_back(std::move(row));
+        rows.push_back(effect(b[0], slot, b, owner.empty() ? nullptr : &owner));
     }
     return rows;
 }
@@ -278,8 +403,13 @@ std::vector<RecordRow> read_save_rows(const std::filesystem::path& path, RecordK
 RecordKind record_kind(const std::filesystem::path& path)
 {
     const auto name = upper(path.filename().string());
-    if (name == "MONCHA.DAX") return RecordKind::monsters;
-    if (name == "MONITM.DAX") return RecordKind::inventory;
+    static const std::regex monster_name(R"(MON[0-9]*(CHA|ITM|SPC)\.DAX)");
+    std::smatch match;
+    if (std::regex_match(name, match, monster_name)) {
+        if (match[1] == "CHA") return RecordKind::monsters;
+        if (match[1] == "ITM") return RecordKind::inventory;
+        return RecordKind::monster_effects;
+    }
     if (name == "ITEM.DAX") return RecordKind::items;
     const auto extension = upper(path.extension().string());
     const auto stem = upper(path.stem().string());
@@ -305,15 +435,20 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
     const auto records = read_dax(path);
     const bool trailer = merged(records);
     std::map<unsigned, std::string> owners;
-    if (kind == RecordKind::inventory) {
+    std::size_t owner_size = 0;
+    if (kind == RecordKind::inventory || kind == RecordKind::monster_effects) {
         const auto folder = path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
+        auto companion = upper(path.filename().string());
+        companion.replace(companion.size() - 7, 3, "CHA");
         for (const auto& entry : std::filesystem::directory_iterator(folder)) {
-            if (record_kind(entry.path()) != RecordKind::monsters)
+            if (upper(entry.path().filename().string()) != companion)
                 continue;
             try {
                 for (const auto& record : read_dax(entry.path())) {
-                    if (record.bytes.size() == monster_size)
+                    if (known_monster_size(record.bytes.size())) {
+                        owner_size = record.bytes.size();
                         owners.emplace(record.id, name_at(record.bytes.data(), 15));
+                    }
                 }
             } catch (const std::exception&) {
                 // The inventory remains readable when its companion is unavailable.
@@ -321,21 +456,44 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
             break;
         }
     }
+    unsigned stride = item_size;
+    if (kind == RecordKind::monster_effects) {
+        stride = effect_size;
+    } else if (kind == RecordKind::inventory) {
+        if (owner_size == 510) {
+            stride = 17;
+        } else if (owner_size == 259 || owner_size == 263 || upper(path.filename().string()) == "MON0ITM.DAX") {
+            stride = 62;
+        } else if (!owner_size && upper(path.filename().string()) != "MONITM.DAX") {
+            const auto fits = [&](unsigned width) {
+                return std::all_of(records.begin(), records.end(), [&](const auto& record) {
+                    return (trailer && record.id >= 253) || record.bytes.size() % width == 0;
+                });
+            };
+            if (!fits(item_size) && fits(17))
+                stride = 17;
+        }
+    }
     std::vector<RecordRow> rows;
     for (const auto& record : records) {
-        if (trailer && record.id >= 253)
+        if (record.bytes.empty() || (trailer && record.id >= 253))
             continue;
         if (kind == RecordKind::monsters) {
-            if (record.bytes.size() != monster_size)
-                throw std::runtime_error("Unexpected DOS character record size");
-            rows.push_back(monster(record.id, record.bytes.data()));
+            rows.push_back(read_monster(record));
         } else {
-            if (record.bytes.size() % item_size)
-                throw std::runtime_error("Unexpected DOS item record size");
-            const auto owner = owners.find(record.id);
-            for (unsigned slot = 0; slot < record.bytes.size() / item_size; ++slot)
-                rows.push_back(item(record.id, slot, record.bytes.data() + slot * item_size,
-                                    owner == owners.end() ? nullptr : &owner->second));
+            if (record.bytes.size() % stride)
+                throw std::runtime_error("Unexpected DOS item or effect record size");
+            const auto found = owners.find(record.id);
+            const auto* owner = found == owners.end() || found->second.empty() ? nullptr : &found->second;
+            for (unsigned slot = 0; slot < record.bytes.size() / stride; ++slot) {
+                const auto* b = record.bytes.data() + slot * stride;
+                if (kind == RecordKind::monster_effects)
+                    rows.push_back(effect(record.id, slot, b, owner));
+                else if (stride != item_size)
+                    rows.push_back(compact_item(record.id, slot, b, stride, owner));
+                else
+                    rows.push_back(item(record.id, slot, b, owner, !owner_size || owner_size == monster_size));
+            }
         }
     }
     return rows;

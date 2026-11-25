@@ -515,6 +515,55 @@ void records(const fs::path& dir)
     check(inventory.size() == 1 && has_field(inventory[0], {"Owner", "Orc"}), "Missing inventory owner");
 }
 
+void numbered_monsters(const fs::path& dir)
+{
+    auto older = character();
+    older.resize(422);
+    older[120] = 23;
+    older[420] = 19;
+    dax(dir / "MON1CHA.DAX", 2, older);
+    auto later = character();
+    later.resize(510);
+    later[1] = 'O';
+    later[2] = 'g';
+    later[3] = 'r';
+    later[178] = 44;
+    later[508] = 33;
+    dax(dir / "mon2cha.dax", 2, later);
+    const auto old = read_record_rows(dir / "MON1CHA.DAX");
+    const auto modern = read_record_rows(dir / "mon2cha.dax");
+    check(old.size() == 1 && has_field(old[0], {"Maximum HP", "23"}) &&
+          has_field(old[0], {"Current HP", "19"}) && modern[0].name == "Ogr" &&
+          has_field(modern[0], {"Maximum HP", "44"}) && has_field(modern[0], {"Current HP", "33"}),
+          "Wrong numbered monster record offsets");
+    dax(dir / "MON2ITM.DAX", 2, {4, 0, 0, 18, 255, 0, 1, 0, 0, 7, 0, 2, 9, 0, 0, 0, 0});
+    const auto items = read_record_rows(dir / "MON2ITM.DAX");
+    check(items.size() == 1 && items[0].name == "Long Sword" &&
+          has_field(items[0], {"Owner", "Ogr"}) && has_field(items[0], {"Magic bonus", "-1"}),
+          "Wrong compact item layout or numbered companion lookup");
+    dax(dir / "MON1SPC.DAX", 2, {51, 0x34, 0x12, 4, 1, 0, 0, 0, 0});
+    const auto effects = read_record_rows(dir / "MON1SPC.DAX");
+    check(effects.size() == 1 && effects[0].name == "Effect 51" &&
+          has_field(effects[0], {"Owner", "Orc"}) && has_field(effects[0], {"Duration (stored)", "4660"}),
+          "Wrong monster effect or numbered companion");
+    auto silver = character();
+    silver.resize(439);
+    silver[112] = 34;
+    silver[437] = 29;
+    dax(dir / "MON3CHA.DAX", 2, silver);
+    const auto blades = read_record_rows(dir / "MON3CHA.DAX");
+    check(has_field(blades.at(0), {"Maximum HP", "34"}) &&
+          has_field(blades.at(0), {"Current HP", "29"}), "Wrong Silver Blades monster offsets");
+    auto buck = character();
+    buck.resize(263);
+    buck[0x45] = buck[0xe3] = 44;
+    buck[0x46] = buck[0xe4] = 1;
+    dax(dir / "MON0CHA.DAX", 2, buck);
+    const auto rogers = read_record_rows(dir / "MON0CHA.DAX");
+    check(has_field(rogers.at(0), {"Maximum HP", "300"}) &&
+          has_field(rogers.at(0), {"Current HP", "300"}), "Wrong Buck Rogers monster HP width");
+}
+
 void vault(const fs::path& dir)
 {
     Bytes bytes(16 + 50 * 18, 255);
@@ -617,6 +666,7 @@ int main(int argc, char** argv)
         else if (name == "packwall") packwall(dir);
         else if (name == "anm") anm(dir);
         else if (name == "vault") vault(dir);
+        else if (name == "monsters") numbered_monsters(dir);
         else if (name == "vace") vace(dir);
         else if (name == "geo") geo(dir);
         else if (name == "walls") walls(dir);
