@@ -7,7 +7,7 @@
 
 namespace goldbox {
 enum class RecordKind { none, monsters, items, base_items, inventory, monster_effects, saved_character,
-    saved_inventory, saved_effects, vault, ecl, amiga_text, amiga_sound, c64,
+    saved_inventory, saved_effects, vault, ecl, amiga_text, sound_samples, c64, xmi,
     frua_items, frua_design, frua_geo, frua_save, luck, countdown_ships };
 using Field = std::pair<std::string, std::string>;
 
@@ -20,4 +20,5 @@ struct RecordRow {
 
 RecordKind record_kind(const std::filesystem::path& path);
 std::vector<RecordRow> read_record_rows(const std::filesystem::path& path);
+std::vector<std::uint8_t> sample_wav(const std::filesystem::path& path, unsigned id);
 }

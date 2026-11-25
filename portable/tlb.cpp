@@ -875,6 +875,20 @@ std::vector<DaxRecord> read_hlib_data(const fs::path& path)
     return records;
 }
 
+std::vector<DaxRecord> read_dos_sound_records(const fs::path& path)
+{
+    const auto bytes = read_bytes(path);
+    const Library library({bytes.data(), bytes.size()});
+    if (library.data.big_endian || !library.data.tag(12, "DIG4") || library.first_item() != 0)
+        throw std::runtime_error("Expected a DOS HLIB DIG4 sample bank");
+    std::vector<DaxRecord> records;
+    for (unsigned id = 0; id < library.ids.size(); ++id) {
+        const auto item = library.item(id);
+        records.push_back({id, static_cast<unsigned>(item.size), Bytes(item.data, item.data + item.size)});
+    }
+    return records;
+}
+
 PictureArchive read_geo_glb(const fs::path& path)
 {
     const auto bytes = read_bytes(path);

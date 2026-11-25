@@ -5,6 +5,8 @@
 #include "item_names.h"
 #include "frua_item_names.h"
 #include "pc98.h"
+#include "tlb.h"
+#include "xmi.h"
 
 #include <algorithm>
 #include <cctype>
@@ -1089,6 +1091,27 @@ std::vector<RecordRow> read_save_rows(const std::filesystem::path& path, RecordK
 }
 }
 
+namespace {
+struct SoundBank {
+    bool packed;
+    std::vector<DaxRecord> samples;
+};
+
+SoundBank read_sound_bank(const std::filesystem::path& path)
+{
+    std::ifstream stream(path, std::ios::binary);
+    char signature[4]{};
+    if (!stream.read(signature, sizeof(signature)))
+        throw std::runtime_error("Cannot read sound bank signature");
+    if (std::string_view(signature, sizeof(signature)) == "HLIB")
+        return {true, read_dos_sound_records(path)};
+    auto records = read_amiga_glb(path, "DIG8");
+    if (records.empty())
+        throw std::runtime_error("Expected an Amiga DIG8 or DOS DIG4 sample bank");
+    return {false, std::move(records)};
+}
+}
+
 RecordKind record_kind(const std::filesystem::path& path)
 {
     if (is_ecl_archive(path))
@@ -1106,7 +1129,7 @@ RecordKind record_kind(const std::filesystem::path& path)
     if (name.compare(0, 6, "SAVGAM") == 0 && upper(path.extension().string()) == ".CSV")
         return RecordKind::frua_save;
     if (name == "STRINGS.GLB") return RecordKind::amiga_text;
-    if (name == "SOUNDS.GLB") return RecordKind::amiga_sound;
+    if (name == "SOUNDS.GLB") return RecordKind::sound_samples;
     static const std::regex monster_name(R"(MON[0-9]*(CHA|ITM|SPC)\.(DAX|GLB))");
     std::smatch match;
     if (std::regex_match(name, match, monster_name)) {
@@ -1117,6 +1140,7 @@ RecordKind record_kind(const std::filesystem::path& path)
     static const std::regex item_name(R"(ITEM[0-9]*\.(DAX|GLB))");
     if (std::regex_match(name, item_name)) return RecordKind::items;
     const auto extension = upper(path.extension().string());
+    if (extension == ".XMI") return RecordKind::xmi;
     const auto stem = upper(path.stem().string());
     if (extension == ".DAT" && (stem == "VAULT" ||
         (stem.size() == 6 && stem.compare(0, 5, "VAULT") == 0 && stem.back() >= 'A' && stem.back() <= 'Z')))
@@ -1152,27 +1176,30 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
         return read_ecl_rows(path);
     if (kind == RecordKind::c64)
         return read_c64_records(path);
-    if (kind == RecordKind::amiga_text || kind == RecordKind::amiga_sound) {
-        const bool text = kind == RecordKind::amiga_text;
-        const auto entries = read_amiga_glb(path, text ? "TEXT" : "DIG8");
+    if (kind == RecordKind::xmi)
+        return read_xmi_rows(path);
+    if (kind == RecordKind::sound_samples) {
+        const auto bank = read_sound_bank(path);
         std::vector<RecordRow> rows;
-        for (const auto& entry : entries) {
+        for (const auto& entry : bank.samples) {
             const auto* b = entry.bytes.data();
-            RecordRow row{entry.id, 0, {}, {}};
-            if (text) {
-                row.name = amiga_name(b, static_cast<unsigned>(entry.bytes.size()));
-                row.fields.emplace_back("Text", row.name);
-                if (row.name.empty())
-                    row.name = "String " + std::to_string(entry.id);
-            } else {
-                if (entry.bytes.size() < 6)
-                    throw std::runtime_error("Truncated Amiga DIG8 sample header");
-                row.name = "Sample " + std::to_string(entry.id);
-                field(row, "Header word", amiga_word(b, 0));
-                field(row, "Declared sample bytes", std::uint32_t(amiga_word(b, 2)) << 16 | amiga_word(b, 4));
-                field(row, "Stored sample bytes", entry.bytes.size() - 6);
-            }
+            if (entry.bytes.size() < 6)
+                throw std::runtime_error("Truncated sound sample header");
+            RecordRow row{entry.id, 0, "Sample " + std::to_string(entry.id), {}};
+            row.fields.emplace_back("Encoding", bank.packed ? "DOS DIG4" : "Amiga DIG8");
+            field(row, "Sample rate (Hz)", amiga_word(b, 0));
+            field(row, "Declared sample bytes", std::uint32_t(amiga_word(b, 2)) << 16 | amiga_word(b, 4));
+            field(row, "Stored sample bytes", entry.bytes.size() - 6);
             rows.push_back(std::move(row));
+        }
+        return rows;
+    }
+    if (kind == RecordKind::amiga_text) {
+        std::vector<RecordRow> rows;
+        for (const auto& entry : read_amiga_glb(path, "TEXT")) {
+            const auto text = amiga_name(entry.bytes.data(), static_cast<unsigned>(entry.bytes.size()));
+            rows.push_back({entry.id, 0, text.empty() ? "String " + std::to_string(entry.id) : text,
+                {{"Text", text}}});
         }
         return rows;
     }
@@ -1275,5 +1302,55 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
         }
     }
     return rows;
+}
+
+std::vector<std::uint8_t> sample_wav(const std::filesystem::path& path, unsigned id)
+{
+    const auto bank = read_sound_bank(path);
+    const auto& records = bank.samples;
+    const auto sample = std::find_if(records.begin(), records.end(),
+        [id](const auto& record) { return record.id == id; });
+    constexpr unsigned header = 6;
+    if (sample == records.end() || sample->bytes.size() < header)
+        throw std::runtime_error("Sound sample is missing or truncated");
+    const auto* bytes = sample->bytes.data();
+    const auto rate = amiga_word(bytes, 0);
+    const auto stored = std::uint32_t(amiga_word(bytes, 2)) << 16 | amiga_word(bytes, 4);
+    const auto decoded = std::uint64_t(stored) * (bank.packed ? 2 : 1);
+    if (!rate || !stored || stored > sample->bytes.size() - header || decoded > 0xffffffffu - 37)
+        throw std::runtime_error("Invalid sound sample length or rate");
+    const auto length = static_cast<std::uint32_t>(decoded);
+    const auto padding = length & 1;
+
+    std::vector<std::uint8_t> wave{'R','I','F','F'};
+    wave.reserve(44ull + length + padding);
+    auto integer = [&](std::uint32_t value, unsigned bytes) {
+        for (unsigned i = 0; i < bytes; ++i)
+            wave.push_back(static_cast<std::uint8_t>(value >> (i * 8)));
+    };
+    integer(36 + length + padding, 4);
+    wave.insert(wave.end(), {'W','A','V','E','f','m','t',' '});
+    integer(16, 4);
+    integer(1, 2); // PCM
+    integer(1, 2); // Mono
+    integer(rate, 4);
+    integer(rate, 4); // Bytes per second
+    integer(1, 2); // One byte per sample frame
+    integer(8, 2);
+    wave.insert(wave.end(), {'d','a','t','a'});
+    integer(length, 4);
+    for (std::uint32_t i = 0; i < stored; ++i) {
+        const auto sample_byte = bytes[header + i];
+        if (bank.packed) {
+            // The DOS speaker driver dispatches the low nibble first.
+            wave.push_back((sample_byte & 15) * 17);
+            wave.push_back((sample_byte >> 4) * 17);
+        } else {
+            wave.push_back(sample_byte ^ 0x80);
+        }
+    }
+    if (padding)
+        wave.push_back(0);
+    return wave;
 }
 }

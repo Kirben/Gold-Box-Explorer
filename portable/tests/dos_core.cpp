@@ -9,6 +9,7 @@
 #include "tlb.h"
 #include "vace.h"
 #include "cmp.h"
+#include "xmi.h"
 
 #include <algorithm>
 #include <fstream>
@@ -626,6 +627,35 @@ void records(const fs::path& dir)
     check(items.size() == 1 && has_field(items[0], {"Magic bonus", "-1"}), "Item bonus lost its sign");
     const auto inventory = read_record_rows(dir / "MONITM.DAX");
     check(inventory.size() == 1 && has_field(inventory[0], {"Owner", "Orc"}), "Missing inventory owner");
+
+    const auto sounds = dir / "SOUNDS.GLB";
+    write(sounds, Bytes{'G','L','I','B',0,0,0,34,0,1,0,0,'D','I','G','8',
+                        0,0,0,24,0,0,0,34,0x1c,0xfa,0,0,0,3,0x80,0,0x7f,0xff});
+    const auto audio = read_record_rows(sounds);
+    check(audio.size() == 1 && has_field(audio[0], {"Sample rate (Hz)", "7418"}), "Lost Amiga sample rate");
+    const auto wave = sample_wav(sounds, 0);
+    check(wave.size() == 48 && wave[4] == 40 && wave[22] == 1 &&
+          wave[24] == 0xfa && wave[25] == 0x1c && wave[34] == 8 && wave[40] == 3 &&
+          wave[44] == 0 && wave[45] == 128 && wave[46] == 255 && wave[47] == 0,
+          "DIG8 WAV PCM sign, length, rate, or padding changed");
+
+    write(sounds, Bytes{'H','L','I','B',32,0,0,0,1,0,0,0,'D','I','G','4',
+                        24,0,0,0,32,0,0,0,0x2b,0x77,0,0,0,1,0xf1,0xcc});
+    const auto packed_audio = read_record_rows(sounds);
+    const auto packed_wave = sample_wav(sounds, 0);
+    check(packed_audio.size() == 1 && has_field(packed_audio[0], {"Encoding", "DOS DIG4"}) &&
+          has_field(packed_audio[0], {"Sample rate (Hz)", "11127"}) &&
+          packed_wave.size() == 46 && packed_wave[44] == 17 && packed_wave[45] == 255,
+          "DOS DIG4 WAV must decode low nibble first and omit archive padding");
+
+    const auto xmi = dir / "music.xmi";
+    write(xmi, Bytes{'F','O','R','M',0,0,0,24,'X','M','I','D','E','V','N','T',0,0,0,11,
+                     0xc0,4,0x90,60,100,10,6,4,0xff,0x2f,0,0});
+    const auto sequences = read_record_rows(xmi);
+    const auto midi = xmi_sequence_midi(xmi, 0);
+    const Bytes expected{'M','T','h','d',0,0,0,6,0,0,0,1,0,60,'M','T','r','k',0,0,0,15,
+                         0,0xc0,4,0,0x90,60,100,10,0x80,60,0,0,0xff,0x2f,0};
+    check(sequences.size() == 1 && midi == expected, "XMIDI note duration, delta or MIDI header changed");
 
     const auto ships = dir / "ships2.dax";
     Bytes ship(108);

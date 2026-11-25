@@ -9,4 +9,5 @@ PictureArchive read_tlb(const std::filesystem::path& path);
 bool is_geo_glb(const std::filesystem::path& path);
 PictureArchive read_geo_glb(const std::filesystem::path& path);
 std::vector<DaxRecord> read_hlib_data(const std::filesystem::path& path);
+std::vector<DaxRecord> read_dos_sound_records(const std::filesystem::path& path);
 }

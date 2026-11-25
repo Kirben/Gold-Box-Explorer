@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(GoldBoxExplorerPortable LANGUAGES CXX)
 
 add_library(goldbox_pictures pictures.cpp geo.cpp walls.cpp records.cpp save_map.cpp tlb.cpp vace.cpp cmp.cpp
-    ecl.cpp ecl_containers.cpp amiga_pictures.cpp c64.cpp pc98.cpp)
+    ecl.cpp ecl_containers.cpp amiga_pictures.cpp c64.cpp pc98.cpp xmi.cpp)
 target_compile_features(goldbox_pictures PUBLIC cxx_std_17)
 target_include_directories(goldbox_pictures PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 if(NOT WIN32)

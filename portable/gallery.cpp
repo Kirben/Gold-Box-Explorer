@@ -11,6 +11,7 @@
 #include "walls.h"
 #include "records.h"
 #include "save_map.h"
+#include "xmi.h"
 
 #include <wx/dcbuffer.h>
 #include <wx/dirctrl.h>
@@ -493,6 +494,8 @@ public:
         file_menu->AppendSeparator();
         file_menu->Append(export_script_id, "Export Selected Script...");
         file_menu->Append(export_scripts_id, "Export All Scripts...");
+        file_menu->Append(export_sample_id, "Export Selected Sample as WAV...");
+        file_menu->Append(export_midi_id, "Export Selected Sequence as MIDI...");
         file_menu->AppendSeparator();
         file_menu->Append(wxID_EXIT, "E&xit");
         auto* menu_bar = new wxMenuBar;
@@ -512,13 +515,21 @@ public:
         }, export_animation_id);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { export_animation(); }, export_animation_id);
         Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent& event) {
-            event.Enable(selected_script() >= 0);
+            event.Enable(selected_record(goldbox::RecordKind::ecl) >= 0);
         }, export_script_id);
         Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent& event) {
             event.Enable(record_kind_ == goldbox::RecordKind::ecl && !record_list_->rows().empty());
         }, export_scripts_id);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { export_script_listing(false); }, export_script_id);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { export_script_listing(true); }, export_scripts_id);
+        Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent& event) {
+            event.Enable(selected_record(goldbox::RecordKind::sound_samples) >= 0);
+        }, export_sample_id);
+        Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent& event) {
+            event.Enable(selected_record(goldbox::RecordKind::xmi) >= 0);
+        }, export_midi_id);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { export_audio(false); }, export_sample_id);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { export_audio(true); }, export_midi_id);
         for (auto* pane : {preview_, perspective_}) {
             pane->Bind(wxEVT_CONTEXT_MENU, [this, pane](wxContextMenuEvent&) {
                 if (!pane->can_export())
@@ -606,6 +617,8 @@ private:
     static constexpr int export_animation_id = wxID_HIGHEST + 3;
     static constexpr int export_script_id = wxID_HIGHEST + 4;
     static constexpr int export_scripts_id = wxID_HIGHEST + 5;
+    static constexpr int export_sample_id = wxID_HIGHEST + 6;
+    static constexpr int export_midi_id = wxID_HIGHEST + 7;
 
     wxString export_name(const wxString& suffix) const
     {
@@ -715,9 +728,9 @@ private:
             wxMessageBox("Could not save the PNG image.", "Export PNG", wxOK | wxICON_ERROR, this);
     }
 
-    long selected_script() const
+    long selected_record(goldbox::RecordKind kind) const
     {
-        if (record_kind_ != goldbox::RecordKind::ecl)
+        if (record_kind_ != kind)
             return -1;
         return record_list_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
     }
@@ -725,7 +738,7 @@ private:
     void export_script_listing(bool all)
     {
         const auto archive_index = files_->GetSelection();
-        const auto selected = selected_script();
+        const auto selected = selected_record(goldbox::RecordKind::ecl);
         const auto& scripts = record_list_->rows();
         if (record_kind_ != goldbox::RecordKind::ecl || archive_index == wxNOT_FOUND ||
             scripts.empty() || (!all && (selected < 0 || static_cast<std::size_t>(selected) >= scripts.size())))
@@ -766,6 +779,39 @@ private:
             return;
         }
         SetStatusText(wxString::Format("Exported %zu %s", count, count == 1 ? "script" : "scripts"));
+    }
+
+    void export_audio(bool midi)
+    {
+        const auto archive_index = files_->GetSelection();
+        const auto selected = selected_record(midi ? goldbox::RecordKind::xmi : goldbox::RecordKind::sound_samples);
+        const auto& records = record_list_->rows();
+        if (archive_index == wxNOT_FOUND || selected < 0 || static_cast<std::size_t>(selected) >= records.size())
+            return;
+        const auto archive = paths_.at(archive_index);
+        const auto id = records[static_cast<std::size_t>(selected)].id;
+        const auto suffix = midi ? wxString::Format("-sequence-%02u.mid", id + 1) :
+                                   wxString::Format("-sample-%02u.wav", id);
+        const auto name = wxString::FromUTF8(archive.stem().u8string()) + suffix;
+        const auto title = midi ? "Export Selected Sequence" : "Export Selected Sample";
+        wxFileDialog dialog(this, title, {}, name,
+                            midi ? "MIDI files (*.mid)|*.mid" : "WAV audio (*.wav)|*.wav",
+                            wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+        if (dialog.ShowModal() != wxID_OK)
+            return;
+        try {
+            std::error_code ec;
+            if (fs::equivalent(archive, fs::u8path(dialog.GetPath().ToUTF8().data()), ec))
+                throw std::runtime_error("Choose a destination other than the original audio file.");
+            const auto data = midi ? goldbox::xmi_sequence_midi(archive, id) : goldbox::sample_wav(archive, id);
+            wxTempFileOutputStream output(dialog.GetPath());
+            if (!output.IsOk() || output.Write(data.data(), data.size()).LastWrite() != data.size() || !output.Commit())
+                throw std::runtime_error("Could not save the converted audio file.");
+            SetStatusText(midi ? wxString::Format("Exported sequence %u as MIDI", id + 1) :
+                                 wxString::Format("Exported sample %u as WAV", id));
+        } catch (const std::exception& error) {
+            wxMessageBox(wxString::FromUTF8(error.what()), title, wxOK | wxICON_ERROR, this);
+        }
     }
 
     void browse(const fs::path& folder, const fs::path& selected)
