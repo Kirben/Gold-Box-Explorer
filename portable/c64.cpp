@@ -757,15 +757,60 @@ PictureArchive scene_picture(const fs::path& path, const Bytes& bytes, unsigned 
     return result;
 }
 
+struct SpellStyle {
+    unsigned first;
+    unsigned end; // Exclusive shape limit. Bit 7 increments VIC sprite colour.
+    unsigned flags;
+    unsigned shared;
+};
+
+void spell_sprite(Frame& frame, unsigned x, const std::uint8_t* bits,
+                  const SpellStyle& style, unsigned phase = 0)
+{
+    sprite(frame, x, 0, bits, ((style.flags + phase) & 15) | (style.flags & 64 ? 128 : 0),
+           style.shared & 15, style.shared >> 4);
+}
+
+void spell_flight(PictureArchive& archive, unsigned id, const std::uint8_t* sprites,
+                  const SpellStyle& style)
+{
+    // A fixed one-cell horizontal sample of the original fixed-point flight.
+    // The native accumulator starts at $80 and adds $C0 for a 24-pixel leg.
+    PictureArchive::Clip clip{id, {}};
+    clip.realtime = true;
+    unsigned shape = style.first, color_phase = 0;
+    unsigned cycles = 0, previous_ms = 0;
+    for (unsigned step = 1; step <= 32; ++step) {
+        const unsigned x = (128 + step * 192) / 256;
+        const unsigned previous_x = (128 + (step - 1) * 192) / 256;
+        if (style.end == 128) {
+            ++color_phase;
+        } else if (style.end && ++shape >= (style.end & 127)) {
+            shape = style.first;
+        }
+        auto frame = image(id, step - 1, 48, 21);
+        spell_sprite(frame, x, sprites + shape * 64, style, color_phase);
+        // PAL model calibrated against the original combat wait and copy loops.
+        cycles += 2822 + (x != previous_x ? 15 : 0) + (step == 32 ? 46 : 28) +
+            (style.end == 128 ? 11 : style.end ? 325 : 0);
+        const unsigned ms = (cycles * 1000 + 492624) / 985248;
+        clip.steps.push_back({archive.frames.size(), static_cast<int>(ms - previous_ms)});
+        archive.frames.push_back(std::move(frame));
+        previous_ms = ms;
+    }
+    archive.playback_only_frames += clip.steps.size();
+    archive.clips.push_back(std::move(clip));
+}
+
 PictureArchive later_spell_art(const Bytes& bytes)
 {
-    unsigned tile_end, sprite_start, shape_count = 20;
+    unsigned tile_end, sprite_start;
     const bool buck = bytes.size() == 3198;
     switch (bytes.size()) {
     case 1994: tile_end = sprite_start = 394; break;
     case 2674: tile_end = sprite_start = 430; break;
     case 2746: tile_end = sprite_start = 412; break;
-    case 3198: tile_end = 430; sprite_start = 736; shape_count = 27; break;
+    case 3198: tile_end = 430; sprite_start = 736; break;
     default: throw std::runtime_error("Unsupported C64 spell artwork bank");
     }
     constexpr std::array<std::uint8_t, 8> blank{};
@@ -781,18 +826,41 @@ PictureArchive later_spell_art(const Bytes& bytes)
         }
         result.frames.push_back(std::move(frame));
     }
-    for (unsigned shape = 0; shape < shape_count; ++shape) {
-        auto frame = image(1, shape, 24, 21);
-        const auto* bits = bytes.data() + sprite_start + 64 * shape;
-        sprite(frame, 0, 0, bits, buck ? bits[63] : 1, 12, 15);
-        result.frames.push_back(std::move(frame));
+    // The five fantasy games share the resident ECL64/CODE03 selectors and
+    // the VIC pairs in COMBAT2 ($E000 + file offset - 2).
+    constexpr SpellStyle fantasy[]{
+        {0,0,0x48,0x07}, {0,0,0x43,0x1e}, {3,6,0x41,0x3e}, {6,0x8a,0x03,0},
+        {10,0x80,0,0}, {13,0,1,0}, {16,19,0x41,0x1b}, {16,19,0x45,0xb5},
+        {19,0,0x40,0x98}, {22,24,0x41,0xd5}, {22,24,0x4b,0xcf}
+    };
+    // Buck Rogers ECL64 $82B9/$82C4 (shapes) and $9292 (VIC pairs).
+    constexpr SpellStyle buck_styles[]{
+        {0,0,0x4a,0x47}, {3,0,0x4d,0x33}, {6,0,0x40,0x1a}, {9,0,0x4d,0x6c},
+        {12,14,0x4a,0x47}, {14,16,0x41,0x7a}, {16,18,0x0f,0},
+        {18,0,0x4a,0x7f}, {21,23,0x41,0xcf}, {23,25,0x40,0x6e}, {25,27,1,0}
+    };
+    const auto* styles = buck ? buck_styles : fantasy;
+    const unsigned style_count = buck ? std::size(buck_styles) : std::size(fantasy);
+    const auto* sprites = bytes.data() + sprite_start;
+    constexpr unsigned fantasy_counts[]{3,3,3,4,3,3,3,3,1,2,2};
+    for (unsigned style = 0; style < style_count; ++style) {
+        const unsigned first = styles[style].first;
+        const unsigned count = !buck ? fantasy_counts[style] :
+            (style + 1 < style_count ? styles[style + 1].first : 27) - first;
+        for (unsigned shape = first; shape < first + count; ++shape) {
+            auto frame = image(style + 1, shape, 24, 21);
+            spell_sprite(frame, 0, sprites + 64 * shape, styles[style]);
+            result.frames.push_back(std::move(frame));
+        }
     }
-    if (buck)
-        return result;
-    auto skull = image(2, 0, 24, 21);
-    sprite(skull, 0, 0, bytes.data() + sprite_start + 21 * 64, 0, 0, 0);
-    sprite(skull, 0, 0, bytes.data() + sprite_start + 20 * 64, 2, 0, 0);
-    result.frames.push_back(std::move(skull));
+    if (!buck) {
+        auto skull = image(style_count + 1, 0, 24, 21);
+        sprite(skull, 0, 0, sprites + 21 * 64, 0, 0, 0);
+        sprite(skull, 0, 0, sprites + 20 * 64, 2, 0, 0);
+        result.frames.push_back(std::move(skull));
+    }
+    for (unsigned style = 0; style < style_count; ++style)
+        spell_flight(result, style + 1, sprites, styles[style]);
     return result;
 }
 
@@ -827,17 +895,19 @@ PictureArchive combat_terrain(const Bytes& bytes)
             result.frames.push_back(std::move(frame));
         }
     }
-    constexpr unsigned poses[][4]{{0,1,2,1},{5,4,3,5},{6,7,8,9},{10,11,12,11}};
-    for (unsigned style = 0; style < std::size(poses); ++style) {
-        PictureArchive::Clip clip{style + 2, {}};
-        for (auto pose : poses[style])
-            clip.steps.push_back({first + style * 20 + pose, 200});
-        result.clips.push_back(std::move(clip));
-    }
     auto skull = image(11, 0, 24, 24);
     sprite(skull, 0, 0, bytes.data() + 440, 0, 0, 0);
     sprite(skull, 0, 0, bytes.data() + 376, 2, 0, 0);
     result.frames.push_back(std::move(skull));
+    PictureArchive::Clip burst{3, {}};
+    for (unsigned shape : {5u, 4u, 3u})
+        burst.steps.push_back({first + 20 + shape, 145});
+    result.clips.push_back(std::move(burst));
+    const auto* sprites = bytes.data() + 1784;
+    for (const auto& [style, shape, end] : {std::array{0u,0u,3u}, std::array{2u,6u,10u},
+                                           std::array{3u,10u,128u}})
+        spell_flight(result, style + 2, sprites,
+                     {shape, end, bytes[1766 + style * 2], bytes[1767 + style * 2]});
     return result;
 }
 

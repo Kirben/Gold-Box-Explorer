@@ -102,7 +102,7 @@ int main(int argc, char** argv)
                     if (clip.whole_archive) {
                         const auto& frame = archive.frames[step.frame];
                         std::cout << ' ' << frame.id << '.' << frame.index + 1;
-                    } else if (step.frame < archive.gallery_count())
+                    } else if (clip.realtime || step.frame < archive.gallery_count())
                         std::cout << ' ' << archive.frames[step.frame].index + 1;
                     else
                         std::cout << " clear";

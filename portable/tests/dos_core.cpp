@@ -877,6 +877,35 @@ void c64_assets(const fs::path& dir)
     check(sprites.frames.size() == 15 && far.width == 48 && far.height == 42 &&
           far.rgba[0] == 129 && far.rgba[(far.width + 1) * 4] == 129 && far.rgba[11] == 0,
           "Later C64 encounter placement, expansion or hardware sprite priority changed");
+
+    Bytes spell_art(1994);
+    spell_art[1] = 0x40;
+    for (unsigned tile = 250; tile < 394; tile += 18)
+        std::fill_n(spell_art.begin() + tile, 9, 32);
+    spell_art[394 + 7 * 64] = 0x80;
+    spell_art[394 + 8 * 64] = 0x40;
+    spell_art[394 + 10 * 64] = 0x80;
+    const auto spell_bank = dir / "SPELLE66.PRG";
+    const auto spell_overlay = dir / "SPELLE65.PRG";
+    write(spell_bank, spell_art);
+    write(spell_overlay, Bytes{0,0x40,0xad,0,0x7d,0x29,7,0xc9,1});
+    const auto spell = read_c64_picture(spell_overlay);
+    const auto& sparkle = spell.clips.at(3);
+    const auto& bolt = spell.clips.at(4);
+    const auto& first_sparkle = spell.frames.at(sparkle.steps.at(0).frame);
+    const auto& second_sparkle = spell.frames.at(sparkle.steps.at(1).frame);
+    const auto& first_bolt = spell.frames.at(bolt.steps.at(0).frame);
+    const auto& second_bolt = spell.frames.at(bolt.steps.at(1).frame);
+    int duration = 0;
+    for (const auto& step : bolt.steps)
+        duration += step.duration_ms;
+    check(sparkle.steps.size() == 32 && bolt.steps.size() == 32 && bolt.realtime &&
+          first_sparkle.width == 48 && first_sparkle.rgba[4] == 117 &&
+          second_sparkle.rgba[4 + 3] == 0 && second_sparkle.rgba[12] == 117 &&
+          first_bolt.rgba[4] == 255 && second_bolt.rgba[8] == 129 &&
+          duration >= 92 && duration <= 95 &&
+          read_c64_picture(spell_bank).clips.size() == spell.clips.size(),
+          "C64 animated spell order, palette cycling or PAL flight timing changed");
 }
 }
 

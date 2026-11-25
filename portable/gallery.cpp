@@ -25,6 +25,7 @@
 #include <wx/wfstream.h>
 
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -529,6 +530,17 @@ public:
         Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
             const auto* clip = selected_clip();
             if (active_ && clip) {
+                if (clip->realtime) {
+                    const auto now = PlaybackClock::now();
+                    while (step_ + 1 < clip->steps.size() && now >= playback_deadline_) {
+                        ++step_;
+                        playback_deadline_ += std::chrono::milliseconds(clip->steps[step_].duration_ms);
+                    }
+                    if (now < playback_deadline_) {
+                        show_playback_step(*clip);
+                        return;
+                    }
+                }
                 if (step_ + 1 == clip->steps.size()) {
                     reset_playback();
                     render();
@@ -925,6 +937,7 @@ private:
             return;
         if (playback_timer_.IsRunning()) {
             playback_timer_.Stop();
+            playback_remaining_ = playback_deadline_ - PlaybackClock::now();
             play_->SetLabel("Resume");
         } else if (active_ && clip->steps[step_].duration_ms == 0) {
             reset_playback();
@@ -935,6 +948,10 @@ private:
                 zoom_->Hide();
                 zoom_->GetParent()->Layout();
             }
+            if (clip->realtime)
+                playback_deadline_ = PlaybackClock::now() + (active_ ?
+                    std::max(PlaybackClock::duration::zero(), playback_remaining_) :
+                    std::chrono::milliseconds(clip->steps[step_].duration_ms));
             active_ = true;
             show_playback_step(*clip);
         }
@@ -945,8 +962,11 @@ private:
         const auto& step = clip.steps[step_];
         show_frame(frames_.at(step.frame), clip.whole_archive);
         play_->SetLabel(step.duration_ms ? "Pause" : "Gallery");
-        if (step.duration_ms)
-            playback_timer_.StartOnce(step.duration_ms);
+        if (step.duration_ms) {
+            const auto ms = clip.realtime ? std::max<int>(1, std::chrono::ceil<std::chrono::milliseconds>(
+                playback_deadline_ - PlaybackClock::now()).count()) : step.duration_ms;
+            playback_timer_.StartOnce(ms);
+        }
     }
 
     void show_frame(const goldbox::Frame& frame, bool fit = false)
@@ -1078,6 +1098,9 @@ private:
     std::map<unsigned, goldbox::WallBanks> banks_;
     std::optional<goldbox::SavedMap> saved_map_;
     wxTimer playback_timer_;
+    using PlaybackClock = std::chrono::steady_clock;
+    PlaybackClock::time_point playback_deadline_;
+    PlaybackClock::duration playback_remaining_{};
     std::size_t step_ = 0;
     bool active_ = false;
 };
