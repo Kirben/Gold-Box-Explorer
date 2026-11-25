@@ -301,6 +301,39 @@ void cmp(const fs::path& dir)
     throw std::runtime_error("CMP accepted a run beyond the raster");
 }
 
+void packwall(const fs::path& dir)
+{
+    constexpr unsigned widths[]{16, 16, 8, 8, 16, 24, 8, 16, 32, 56, 24};
+    constexpr unsigned heights[]{88, 56, 32, 16, 16, 32, 8, 16, 32, 56, 16};
+    Bytes record;
+    for (unsigned i = 0; i < 11; ++i) {
+        record.insert(record.end(), {0, static_cast<std::uint8_t>(heights[i] - 1),
+                                     static_cast<std::uint8_t>(widths[i] / 8), 0});
+        record.insert(record.end(), widths[i] * heights[i] / 2, i == 0 ? 0x40 : 0x20);
+    }
+    Bytes bytes;
+    for (unsigned i = 0; i < 25; ++i)
+        bytes.insert(bytes.end(), record.begin(), record.end());
+    const auto path = dir / "packwall.out";
+    write(path, bytes);
+    check(is_packwall_archive(path) && !is_packwall_archive("OTHER.OUT"), "PACKWALL routing mismatch");
+    const auto archive = read_packwall(path);
+    check(archive.gallery_count() == 25 && archive.frames.back().id == 25,
+          "PACKWALL wall set IDs or count are incorrect");
+    const auto& sheet = archive.frames.front();
+    check(sheet.width == 272 && sheet.height == 96 && sheet.rgba[0] == 170 &&
+          sheet.rgba[3] == 255 && sheet.rgba[7] == 0 && sheet.rgba[16 * 4 + 3] == 0 &&
+          sheet.rgba[20 * 4 + 1] == 170, "PACKWALL sheet layout or transparency mismatch");
+    bytes[2] = 0;
+    write(path, bytes);
+    try {
+        read_packwall(path);
+    } catch (const std::runtime_error&) {
+        return;
+    }
+    throw std::runtime_error("PACKWALL accepted a zero-width perspective");
+}
+
 void vace(const fs::path& dir)
 {
     const Bytes first{64, 1, 200, 0, 0, 0, 128, 2, 3, 2, 1, 2, 255};
@@ -482,6 +515,7 @@ int main(int argc, char** argv)
         else if (name == "tlb") tlb(dir);
         else if (name == "geo-glb") geo_glb(dir);
         else if (name == "cmp") cmp(dir);
+        else if (name == "packwall") packwall(dir);
         else if (name == "vace") vace(dir);
         else if (name == "geo") geo(dir);
         else if (name == "walls") walls(dir);

@@ -13,6 +13,8 @@ constexpr unsigned screen_width = 320;
 constexpr unsigned screen_height = 200;
 constexpr unsigned tile_size = 24;
 constexpr unsigned tile_count = 48;
+constexpr unsigned wall_count = 25;
+constexpr unsigned wall_record_size = 0x10ec;
 constexpr unsigned palette[]{
     0x000000, 0x0000aa, 0x00aa00, 0x00aaaa, 0xaa0000, 0x000000, 0xaa5500, 0xaaaaaa,
     0x555555, 0x5555ff, 0x55ff55, 0x55ffff, 0xff5555, 0xff55ff, 0xffff55, 0xffffff
@@ -67,20 +69,24 @@ Bytes unpack_cmp(const Bytes& source)
     return packed;
 }
 
+void put_pixel(std::uint8_t* rgba, unsigned index)
+{
+    const auto color = palette[index];
+    rgba[0] = static_cast<std::uint8_t>(color >> 16);
+    rgba[1] = static_cast<std::uint8_t>(color >> 8);
+    rgba[2] = static_cast<std::uint8_t>(color);
+    rgba[3] = 255;
+}
+
 Frame render(const std::uint8_t* packed, unsigned id, unsigned width, unsigned height, bool columns)
 {
     Frame frame{id, 0, width, height, Bytes(width * height * 4)};
     for (unsigned y = 0; y < height; ++y) {
         for (unsigned x = 0; x < width / 2; ++x) {
             const auto pair = packed[columns ? x * height + y : y * (width / 2) + x];
-            for (unsigned pixel = 0; pixel < 2; ++pixel) {
-                const auto color = palette[pixel ? pair & 15 : pair >> 4];
-                auto* rgba = frame.rgba.data() + (y * width + 2 * x + pixel) * 4;
-                rgba[0] = static_cast<std::uint8_t>(color >> 16);
-                rgba[1] = static_cast<std::uint8_t>(color >> 8);
-                rgba[2] = static_cast<std::uint8_t>(color);
-                rgba[3] = 255;
-            }
+            auto* rgba = frame.rgba.data() + (y * width + 2 * x) * 4;
+            put_pixel(rgba, pair >> 4);
+            put_pixel(rgba + 4, pair & 15);
         }
     }
     return frame;
@@ -127,6 +133,61 @@ PictureArchive read_cmp(const std::filesystem::path& path)
                                            i, tile_size, tile_size, false));
     } else {
         result.frames.push_back(render(packed.data(), 1, screen_width, screen_height, source[2] == 2));
+    }
+    return result;
+}
+
+bool is_packwall_archive(const std::filesystem::path& path)
+{
+    return upper(path.filename().string()) == "PACKWALL.OUT";
+}
+
+PictureArchive read_packwall(const std::filesystem::path& path)
+{
+    constexpr unsigned sheet_width = 272;
+    constexpr unsigned sheet_height = 96;
+    constexpr unsigned perspectives = 11;
+    constexpr auto archive_size = wall_count * wall_record_size;
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file || file.tellg() != archive_size)
+        throw std::runtime_error("Expected a 108300-byte Hillsfar PACKWALL.OUT archive");
+    Bytes source(archive_size);
+    file.seekg(0);
+    if (!file.read(reinterpret_cast<char*>(source.data()), source.size()))
+        throw std::runtime_error("Unable to read Hillsfar PACKWALL.OUT");
+
+    PictureArchive result;
+    result.frames.reserve(wall_count);
+    for (unsigned entry = 0; entry < wall_count; ++entry) {
+        auto offset = entry * wall_record_size;
+        const auto end = offset + wall_record_size;
+        Frame sheet{entry + 1, 0, sheet_width, sheet_height, Bytes(sheet_width * sheet_height * 4)};
+        unsigned left = 0;
+        for (unsigned piece = 0; piece < perspectives; ++piece) {
+            if (end - offset < 4)
+                throw std::runtime_error("Truncated Hillsfar wall perspective header");
+            const unsigned height = source[offset + 1] + 1;
+            const unsigned width = source[offset + 2] * 8;
+            offset += 4;
+            const auto length = width / 2 * height;
+            if (!width || left + width > sheet_width || height > sheet_height || length > end - offset)
+                throw std::runtime_error("Invalid Hillsfar wall perspective dimensions");
+            for (unsigned y = 0; y < height; ++y) {
+                for (unsigned x = 0; x < width / 2; ++x) {
+                    const auto pair = source[offset + y * (width / 2) + x];
+                    auto* target = sheet.rgba.data() + (y * sheet_width + left + 2 * x) * 4;
+                    if (const auto index = pair >> 4)
+                        put_pixel(target, index);
+                    if (const auto index = pair & 15)
+                        put_pixel(target + 4, index);
+                }
+            }
+            left += width + 4;
+            offset += length;
+        }
+        if (offset != end)
+            throw std::runtime_error("Unexpected bytes after Hillsfar wall perspectives");
+        result.frames.push_back(std::move(sheet));
     }
     return result;
 }
