@@ -1,4 +1,5 @@
 #include "pictures.h"
+#include "apng.h"
 #include "dax.h"
 #include "geo.h"
 #include "walls.h"
@@ -7,6 +8,8 @@
 
 #include <wx/dcbuffer.h>
 #include <wx/dirctrl.h>
+#include <wx/file.h>
+#include <wx/filename.h>
 #include <wx/listbox.h>
 #include <wx/listctrl.h>
 #include <wx/scrolwin.h>
@@ -14,10 +17,13 @@
 #include <wx/timer.h>
 #include <wx/treectrl.h>
 #include <wx/wx.h>
+#include <wx/wfstream.h>
 
 #include <algorithm>
 #include <fstream>
+#include <functional>
 #include <limits>
+#include <set>
 
 namespace {
 namespace fs = std::filesystem;
@@ -174,13 +180,17 @@ public:
         });
     }
 
-    void show(const goldbox::Frame* frame, int zoom)
+    void show(const goldbox::Frame* frame, int zoom, const wxString& filename = {})
     {
+        native_image_ = wxNullImage;
+        map_image_ = {};
+        filename_ = filename;
         bitmap_ = wxNullBitmap;
         if (frame) {
             auto image = frame_image(*frame);
             bitmap_ = wxBitmap(zoom == 1 ? image : image.Scale(frame->width * zoom,
                                frame->height * zoom, wxIMAGE_QUALITY_NEAREST));
+            native_image_ = std::move(image);
         }
         SetVirtualSize(bitmap_.IsOk() ? wxSize(bitmap_.GetWidth() + 24, bitmap_.GetHeight() + 24)
                                       : wxSize(0, 0));
@@ -188,12 +198,35 @@ public:
     }
 
     void show_map(const goldbox::GeoMap& map, int zoom, int cursor_x, int cursor_y, int facing,
+                  const wxString& filename,
                   const goldbox::MapMask* visited = nullptr,
                   const goldbox::MapMask* changed = nullptr)
     {
+        filename_ = filename;
+        native_image_ = wxNullImage;
+        if (zoom == 1) {
+            map_image_ = {};
+        } else {
+            using Mask = std::optional<goldbox::MapMask>;
+            map_image_ = [map, cursor_x, cursor_y, facing,
+                          seen = visited ? Mask(*visited) : Mask{},
+                          diff = changed ? Mask(*changed) : Mask{}] {
+                return draw_map(map, 1, cursor_x, cursor_y, facing,
+                                seen ? &*seen : nullptr, diff ? &*diff : nullptr).ConvertToImage();
+            };
+        }
         bitmap_ = draw_map(map, zoom, cursor_x, cursor_y, facing, visited, changed);
         SetVirtualSize(bitmap_.GetWidth() + 24, bitmap_.GetHeight() + 24);
         Refresh();
+    }
+
+    bool can_export() const { return IsShownOnScreen() && bitmap_.IsOk(); }
+    const wxString& filename() const { return filename_; }
+    wxImage export_image() const
+    {
+        if (native_image_.IsOk())
+            return native_image_;
+        return map_image_ ? map_image_() : bitmap_.ConvertToImage();
     }
 
 private:
@@ -289,6 +322,9 @@ private:
     }
 
     wxBitmap bitmap_;
+    wxImage native_image_;
+    std::function<wxImage()> map_image_;
+    wxString filename_;
 };
 
 class Gallery : public wxFrame {
@@ -361,11 +397,37 @@ public:
         CreateStatusBar();
 
         auto* file_menu = new wxMenu;
+        file_menu->Append(export_png_id, "Export PNG...");
+        file_menu->Append(export_frames_id, "Export All Frames...");
+        file_menu->Append(export_animation_id, "Export Animation...");
+        file_menu->AppendSeparator();
         file_menu->Append(wxID_EXIT, "E&xit");
         auto* menu_bar = new wxMenuBar;
         menu_bar->Append(file_menu, "&File");
         SetMenuBar(menu_bar);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { Close(); }, wxID_EXIT);
+        Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent& event) {
+            event.Enable(preview_->can_export());
+        }, export_png_id);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { export_png(*preview_); }, export_png_id);
+        Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent& event) {
+            event.Enable(can_export_frames());
+        }, export_frames_id);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { export_frames(); }, export_frames_id);
+        Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent& event) {
+            event.Enable(selected_clip() != nullptr);
+        }, export_animation_id);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { export_animation(); }, export_animation_id);
+        for (auto* pane : {preview_, perspective_}) {
+            pane->Bind(wxEVT_CONTEXT_MENU, [this, pane](wxContextMenuEvent&) {
+                if (!pane->can_export())
+                    return;
+                wxMenu menu;
+                menu.Append(wxID_SAVE, "Export PNG...");
+                menu.Bind(wxEVT_MENU, [this, pane](wxCommandEvent&) { export_png(*pane); }, wxID_SAVE);
+                pane->PopupMenu(&menu);
+            });
+        }
 
         folders->Bind(wxEVT_DIRCTRL_SELECTIONCHANGED, [this, folders](wxTreeEvent& event) {
             const auto path = folders->GetPath(event.GetItem());
@@ -425,6 +487,109 @@ private:
                                                wxSP_3DSASH | wxSP_LIVE_UPDATE);
         splitter->SetMinimumPaneSize(splitter->FromDIP(60));
         return splitter;
+    }
+
+    static constexpr int export_png_id = wxID_HIGHEST + 1;
+    static constexpr int export_frames_id = wxID_HIGHEST + 2;
+    static constexpr int export_animation_id = wxID_HIGHEST + 3;
+
+    wxString export_name(const wxString& suffix) const
+    {
+        return wxString::FromUTF8(paths_.at(files_->GetSelection()).stem().u8string()) + suffix + ".png";
+    }
+
+    static wxString frame_suffix(const goldbox::Frame& frame)
+    {
+        return wxString::Format("-%02X-frame-%02u", frame.id, frame.index + 1);
+    }
+
+    bool can_export_frames() const
+    {
+        const auto selected = files_->GetSelection();
+        return !frames_.empty() && selected != wxNOT_FOUND &&
+               goldbox::is_picture_archive(paths_.at(selected));
+    }
+
+    void export_frames()
+    {
+        if (!can_export_frames())
+            return;
+        const auto& archive = paths_.at(files_->GetSelection());
+        wxDirDialog dialog(this, "Choose a folder for the PNG frames",
+                           wxString::FromUTF8(archive.parent_path().u8string()));
+        if (dialog.ShowModal() != wxID_OK)
+            return;
+
+        std::set<wxString> names;
+        std::vector<wxString> targets;
+        targets.reserve(frames_.size());
+        for (const auto& frame : frames_) {
+            const auto suffix = frame_suffix(frame);
+            auto name = export_name(suffix);
+            for (unsigned copy = 2; !names.insert(name).second; ++copy)
+                name = export_name(suffix + wxString::Format("-%u", copy));
+            auto path = wxFileName(dialog.GetPath(), name).GetFullPath();
+            if (wxFileName::Exists(path, wxFILE_EXISTS_ANY | wxFILE_EXISTS_NO_FOLLOW)) {
+                wxMessageBox("The destination already contains " + name +
+                             ". Choose a different folder.", "Export All Frames",
+                             wxOK | wxICON_WARNING, this);
+                return;
+            }
+            targets.push_back(std::move(path));
+        }
+
+        for (std::size_t i = 0; i < frames_.size(); ++i) {
+            wxFile file;
+            bool saved = false;
+            if (file.Create(targets[i], false)) {
+                auto image = frame_image(frames_[i]);
+                {
+                    wxFileOutputStream stream(file);
+                    saved = image.SaveFile(stream, wxBITMAP_TYPE_PNG) && stream.IsOk();
+                }
+                saved = file.Close() && saved;
+                if (!saved)
+                    wxRemoveFile(targets[i]);
+            }
+            if (!saved) {
+                wxMessageBox(wxString::Format("Export stopped after saving %zu of %zu frames.\n", i,
+                                              frames_.size()) + targets[i],
+                             "Export All Frames", wxOK | wxICON_ERROR, this);
+                return;
+            }
+        }
+        SetStatusText(wxString::Format("Exported %zu PNG frames", frames_.size()));
+    }
+
+    void export_animation()
+    {
+        const auto* clip = selected_clip();
+        if (!clip)
+            return;
+        const auto name = export_name(wxString::Format("-%02X-animation", clip->id));
+        wxFileDialog dialog(this, "Export Animation", {}, name,
+                            "Animated PNG (*.png)|*.png", wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+        if (dialog.ShowModal() != wxID_OK)
+            return;
+        wxTempFileOutputStream output(dialog.GetPath());
+        if (!output.IsOk() || !goldbox::write_apng(output, frames_, *clip) || !output.Commit()) {
+            wxMessageBox("Could not save the animated PNG.", "Export Animation",
+                         wxOK | wxICON_ERROR, this);
+            return;
+        }
+        SetStatusText("Exported animated PNG");
+    }
+
+    void export_png(const Preview& pane)
+    {
+        if (!pane.can_export())
+            return;
+        // Snapshot the current frame before the dialog runs its modal event loop.
+        auto image = pane.export_image();
+        wxFileDialog dialog(this, "Export PNG", {}, pane.filename(), "PNG images (*.png)|*.png",
+                            wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+        if (dialog.ShowModal() == wxID_OK && !image.SaveFile(dialog.GetPath(), wxBITMAP_TYPE_PNG))
+            wxMessageBox("Could not save the PNG image.", "Export PNG", wxOK | wxICON_ERROR, this);
     }
 
     void browse(const fs::path& folder, const fs::path& selected)
@@ -646,7 +811,8 @@ private:
 
     void show_frame(const goldbox::Frame& frame)
     {
-        preview_->show(&frame, zoom_->GetSelection() + 1);
+        preview_->show(&frame, zoom_->GetSelection() + 1,
+                       export_name(frame_suffix(frame)));
     }
 
     void show_fields(std::size_t index)
@@ -685,6 +851,7 @@ private:
             const bool original = save.original && (!save.copied || original_map_->GetValue());
             const auto& map = original ? *save.original : *save.copied;
             preview_->show_map(map, zoom_->GetSelection() + 1, save.x, save.y, save.facing,
+                               export_name(wxString::Format("-map-%02X", save.map_id)),
                                save.visited ? &*save.visited : nullptr, compare ? &save.changed : nullptr);
             show_view(true, false, false, false, false, compare);
             auto status = wxString::Format("Saved map %u   |   Party (%u, %u)   |   ",
@@ -714,11 +881,13 @@ private:
                 const bool has_walls = !banks[0].empty();
                 const int direction = facing_->GetSelection();
                 preview_->show_map(map, zoom_->GetSelection() + 1, cursor_x_, cursor_y_,
-                                   has_walls ? direction : -1);
+                                   has_walls ? direction : -1,
+                                   export_name(wxString::Format("-map-%02X", record.id)));
                 show_view(true, false, true, has_walls);
                 if (has_walls) {
                     const auto view = goldbox::wall_perspective(map, banks, cursor_x_, cursor_y_, direction);
-                    perspective_->show(&view, 2);
+                    perspective_->show(&view, 2, export_name(wxString::Format("-map-%02X-view-%d-%d-%d",
+                        record.id, cursor_x_, cursor_y_, direction)));
                     SetStatusText(wxString::Format("Map %u   |   Camera (%d, %d)   |   Click a square to move",
                                                    record.id, cursor_x_, cursor_y_));
                 } else {
@@ -779,6 +948,7 @@ private:
 class ExplorerApp : public wxApp {
     bool OnInit() override
     {
+        wxImage::AddHandler(new wxPNGHandler);
         fs::path initial;
         if (argc > 1)
             initial = fs::u8path(wxString(argv[1]).ToUTF8().data());
