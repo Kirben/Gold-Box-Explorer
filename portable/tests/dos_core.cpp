@@ -170,16 +170,16 @@ void ending(const fs::path& dir)
     check(partial.gallery_count() == 2 && partial.clips.empty(), "Incomplete FINAL must stay browsable");
 }
 
-Bytes tlb_library(const char* type, const std::vector<Bytes>& records, bool has_ids = false)
+Bytes tlb_library(const char* type, const std::vector<Bytes>& records, bool has_ids = false, bool amiga = false)
 {
     Bytes bytes(16 + 4 * (records.size() + 1));
-    std::copy_n("HLIB", 4, bytes.begin());
+    std::copy_n(amiga ? "GLIB" : "HLIB", 4, bytes.begin());
     std::copy_n(type, 4, bytes.begin() + 12);
-    bytes[8] = static_cast<std::uint8_t>(records.size());
+    bytes[amiga ? 9 : 8] = static_cast<std::uint8_t>(records.size());
     bytes[11] = has_ids;
     const auto set_dword = [&](std::size_t offset, std::size_t value) {
         for (unsigned i = 0; i < 4; ++i)
-            bytes[offset + i] = static_cast<std::uint8_t>(value >> (i * 8));
+            bytes[offset + i] = static_cast<std::uint8_t>(value >> ((amiga ? 3 - i : i) * 8));
     };
     for (std::size_t i = 0; i < records.size(); ++i) {
         set_dword(16 + 4 * i, bytes.size());
@@ -199,6 +199,40 @@ Bytes tlb_image(std::uint8_t method, const Bytes& pixels)
 
 void tlb(const fs::path& dir)
 {
+    Bytes amiga_palette(104);
+    amiga_palette[7] = 232;
+    amiga_palette[8 + 16 * 3] = 160;
+    const Bytes masked{0,1,0,0,0,0,1,225, 0x80,0,0,0,0,0x60};
+    const Bytes compressed{0,1,0,0,0,0,1,226, 253,0,0,0x40};
+    const auto amiga_path = dir / "amiga.tlb";
+    write(amiga_path, tlb_library("GLIB", {{0,1,0,42,0,1},
+        tlb_library("TILE", {amiga_palette, masked, compressed}, false, true)}, true, true));
+    const auto amiga = read_tlb(amiga_path);
+    check(amiga.frames.size() == 2 && amiga.skipped_ids.empty() && amiga.frames[0].id == 42 &&
+          amiga.frames[0].width == 8 && amiga.frames[0].rgba[3] == 0 &&
+          amiga.frames[0].rgba[4] == 160 && amiga.frames[0].rgba[7] == 255 &&
+          amiga.frames[1].rgba[4] == 160, "Amiga TILE endian, palette, mask or RLE mismatch");
+
+    Bytes amiga_map(1024);
+    amiga_map[0] = 0x10;
+    amiga_map[512] = 1;
+    const auto amiga_map_path = dir / "GEO.GLB";
+    write(amiga_map_path, tlb_library("DATA", {{0,1,0,42,0,1}, amiga_map}, true, true));
+    const auto maps = read_geo_glb(amiga_map_path);
+    check(maps.frames.size() == 1 && maps.frames[0].id == 42 && maps.frames[0].width == 193 &&
+          maps.frames[0].rgba[0] == 235 && maps.frames[0].rgba[(5 * 193 + 5) * 4] == 94,
+          "Amiga fixed GEO layout mismatch");
+    const auto strings = dir / "STRINGS.GLB";
+    write(strings, tlb_library("TEXT", {{'C','l','e','r','i','c'}, {'T','h','i','e','f'}}, false, true));
+    const auto labels = read_record_rows(strings);
+    check(labels.size() == 2 && labels[0].id == 0 && labels[0].name == "Cleric" &&
+          labels[1].id == 1 && labels[1].name == "Thief", "Amiga GLIB string IDs or payload mismatch");
+    const auto sounds = dir / "SOUNDS.GLB";
+    write(sounds, tlb_library("DIG8", {{0x1c,0xfa,0,0,0,2,0x7f,0x80}}, false, true));
+    const auto samples = read_record_rows(sounds);
+    check(samples.size() == 1 && samples[0].fields.back().second == "2",
+          "Amiga GLIB sample metadata mismatch");
+
     const Bytes palette{5, 0, 32, 0, 1, 0, 0, 24, 10, 20, 30};
     const auto tile = tlb_library("TILE", {palette, tlb_image(16, {32, 0, 32, 0}),
         tlb_image(17, {255, 0, 0, 0, 32, 32, 32, 32}), tlb_image(18, {253, 32}),

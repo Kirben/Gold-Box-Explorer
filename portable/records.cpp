@@ -586,6 +586,8 @@ RecordKind record_kind(const std::filesystem::path& path)
     if (is_ecl_archive(path))
         return RecordKind::ecl;
     const auto name = upper(path.filename().string());
+    if (name == "STRINGS.GLB") return RecordKind::amiga_text;
+    if (name == "SOUNDS.GLB") return RecordKind::amiga_sound;
     static const std::regex monster_name(R"(MON[0-9]*(CHA|ITM|SPC)\.DAX)");
     std::smatch match;
     if (std::regex_match(name, match, monster_name)) {
@@ -615,6 +617,30 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
         return read_vault(path);
     if (kind == RecordKind::ecl)
         return read_ecl_rows(path);
+    if (kind == RecordKind::amiga_text || kind == RecordKind::amiga_sound) {
+        const bool text = kind == RecordKind::amiga_text;
+        const auto entries = read_amiga_glb(path, text ? "TEXT" : "DIG8");
+        std::vector<RecordRow> rows;
+        for (const auto& entry : entries) {
+            const auto* b = entry.bytes.data();
+            RecordRow row{entry.id, 0, {}, {}};
+            if (text) {
+                row.name = amiga_name(b, static_cast<unsigned>(entry.bytes.size()));
+                row.fields.emplace_back("Text", row.name);
+                if (row.name.empty())
+                    row.name = "String " + std::to_string(entry.id);
+            } else {
+                if (entry.bytes.size() < 6)
+                    throw std::runtime_error("Truncated Amiga DIG8 sample header");
+                row.name = "Sample " + std::to_string(entry.id);
+                field(row, "Header word", amiga_word(b, 0));
+                field(row, "Declared sample bytes", std::uint32_t(amiga_word(b, 2)) << 16 | amiga_word(b, 4));
+                field(row, "Stored sample bytes", entry.bytes.size() - 6);
+            }
+            rows.push_back(std::move(row));
+        }
+        return rows;
+    }
     if (kind == RecordKind::saved_character || kind == RecordKind::saved_inventory ||
         kind == RecordKind::saved_effects)
         return read_save_rows(path, kind);

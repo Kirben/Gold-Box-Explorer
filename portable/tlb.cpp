@@ -36,12 +36,13 @@ Bytes read_bytes(const fs::path& path)
 struct Slice {
     const std::uint8_t* data;
     std::size_t size;
+    bool big_endian = false;
 
     Slice part(std::size_t start, std::size_t count) const
     {
         if (start > size || count > size - start)
             throw std::runtime_error("TLB record extends beyond its library");
-        return {data + start, count};
+        return {data + start, count, big_endian};
     }
 
     unsigned byte(std::size_t offset) const { return *part(offset, 1).data; }
@@ -49,7 +50,7 @@ struct Slice {
     unsigned word(std::size_t offset) const
     {
         const auto* p = part(offset, 2).data;
-        return unsigned(p[0]) | (unsigned(p[1]) << 8);
+        return big_endian ? (unsigned(p[0]) << 8 | p[1]) : (unsigned(p[1]) << 8 | p[0]);
     }
 
     int signed_word(std::size_t offset) const
@@ -60,7 +61,9 @@ struct Slice {
 
     std::uint32_t dword(std::size_t offset) const
     {
-        return word(offset) | (std::uint32_t(word(offset + 2)) << 16);
+        const auto first = std::uint32_t(word(offset));
+        const auto second = std::uint32_t(word(offset + 2));
+        return big_endian ? (first << 16 | second) : (second << 16 | first);
     }
 
     bool tag(std::size_t offset, const char* value) const
@@ -73,7 +76,8 @@ struct Slice {
 struct Library {
     explicit Library(Slice source) : data(source)
     {
-        if (!data.tag(0, "HLIB") || data.byte(10) != 0)
+        data.big_endian = data.tag(0, "GLIB");
+        if ((!data.big_endian && !data.tag(0, "HLIB")) || data.byte(10) != 0)
             throw std::runtime_error("Unsupported TLB library header");
         const auto size = data.dword(4);
         if (size < 16)
@@ -366,6 +370,193 @@ void read_tiles(const Library& library, bool external_only, Palette& palette,
     }
 }
 
+bool amiga_palette(Slice record, Palette& palette)
+{
+    if (record.size < 8 || (record.byte(7) != 8 && record.byte(7) != 232) ||
+        (record.size != 56 && record.size != 104))
+        return false;
+    const auto* rgb = record.part(8, record.size - 8).data;
+    for (unsigned i = 0; i < (record.size - 8) / 3; ++i)
+        palette[i] = {rgb[3 * i], rgb[3 * i + 1], rgb[3 * i + 2], 255};
+    return true;
+}
+
+Frame amiga_tile(Slice record, unsigned id, unsigned index, const Palette& palette)
+{
+    const auto method = record.byte(7);
+    const unsigned stride = record.byte(6);
+    const unsigned height = record.word(0);
+    if (!stride || !height || height > 1024)
+        throw std::runtime_error("Invalid Amiga TILE dimensions");
+    const unsigned colors = method >= 224 ? 5 : 4;
+    const bool masked = method == 1 || method == 225;
+    const auto span = stride * height;
+    const auto required = span * (colors + masked);
+    Bytes unpacked;
+    const std::uint8_t* data;
+    if (method == 2 || method == 226) {
+        std::size_t at = 8;
+        unpacked.reserve(required);
+        while (unpacked.size() < required) {
+            const auto code = record.byte(at++);
+            const auto count = code < 128 ? code + 1 : 257 - code;
+            if (count > required - unpacked.size())
+                throw std::runtime_error("Amiga TILE run exceeds image dimensions");
+            if (code < 128) {
+                const auto* source = record.part(at, count).data;
+                unpacked.insert(unpacked.end(), source, source + count);
+                at += count;
+            } else {
+                unpacked.insert(unpacked.end(), count, record.byte(at++));
+            }
+        }
+        if (record.size - at > 1)
+            throw std::runtime_error("Unexpected data after Amiga TILE runs");
+        data = unpacked.data();
+    } else {
+        if (record.size != 8 + required)
+            throw std::runtime_error("Unexpected Amiga planar TILE size");
+        data = record.part(8, required).data;
+    }
+    const auto* mask = masked ? data : nullptr;
+    if (mask)
+        data += span;
+    Frame frame{id, index, stride * 8, height, Bytes(span * 32)};
+    for (unsigned offset = 0; offset < span; ++offset) {
+        for (unsigned bit = 0; bit < 8; ++bit) {
+            const unsigned key = 128 >> bit;
+            if (mask && (mask[offset] & key))
+                continue;
+            unsigned color = 0;
+            for (unsigned plane = 0; plane < colors; ++plane)
+                if (data[plane * span + offset] & key)
+                    color |= 1u << plane;
+            std::copy(palette[color].begin(), palette[color].end(),
+                      frame.rgba.begin() + (offset * 8 + bit) * 4);
+        }
+    }
+    return frame;
+}
+
+void append_amiga_tiles(const Library& library, Palette palette, PictureArchive& result,
+                        std::optional<unsigned> group = {})
+{
+    if (!library.data.tag(12, "TILE"))
+        throw std::runtime_error("Expected an Amiga TILE library");
+    unsigned index = 0;
+    for (auto i = library.first_item(); i < library.ids.size(); ++i) {
+        const auto tile = library.item(i);
+        if (tile.size < 8 || amiga_palette(tile, palette))
+            continue;
+        const auto id = group.value_or(library.ids[i].value_or(i));
+        const auto method = tile.byte(7);
+        switch (method) {
+        case 0: case 1: case 2: case 224: case 225: case 226:
+            try {
+                result.frames.push_back(amiga_tile(tile, id, group ? index : 0, palette));
+            } catch (const std::runtime_error&) {
+                result.skipped_ids.push_back(id);
+            }
+            break;
+        default:
+            result.skipped_ids.push_back(id);
+            break;
+        }
+        ++index;
+    }
+}
+
+PictureArchive read_amiga_tiles(const Library& library, const fs::path& path)
+{
+    PictureArchive result;
+    auto palette = default_palette();
+    for (unsigned i = 16; i < 32; ++i)
+        palette[i] = palette[i - 16];
+    const auto folder = fs::absolute(path).parent_path();
+    if (upper(path.filename().string()) != "ALWAYS.TLB") {
+        auto companion = map_companion(folder, "DISK1", "ALWAYS.TLB");
+        if (!companion)
+            companion = find_resource(folder.parent_path(), "ALWAYS.TLB");
+        if (companion) {
+            try {
+                const auto bytes = read_bytes(*companion);
+                const Library system({bytes.data(), bytes.size()});
+                if (system.data.big_endian && system.ids.size() > system.first_item())
+                    amiga_palette(system.item(system.first_item()), palette);
+            } catch (const std::runtime_error&) {
+                // Embedded palettes still apply when the system palette is compressed.
+            }
+        }
+    }
+    if (library.data.tag(12, "TILE")) {
+        append_amiga_tiles(library, palette, result);
+    } else if (library.data.tag(12, "GLIB") || library.data.tag(12, "HLIB")) {
+        for (auto i = library.first_item(); i < library.ids.size(); ++i) {
+            const auto id = library.ids[i].value_or(i);
+            try {
+                append_amiga_tiles(Library(library.item(i)), palette, result, id);
+            } catch (const std::runtime_error&) {
+                result.skipped_ids.push_back(id);
+            }
+        }
+    } else {
+        throw std::runtime_error("Unsupported Amiga GLIB graphics content");
+    }
+    std::sort(result.skipped_ids.begin(), result.skipped_ids.end());
+    result.skipped_ids.erase(std::unique(result.skipped_ids.begin(), result.skipped_ids.end()),
+                             result.skipped_ids.end());
+    return result;
+}
+
+PictureArchive read_amiga_geo(const Library& maps)
+{
+    PictureArchive result;
+    for (const auto& [id, index] : maps.directory) {
+        if (!index || index >= maps.ids.size())
+            throw std::runtime_error("Invalid Amiga GEO area index");
+        const auto area = maps.item(index);
+        const bool fixed = area.size == 1024;
+        if (!fixed && area.size < 8) {
+            result.skipped_ids.push_back(id);
+            continue;
+        }
+        const unsigned rows = fixed ? 16 : area.byte(0);
+        const unsigned cols = fixed ? 16 : area.byte(1);
+        const unsigned cells = rows * cols;
+        const unsigned header = fixed ? 0 : 8;
+        if (!cells || cells > 784 || header + 4 * cells > area.size) {
+            result.skipped_ids.push_back(id);
+            continue;
+        }
+        constexpr unsigned scale = 12;
+        Frame frame{id, 0, cols * scale + 1, rows * scale + 1, {}};
+        frame.rgba.resize(frame.width * frame.height * 4);
+        auto paint = [&](unsigned x, unsigned y, Color color) {
+            std::copy(color.begin(), color.end(), frame.rgba.begin() + (y * frame.width + x) * 4);
+        };
+        const Color background{24,24,24,255}, wall{235,235,235,255}, event{94,180,130,255};
+        for (unsigned y = 0; y < frame.height; ++y)
+            for (unsigned x = 0; x < frame.width; ++x)
+                paint(x, y, background);
+        for (unsigned i = 0; i < cells; ++i) {
+            const unsigned x = i % cols * scale, y = i / cols * scale;
+            const auto ne = area.byte(header + i), sw = area.byte(header + cells + i);
+            for (unsigned dot = 0; dot <= scale; ++dot) {
+                if (ne >> 4) paint(x + dot, y, wall);
+                if (ne & 15) paint(x + scale, y + dot, wall);
+                if (sw >> 4) paint(x + dot, y + scale, wall);
+                if (sw & 15) paint(x, y + dot, wall);
+            }
+            if (area.byte(header + 2 * cells + i) & 127)
+                for (unsigned dy = 5; dy < 8; ++dy)
+                    for (unsigned dx = 5; dx < 8; ++dx)
+                        paint(x + dx, y + dy, event);
+        }
+        result.frames.push_back(std::move(frame));
+    }
+    return result;
+}
+
 Palette dark_queen_palette(const fs::path& folder)
 {
     auto palette = default_palette();
@@ -454,6 +645,8 @@ PictureArchive read_tlb(const fs::path& path)
 {
     const auto bytes = read_bytes(path);
     const Library library({bytes.data(), bytes.size()});
+    if (library.data.big_endian)
+        return read_amiga_tiles(library, path);
     auto palette = default_palette();
     const auto name = upper(path.filename().string());
     if ((name == "TITLE.TLB" || name == "FINAL.TLB") && library.data.tag(12, "HLIB")) {
@@ -513,6 +706,8 @@ PictureArchive read_geo_glb(const fs::path& path)
     const Library maps({bytes.data(), bytes.size()});
     if (!maps.data.tag(12, "DATA") || maps.first_item() != 1 || maps.directory.empty())
         throw std::runtime_error("Expected a GEO.GLB map directory");
+    if (maps.data.big_endian)
+        return read_amiga_geo(maps);
 
     const auto folder = fs::absolute(path).parent_path();
     const auto tile_path = map_companion(folder, "DISK2", "TOPVIEW.TLB");

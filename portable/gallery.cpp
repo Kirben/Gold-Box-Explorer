@@ -814,7 +814,7 @@ private:
                                     : packwall ? goldbox::read_packwall(path)
                                     : vace ? goldbox::read_vace(path) : goldbox::read_pictures(path);
                 if (archive.frames.empty())
-                    throw std::runtime_error("Archive contains no wall pieces");
+                    throw std::runtime_error("Archive contains no supported images");
                 const auto count = archive.gallery_count();
                 frames_ = std::move(archive.frames);
                 clips_ = std::move(archive.clips);

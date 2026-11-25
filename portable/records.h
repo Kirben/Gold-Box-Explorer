@@ -6,7 +6,7 @@
 #include <utility>
 
 namespace goldbox {
-enum class RecordKind { none, monsters, items, inventory, monster_effects, saved_character, saved_inventory, saved_effects, vault, ecl };
+enum class RecordKind { none, monsters, items, inventory, monster_effects, saved_character, saved_inventory, saved_effects, vault, ecl, amiga_text, amiga_sound };
 using Field = std::pair<std::string, std::string>;
 
 struct RecordRow {

@@ -146,16 +146,17 @@ std::vector<DaxRecord> try_amiga_dax(const Bytes& file)
     return records;
 }
 
-std::vector<DaxRecord> try_amiga_glb(const Bytes& file)
+std::vector<DaxRecord> try_amiga_glb(const Bytes& file, const char* content)
 {
     if (file.size() < 16 || !std::equal(file.begin(), file.begin() + 4, "GLIB"))
         return {};
     const auto count = be16(file, 8);
+    const auto flags = be16(file, 10);
     const auto table_end = 16 + 4 * (count + 1);
-    if (file.size() != be32(file, 4) || be16(file, 10) != 1 ||
-        !std::equal(file.begin() + 12, file.begin() + 16, "DATA") ||
+    if (file.size() != be32(file, 4) || flags > 1 ||
+        !std::equal(file.begin() + 12, file.begin() + 16, content) ||
         !count || table_end > file.size())
-        throw std::runtime_error("Invalid Amiga GLIB DATA header");
+        throw std::runtime_error("Invalid Amiga GLIB header");
     std::vector<std::uint32_t> offsets;
     for (unsigned i = 0; i <= count; ++i) {
         const auto offset = be32(file, 16 + 4 * i);
@@ -163,22 +164,39 @@ std::vector<DaxRecord> try_amiga_glb(const Bytes& file)
             throw std::runtime_error("Invalid Amiga GLIB record offset");
         offsets.push_back(offset);
     }
+    std::vector<DaxRecord> records;
+    auto append = [&](unsigned id, unsigned index) {
+        const auto first = offsets[index];
+        const auto last = offsets[index + 1];
+        records.push_back({id, last - first, Bytes(file.begin() + first, file.begin() + last)});
+    };
+    if (!flags) {
+        for (unsigned i = 0; i < count; ++i)
+            append(i, i);
+        return records;
+    }
     if (offsets[1] - offsets[0] < 2)
         throw std::runtime_error("Missing Amiga GLIB index");
     const auto entries = be16(file, offsets[0]);
     if (2 + 4 * entries > offsets[1] - offsets[0])
         throw std::runtime_error("Truncated Amiga GLIB index");
-    std::vector<DaxRecord> records;
     for (unsigned i = 0; i < entries; ++i) {
         const auto at = offsets[0] + 2 + 4 * i;
         const auto index = be16(file, at + 2);
         if (!index || index >= count)
             throw std::runtime_error("Invalid Amiga GLIB record index");
-        const auto first = offsets[index];
-        const auto last = offsets[index + 1];
-        records.push_back({be16(file, at), last - first, Bytes(file.begin() + first, file.begin() + last)});
+        append(be16(file, at), index);
     }
     return records;
+}
+
+std::vector<DaxRecord> read_amiga_glb(const std::filesystem::path& path, const char* content)
+{
+    std::ifstream input(path, std::ios::binary);
+    if (!input)
+        throw std::runtime_error("Cannot open Amiga GLIB library");
+    const Bytes bytes{std::istreambuf_iterator<char>(input), {}};
+    return try_amiga_glb(bytes, content);
 }
 
 std::vector<DaxRecord> try_amiga_dax(const std::filesystem::path& path)
