@@ -598,6 +598,24 @@ RecordRow effect(unsigned id, unsigned slot, const std::uint8_t* b, const std::s
     return row;
 }
 
+void base_item_fields(RecordRow& row, const std::uint8_t* item)
+{
+    field(row, "Equipment slot", item[0]);
+    field(row, "Hands required", item[1]);
+    field(row, "Large target damage dice count", item[2]);
+    field(row, "Large target damage die sides", item[3]);
+    field(row, "Large target damage modifier", signed_byte(item[4]));
+    field(row, "Rate of fire (doubled)", item[5]);
+    field(row, "Armour class descriptor", item[6]);
+    field(row, "Weapon class / damage type flags", item[7]);
+    field(row, "Small or medium target damage dice count", item[9]);
+    field(row, "Small or medium target damage die sides", item[10]);
+    field(row, "Small or medium target damage modifier", signed_byte(item[11]));
+    field(row, "Range (stored)", item[12]);
+    field(row, "Class usability mask", item[13]);
+    field(row, "Weapon property flags", item[14]);
+}
+
 std::vector<RecordRow> read_base_items(const std::filesystem::path& path)
 {
     const auto bytes = read_record_file(path);
@@ -618,8 +636,8 @@ std::vector<RecordRow> read_base_items(const std::filesystem::path& path)
         RecordRow row{id, 0, "Base item " + std::to_string(id), {}};
         field(row, "Base item type", id);
         field(row, "File offset", offset);
-        field(row, "Equipment slot", item[0]);
         if (buck_rogers) {
+            field(row, "Equipment slot", item[0]);
             field(row, "Attacks per round (doubled)", item[1]);
             field(row, "Weapon class / armour class code", item[2]);
             field(row, "Heavy equipment", item[3]);
@@ -629,24 +647,205 @@ std::vector<RecordRow> read_base_items(const std::filesystem::path& path)
             field(row, "Range", item[7]);
             field(row, "Consumable", item[8]);
         } else {
-            field(row, "Hands required", item[1]);
-            field(row, "Large target damage dice count", item[2]);
-            field(row, "Large target damage die sides", item[3]);
-            field(row, "Large target damage modifier", signed_byte(item[4]));
-            field(row, "Rate of fire (doubled)", item[5]);
-            field(row, "Armour class descriptor", item[6]);
-            field(row, "Weapon class / damage type flags", item[7]);
-            field(row, "Small or medium target damage dice count", item[9]);
-            field(row, "Small or medium target damage die sides", item[10]);
-            field(row, "Small or medium target damage modifier", signed_byte(item[11]));
-            field(row, "Range (stored)", item[12]);
-            field(row, "Class usability mask", item[13]);
-            field(row, "Weapon property flags", item[14]);
+            base_item_fields(row, item);
         }
         row.fields.emplace_back("Stored bytes", raw_bytes(item, 0, stride));
         rows.push_back(std::move(row));
     }
     return rows;
+}
+
+std::vector<RecordRow> read_frua_items(const std::filesystem::path& path)
+{
+    const auto directory = path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
+    std::filesystem::path definitions, base;
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        if (!entry.is_regular_file())
+            continue;
+        const auto name = upper(entry.path().filename().string());
+        if (name == "ITEM.DAT") definitions = entry.path();
+        if (name == "ITEMS.DAT") base = entry.path();
+    }
+    if (upper(path.filename().string()) == "ITEM.DAT") definitions = path;
+    else base = path;
+    if (definitions.empty())
+        return read_base_items(base);
+    const auto items = read_record_file(definitions);
+    const auto base_items = base.empty() ? std::vector<std::uint8_t>{} : read_record_file(base);
+    constexpr unsigned count = 254, base_stride = 16;
+    const auto stride = items.size() / count;
+    if ((stride != 17 && stride != 18) || items.size() != count * stride)
+        throw std::runtime_error("Expected 254 DOS ITEM.DAT records");
+    if (!base_items.empty() && base_items.size() != 128 * base_stride)
+        throw std::runtime_error("Expected 128 DOS ITEMS.DAT base records");
+    std::vector<RecordRow> rows;
+    rows.reserve(count);
+    for (unsigned id = 0; id < count; ++id) {
+        const auto* b = items.data() + id * stride;
+        RecordRow row{id, 0, {}, {}};
+        for (const auto component : {b[3], b[2], b[1]}) {
+            if (!component)
+                continue;
+            if (!row.name.empty())
+                row.name += ' ';
+            if (component < std::size(frua_item_components))
+                row.name += frua_item_components[component];
+            else
+                row.name += '[' + std::to_string(component) + ']';
+        }
+        if (row.name.empty())
+            row.name = "Item " + std::to_string(id);
+        field(row, "Item ID", id);
+        field(row, "Base item type", b[0]);
+        row.fields.emplace_back("Name component IDs", std::to_string(b[3]) + ", " +
+                                std::to_string(b[2]) + ", " + std::to_string(b[1]));
+        field(row, "Weight", signed_word(word(b, 4)));
+        field(row, "Price", signed_word(word(b, 6)));
+        field(row, "Magic bonus", signed_byte(b[8]));
+        field(row, "Secondary code", b[9]);
+        field(row, "Readied", b[10]);
+        field(row, "Identification flags", b[11]);
+        field(row, "Cursed", b[12]);
+        field(row, "Quantity", b[13]);
+        field(row, "Charges", b[14]);
+        field(row, "Magical effect code", b[15]);
+        field(row, "Special code", b[16]);
+        if (std::size_t(b[0] + 1) * base_stride <= base_items.size())
+            base_item_fields(row, base_items.data() + b[0] * base_stride);
+        row.fields.emplace_back("Stored bytes", raw_bytes(b, 0, static_cast<unsigned>(stride)));
+        rows.push_back(std::move(row));
+    }
+    return rows;
+}
+
+std::string fixed_text(const std::uint8_t* b, unsigned length)
+{
+    const auto end = std::find(b, b + length, 0);
+    std::string result(b, end);
+    const auto last = result.find_last_not_of(' ');
+    result.resize(last == std::string::npos ? 0 : last + 1);
+    return result;
+}
+
+std::vector<RecordRow> read_frua_design(const std::filesystem::path& path)
+{
+    const auto bytes = read_record_file(path);
+    if (bytes.size() < 387)
+        throw std::runtime_error("Truncated FRUA GAME001.DAT");
+    const auto* b = bytes.data();
+    auto name = fixed_text(b, 32);
+    RecordRow row{0, 0, name.empty() ? "Adventure design" : std::move(name), {}};
+    constexpr const char* resources[]{"Starting experience", "Starting platinum", "Starting gems", "Starting jewellery"};
+    for (unsigned i = 0; i < 4; ++i) {
+        const auto at = 32 + i * 4;
+        const auto value = word(b, at) | (std::uint32_t(word(b, at + 2)) << 16);
+        field(row, resources[i], value);
+    }
+    field(row, "Starting module", b[48]);
+    field(row, "Starting entry point", b[49]);
+    field(row, "Starting equipment", b[50]);
+    for (unsigned i = 0; i < 20; ++i) {
+        auto label = (i < 8 ? "Key " : "Special item ") + std::to_string(i < 8 ? i + 1 : i - 7);
+        row.fields.emplace_back(std::move(label), fixed_text(b + 52 + i * 16, 16));
+    }
+    row.fields.emplace_back("Design password", fixed_text(b + 372, 15));
+    return {std::move(row)};
+}
+
+std::vector<RecordRow> read_frua_geo(const std::filesystem::path& path)
+{
+    const auto bytes = read_record_file(path);
+    constexpr unsigned grid = 322, stored_cells = 576, cell_stride = 6;
+    if (bytes.size() < grid + stored_cells * cell_stride)
+        throw std::runtime_error("Truncated FRUA GEO map");
+    const auto* b = bytes.data();
+    const unsigned height = b[26], width = b[27];
+    const auto cells = width * height;
+    if (cells > stored_cells)
+        throw std::runtime_error("Invalid FRUA GEO map dimensions");
+    auto name = fixed_text(b + 142, 16);
+    RecordRow summary{0, 0, name.empty() ? "Map summary" : std::move(name), {}};
+    field(summary, "Width", width);
+    field(summary, "Height", height);
+    const bool overland = b[28] == 255 && b[29] == 255 && b[30] == 255;
+    summary.fields.emplace_back("Module type", overland ? "Overland" : "Dungeon");
+    summary.fields.emplace_back("Wall art slots", raw_bytes(b, 28, 3));
+    field(summary, "Area view", b[31]);
+    summary.fields.emplace_back("Backdrop slots", raw_bytes(b, 32, 4));
+    field(summary, "Dungeon combat art", b[36]);
+    field(summary, "Wilderness combat art", b[37]);
+    field(summary, "Summoned monster", b[286]);
+    field(summary, "Undead turning difficulty", b[287]);
+    field(summary, "Camp picture", b[312]);
+    field(summary, "Treasure picture", b[313]);
+    for (unsigned i = 0; i < 8; ++i) {
+        const auto slot = std::to_string(i + 1);
+        const auto* entry = b + 38 + i * 4;
+        summary.fields.emplace_back("Entry point " + slot, std::to_string(entry[1]) + ", " +
+                                    std::to_string(entry[0]) + " (facing " + std::to_string(entry[2]) + ')');
+        summary.fields.emplace_back("Zone " + slot, fixed_text(b + 158 + i * 16, 16));
+        const auto* rest = b + 70 + i * 4;
+        summary.fields.emplace_back("Rest event " + slot, std::to_string(rest[2]) + " (" +
+                                    std::to_string(rest[3]) + "% every " + std::to_string(rest[0]) + " minutes)");
+        const auto* step = b + 102 + i * 4;
+        summary.fields.emplace_back("Step event " + slot, std::to_string(step[2]) + " (every " +
+                                    std::to_string(step[0]) + " steps, zone mask " + std::to_string(step[3]) + ')');
+    }
+    std::vector<RecordRow> rows;
+    rows.reserve(1 + cells);
+    rows.push_back(std::move(summary));
+    for (unsigned i = 0; i < cells; ++i) {
+        const auto* cell = b + grid + i * cell_stride;
+        RecordRow row{i + 1, 0, "Cell " + std::to_string(i % width) + ", " + std::to_string(i / width), {}};
+        constexpr const char* edges[]{"North", "East", "South", "West"};
+        for (unsigned direction = 0; direction < 4; ++direction)
+            field(row, edges[direction], cell[direction]);
+        field(row, "Event", cell[4]);
+        field(row, "Backdrop / zone byte", cell[5]);
+        rows.push_back(std::move(row));
+    }
+    constexpr unsigned encounter_tag = grid + stored_cells * cell_stride;
+    constexpr unsigned encounters = encounter_tag + 8, encounter_count = 100, encounter_stride = 20;
+    if (bytes.size() >= encounters + encounter_count * encounter_stride &&
+        upper(std::string(reinterpret_cast<const char*>(b + encounter_tag), 4)) == "ENCR") {
+        for (unsigned i = 0; i < encounter_count; ++i) {
+            const auto* event = b + encounters + i * encounter_stride;
+            if (!event[0])
+                continue;
+            RecordRow row{stored_cells + i + 1, 0, "Event " + std::to_string(i + 1), {}};
+            field(row, "Event type", event[0]);
+            field(row, "Do flag", event[1]);
+            field(row, "Condition", event[2]);
+            field(row, "Chained event", event[3]);
+            row.fields.emplace_back("Event parameters", raw_bytes(event, 4, 16));
+            rows.push_back(std::move(row));
+        }
+    }
+    return rows;
+}
+
+std::vector<RecordRow> read_frua_save(const std::filesystem::path& path)
+{
+    const auto b = read_record_file(path);
+    if (b.size() < 131)
+        throw std::runtime_error("Truncated FRUA SAVGAM CSV data");
+    RecordRow row{0, 0, "Saved party", {}};
+    constexpr std::pair<unsigned, const char*> fields[]{
+        {1,"No magic"}, {5,"Rounds"}, {6,"Turns"}, {7,"Hours"}, {8,"Days"},
+        {9,"Months"}, {10,"Years"}, {16,"Facing direction"}, {17,"Game speed"},
+        {18,"Current module"}, {21,"Initiated"}, {22,"Previous column"}, {23,"Previous row"},
+        {24,"Search mode"}, {25,"Overland"}, {28,"Party never dies"}, {29,"No treasure"},
+        {30,"No combat XP"}, {31,"Party size"}, {33,"Dungeon"}, {35,"Second overland"},
+        {36,"Overland column"}, {37,"Overland row"}, {38,"Combat level"}, {43,"No rest zone"},
+        {47,"Training allowed"}, {54,"Initial opponent distance"}, {57,"Friendly opponents"},
+        {59,"Underwater"}, {65,"Dungeon column"}, {66,"Dungeon row"},
+    };
+    for (const auto& [offset, label] : fields)
+        field(row, label, b[offset]);
+    row.fields.emplace_back("Key bytes", raw_bytes(b.data(), 67, 8));
+    row.fields.emplace_back("Special item bytes", raw_bytes(b.data(), 75, 12));
+    row.fields.emplace_back("Quest bytes", raw_bytes(b.data(), 87, 44));
+    return {std::move(row)};
 }
 
 std::vector<RecordRow> read_vault(const std::filesystem::path& path)
@@ -775,6 +974,12 @@ RecordKind record_kind(const std::filesystem::path& path)
         return RecordKind::c64;
     const auto name = upper(path.filename().string());
     if (name == "ITEMS" || name == "ITEMS.1") return RecordKind::base_items;
+    if (name == "ITEM.DAT" || name == "ITEMS.DAT") return RecordKind::frua_items;
+    if (name == "GAME001.DAT") return RecordKind::frua_design;
+    if (name.compare(0, 3, "GEO") == 0 && upper(path.extension().string()) == ".DAT")
+        return RecordKind::frua_geo;
+    if (name.compare(0, 6, "SAVGAM") == 0 && upper(path.extension().string()) == ".CSV")
+        return RecordKind::frua_save;
     if (name == "STRINGS.GLB") return RecordKind::amiga_text;
     if (name == "SOUNDS.GLB") return RecordKind::amiga_sound;
     static const std::regex monster_name(R"(MON[0-9]*(CHA|ITM|SPC)\.(DAX|GLB))");
@@ -806,6 +1011,14 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
         return read_vault(path);
     if (kind == RecordKind::base_items)
         return read_base_items(path);
+    if (kind == RecordKind::frua_items)
+        return read_frua_items(path);
+    if (kind == RecordKind::frua_design)
+        return read_frua_design(path);
+    if (kind == RecordKind::frua_geo)
+        return read_frua_geo(path);
+    if (kind == RecordKind::frua_save)
+        return read_frua_save(path);
     if (kind == RecordKind::ecl)
         return read_ecl_rows(path);
     if (kind == RecordKind::c64)

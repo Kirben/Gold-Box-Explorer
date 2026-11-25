@@ -30,7 +30,7 @@ include(CTest)
 if(BUILD_TESTING)
     add_executable(goldbox-dos-tests tests/dos_core.cpp)
     target_link_libraries(goldbox-dos-tests PRIVATE goldbox_pictures)
-    foreach(section IN ITEMS pictures geo walls records saves tlb vace ending geo-glb cmp packwall anm vault monsters items ecl c64 ilbm)
+    foreach(section IN ITEMS pictures geo walls records saves tlb vace ending geo-glb cmp packwall anm vault monsters items ecl c64 ilbm frua-records)
         add_test(NAME dos-${section} COMMAND goldbox-dos-tests
             ${section} "${CMAKE_CURRENT_BINARY_DIR}/fixtures/${section}")
     endforeach()

@@ -1056,6 +1056,72 @@ static void ilbm(const fs::path& dir)
     check(rejected, "ILBM accepted a ByteRun1 run crossing bitplane rows");
 }
 
+static void frua_records(const fs::path& dir)
+{
+    const auto items = dir / "item.dat";
+    const auto base = dir / "ITEMS.DAT";
+    Bytes base_data(128 * 16);
+    base_data[16 + 1] = 2;
+    const auto standalone_base = dir / "standalone" / "ITEMS.DAT";
+    fs::create_directories(standalone_base.parent_path());
+    write(standalone_base, base_data);
+    check(read_record_rows(standalone_base).size() == 128, "FRUA base table must open independently");
+    write(base, base_data);
+    for (const unsigned stride : {17, 18}) {
+        Bytes data(254 * stride);
+        auto start = data.begin() + stride;
+        start[0] = 1;
+        start[3] = 18;
+        start[4] = 44;
+        start[6] = 75;
+        start[8] = 255;
+        write(items, data);
+        for (const auto& path : {items, base}) {
+            const auto rows = read_record_rows(path);
+            check(rows.size() == 254 && rows[1].name == "Long Sword" &&
+                  has_field(rows[1], {"Price", "75"}) &&
+                  has_field(rows[1], {"Magic bonus", "-1"}) &&
+                  has_field(rows[1], {"Hands required", "2"}), "FRUA item companion or stride failed");
+        }
+    }
+
+    const auto design = dir / "GAME001.DAT";
+    Bytes settings(387);
+    std::copy_n("Design", 6, settings.begin());
+    settings[34] = 1;
+    settings[48] = 4;
+    std::copy_n("Silver Key", 10, settings.begin() + 52);
+    write(design, settings);
+    const auto campaign = read_record_rows(design);
+    check(campaign.size() == 1 && campaign[0].name == "Design" &&
+          has_field(campaign[0], {"Starting experience", "65536"}) &&
+          has_field(campaign[0], {"Key 1", "Silver Key"}), "FRUA design offsets failed");
+
+    const auto geo_dat = dir / "GEO001.DAT";
+    constexpr unsigned grid = 322, encounter_tag = grid + 24 * 24 * 6;
+    Bytes dungeon(encounter_tag + 8 + 100 * 20);
+    dungeon[26] = 15;
+    dungeon[27] = 38;
+    std::copy_n("Keep", 4, dungeon.begin() + 142);
+    dungeon[grid + 6 * 38 + 4] = 5;
+    std::copy_n("ENCR", 4, dungeon.begin() + encounter_tag);
+    dungeon[encounter_tag + 8 + 4 * 20] = 38;
+    write(geo_dat, dungeon);
+    const auto map = read_record_rows(geo_dat);
+    check(map.size() == 572 && map.front().name == "Keep" && map[39].name == "Cell 0, 1" &&
+          has_field(map[39], {"Event", "5"}) && map.back().name == "Event 5" &&
+          has_field(map.back(), {"Event type", "38"}), "FRUA map offsets failed");
+
+    const auto save = dir / "SAVGAMA.CSV";
+    Bytes saved(131);
+    saved[31] = 6;
+    saved[65] = 12;
+    write(save, saved);
+    const auto party = read_record_rows(save);
+    check(party.size() == 1 && has_field(party[0], {"Party size", "6"}) &&
+          has_field(party[0], {"Dungeon column", "12"}), "FRUA binary saved party offsets failed");
+}
+
 int main(int argc, char** argv)
 {
     try {
@@ -1076,6 +1142,7 @@ int main(int argc, char** argv)
         else if (name == "ecl") ecl_scripts(dir);
         else if (name == "c64") c64_assets(dir);
         else if (name == "ilbm") ilbm(dir);
+        else if (name == "frua-records") frua_records(dir);
         else if (name == "vace") vace(dir);
         else if (name == "geo") geo(dir);
         else if (name == "walls") walls(dir);
