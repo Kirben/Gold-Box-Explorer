@@ -810,6 +810,89 @@ void numbered_monsters(const fs::path& dir)
     const auto blades = read_record_rows(dir / "MON3CHA.DAX");
     check(has_field(blades.at(0), {"Maximum HP", "34"}) &&
           has_field(blades.at(0), {"Current HP", "29"}), "Wrong Silver Blades monster offsets");
+    auto inventory = item();
+    inventory[46] = 50;
+    inventory[47] = 108;
+    inventory[48] = 0;
+    inventory[49] = 50;
+    dax(dir / "MON3ITM.DAT", 2, inventory);
+    const auto silver_items = read_record_rows(dir / "MON3ITM.DAT");
+    check(silver_items.size() == 1 && silver_items[0].name == "Bracers AC 4" &&
+          has_field(silver_items[0], {"Owner", "Orc"}),
+          "Wrong Silver Blades inventory name or DAT archive routing");
+
+    auto krynn = character();
+    krynn.resize(216);
+    krynn[40] = 40;
+    krynn[214] = 38;
+    dax(dir / "MON4CHA.DAX", 2, krynn);
+    const auto krynn_creatures = read_record_rows(dir / "MON4CHA.DAX");
+    check(krynn_creatures.size() == 1 && has_field(krynn_creatures[0], {"Maximum HP", "40"}) &&
+          has_field(krynn_creatures[0], {"Current HP", "38"}), "Wrong Death Knights monster layout");
+    std::vector<std::uint8_t> spellbook(220);
+    spellbook[0] = 15;
+    spellbook[1] = 0x80 | 47;
+    spellbook[74 + 46] = 1;
+    dax(dir / "MON4WIZ.DAX", 2, spellbook);
+    const auto spell_rows = read_record_rows(dir / "MON4WIZ.DAX");
+    check(spell_rows.size() == 1 && spell_rows[0].name == "Orc" &&
+          has_field(spell_rows[0], {"Memorization slot 1", "Spell 15 - Magic Missile (ready)"}) &&
+          has_field(spell_rows[0], {"Memorization slot 2", "Spell 47 - Fireball (pending rest)"}) &&
+          has_field(spell_rows[0], {"Known spell", "Spell 47 - Fireball"}), "Wrong Death Knights spell data");
+    inventory[46] = 68;
+    inventory[47] = 112;
+    inventory[49] = 68;
+    dax(dir / "MON4ITM.DAX", 2, inventory);
+    const auto krynn_items = read_record_rows(dir / "MON4ITM.DAX");
+    check(krynn_items.size() == 1 && krynn_items[0].name == "Solamnic Plate +2" &&
+          has_field(krynn_items[0], {"Owner", "Orc"}),
+          "Wrong Death Knights inventory name or owner");
+
+    auto champions = character();
+    champions.resize(409);
+    champions[98] = 52;
+    champions[407] = 49;
+    dax(dir / "MON5CHA.DAT", 2, champions);
+    const auto champions_rows = read_record_rows(dir / "MON5CHA.DAT");
+    check(has_field(champions_rows.at(0), {"Maximum HP", "52"}) &&
+          has_field(champions_rows.at(0), {"Current HP", "49"}),
+          "Wrong Champions of Krynn monster fields");
+    inventory[46] = 75;
+    inventory[47] = 76;
+    inventory[49] = 75;
+    dax(dir / "MON5ITM.DAT", 2, inventory);
+    const auto champions_items = read_record_rows(dir / "MON5ITM.DAT");
+    check(champions_items.size() == 1 && champions_items[0].name == "Dust Disappearance" &&
+          has_field(champions_items[0], {"Owner", "Orc"}),
+          "Wrong Champions of Krynn inventory name or DAT companion");
+    dax(dir / "MON5SPC.DAT", 2, {51, 0x34, 0x12, 4, 1, 0, 0, 0, 0});
+    const auto champions_effects = read_record_rows(dir / "MON5SPC.DAT");
+    check(champions_effects.size() == 1 && has_field(champions_effects[0], {"Owner", "Orc"}),
+          "Wrong Champions of Krynn effect archive routing");
+
+    std::vector<std::uint8_t> dark_queen(0x19e + 2 + 5 + 17);
+    std::copy_n("Wyvern", 7, dark_queen.begin() + 0x68);
+    dark_queen[0x89] = 33;
+    dark_queen[0x19e] = 1;
+    dark_queen[0x19f] = 1;
+    dark_queen[0x1a0] = 51;
+    dark_queen[0x1a5] = 18;
+    std::vector<std::uint8_t> packed{static_cast<std::uint8_t>(dark_queen.size() >> 8),
+                                     static_cast<std::uint8_t>(dark_queen.size())};
+    for (std::size_t at = 0; at < dark_queen.size(); at += 128) {
+        const auto count = std::min<std::size_t>(128, dark_queen.size() - at);
+        packed.push_back(static_cast<std::uint8_t>(count - 1));
+        packed.insert(packed.end(), dark_queen.begin() + at, dark_queen.begin() + at + count);
+    }
+    auto library = tlb_library("HLIB", {{1, 0, 42, 0, 1, 0}, packed}, true);
+    std::copy_n("DATA", 4, library.begin() + 12);
+    write(dir / "MONCHA.LIB", library);
+    const auto queen_rows = read_record_rows(dir / "MONCHA.LIB");
+    check(queen_rows.size() == 1 && queen_rows[0].id == 42 && queen_rows[0].name == "Wyvern" &&
+          has_field(queen_rows[0], {"Maximum HP", "33"}) &&
+          has_field(queen_rows[0], {"Effect ID 1", "51"}) &&
+          has_field(queen_rows[0], {"Item type 1", "18"}), "Wrong Dark Queen HLIB monster data");
+
     auto buck = character();
     buck.resize(263);
     buck[0x45] = buck[0xe3] = 44;

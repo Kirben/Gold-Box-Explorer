@@ -237,7 +237,7 @@ std::vector<RecordRow> amiga_record_rows(const std::vector<DaxRecord>& records, 
     return rows;
 }
 
-std::vector<std::uint8_t> unpack_amiga_monster(const std::vector<std::uint8_t>& packed, unsigned start)
+std::vector<std::uint8_t> unpack_monster_packbits(const std::vector<std::uint8_t>& packed, unsigned start)
 {
     std::vector<std::uint8_t> bytes;
     for (std::size_t at = start; at < packed.size();) {
@@ -264,14 +264,14 @@ RecordRow later_amiga_monster(const DaxRecord& record)
     unsigned name_offset = 0;
     if (original.size() != 422 && original.size() != 440) {
         if (original.size() >= 2 && original[0] >= 1 && original[0] <= 4) {
-            expanded = unpack_amiga_monster(original, 2);
+            expanded = unpack_monster_packbits(original, 2);
             if (expanded.size() == amiga_word(original.data(), 0) && expanded.size() >= 124)
                 name_offset = 96;
             else
                 expanded.clear();
         }
         if (expanded.empty()) {
-            expanded = unpack_amiga_monster(original, 0);
+            expanded = unpack_monster_packbits(original, 0);
             if (expanded.size() != 422 && expanded.size() != 440)
                 throw std::runtime_error("Unsupported packed Amiga monster record");
         }
@@ -293,6 +293,57 @@ RecordRow later_amiga_monster(const DaxRecord& record)
     for (unsigned at = 0; at < bytes.size(); at += 16)
         amiga_field(row, at, "Decoded bytes", raw_bytes(b, at, std::min<unsigned>(16, bytes.size() - at)));
     return row;
+}
+
+std::vector<RecordRow> dark_queen_monsters(const std::filesystem::path& path)
+{
+    constexpr unsigned character_size = 0x19e, effect_width = 5, item_width = 17;
+    std::vector<RecordRow> rows;
+    for (const auto& record : read_hlib_data(path)) {
+        if (record.bytes.empty())
+            continue;
+        if (record.bytes.size() < 2)
+            throw std::runtime_error("Truncated Dark Queen monster record");
+        const auto decoded = unpack_monster_packbits(record.bytes, 2);
+        const auto* b = decoded.data();
+        if (decoded.size() != amiga_word(record.bytes.data(), 0) || decoded.size() < character_size + 2)
+            throw std::runtime_error("Invalid Dark Queen monster record length for ID " + std::to_string(record.id));
+        const auto effects = b[character_size];
+        const auto items = b[character_size + 1];
+        if (decoded.size() < character_size + 2 + effects * effect_width + items * item_width)
+            throw std::runtime_error("Truncated Dark Queen monster inventory or effects");
+        const auto* name = reinterpret_cast<const char*>(b + 0x68);
+        RecordRow row{record.id, 0, std::string(name, std::find(name, name + 16, '\0')), {}};
+        if (row.name.empty())
+            row.name = "Monster " + std::to_string(record.id);
+        field(row, "Record ID", record.id);
+        field(row, "Record size", character_size);
+        constexpr const char* stats[]{"Strength", "Intelligence", "Wisdom", "Dexterity", "Constitution", "Charisma"};
+        for (unsigned i = 0; i < std::size(stats); ++i) {
+            field(row, (std::string(stats[i]) + " (base)").c_str(), b[0x78 + 2 * i]);
+            field(row, (std::string(stats[i]) + " (current)").c_str(), b[0x79 + 2 * i]);
+        }
+        field(row, "Race code", word(b, 0x58));
+        field(row, "Class code", word(b, 0x5a));
+        field(row, "Age", word(b, 0x52));
+        field(row, "Maximum HP", b[0x89]);
+        field(row, "Current HP", b[0x198]);
+        field(row, "Base THAC0", 60 - b[0x87]);
+        field(row, "Base AC", 60 - b[0xbb]);
+        field(row, "Base movement", b[0x90]);
+        field(row, "Alignment code", word(b, 0x62));
+        field(row, "Primary attacks (stored)", b[0xb3]);
+        field(row, "XP award", word(b, 0x54));
+        field(row, "Inventory count", items);
+        field(row, "Effect count", effects);
+        for (unsigned i = 0; i < effects; ++i)
+            field(row, ("Effect ID " + std::to_string(i + 1)).c_str(), b[character_size + 2 + i * effect_width]);
+        for (unsigned i = 0; i < items; ++i)
+            field(row, ("Item type " + std::to_string(i + 1)).c_str(),
+                b[character_size + 2 + effects * effect_width + i * item_width]);
+        rows.push_back(std::move(row));
+    }
+    return rows;
 }
 
 std::vector<RecordRow> later_amiga_records(const std::filesystem::path& path, RecordKind kind)
@@ -421,6 +472,8 @@ struct MonsterLayout {
 };
 
 constexpr MonsterLayout later_monsters[]{
+    {216, 31, 32, 38, 40, 47, 86, 87, 95, 109, 124, 203},
+    {409, 89, 90, 96, 98, 213, 266, 267, 275, 304, 322, 396},
     {422, 115, 116, 118, 120, 228, 283, 284, 292, 316, 332, 409},
     {439, 106, 107, 110, 112, 237, 288, 289, 297, 334, 352, 426},
     {510, 172, 173, 176, 178, 311, 359, 360, 368, 408, 422, 497},
@@ -490,20 +543,88 @@ RecordRow read_monster(const DaxRecord& record)
     return row;
 }
 
-RecordRow item(unsigned id, unsigned slot, const std::uint8_t* b, const std::string* owner,
-               bool pool_names = true, bool pc98 = false)
+RecordRow death_knights_spells(const DaxRecord& record, const std::string* owner)
 {
-    RecordRow row{id, slot, name_at(b, 40, pc98), {}};
+    constexpr unsigned memorized_count = 74, known_count = 114, slot_bytes = 32;
+    if (record.bytes.size() != memorized_count + known_count + slot_bytes)
+        throw std::runtime_error("Unexpected Death Knights spell record size");
+    // Spell IDs and names from Death Knights of Krynn's gdconsts.pas.
+    constexpr std::string_view names[]{
+        "", "Bless", "Barkskin", "Cure Light Wounds", "Charm Person/Mammal",
+        "Detect Magic", "Protection From Evil", "Ressurection", "Resist Cold", "Burning Hands",
+        "Charm Person", "Detect Magic", "Enlarge", "Reduce", "Friends",
+        "Magic Missile", "Protection From Evil", "Restoration", "Read Magic", "Shield",
+        "Shocking Grasp", "Sleep", "Find Traps", "Hold Person", "Resist Fire",
+        "Silence, 15' Radius", "Slow Poison", "Snake Charm", "Spiritual Hammer", "Detect Invisibility",
+        "Invisibility", "Knock", "Mirror Image", "Ray of Enfeeblement", "Stinking Cloud",
+        "Strength", "", "Cure Blindness", "Cause Blindness", "Cure Disease",
+        "Harm", "Dispel Magic", "Prayer", "Remove Curse", "Bestow Curse",
+        "Blink", "Dispel Magic", "Fireball", "Haste", "Hold Person",
+        "Invisibility, 10' Radius", "Lightning Bolt", "Protection From Evil, 10' Radius", "Heal", "Protection From Normal Missiles",
+        "Slow", "Death Spell", "", "Cure Serious Wounds", "",
+        "Disentegrate", "", "", "Globe Of Invulnerability", "",
+        "", "Stone to Flesh", "Neutralize Poison", "Poison", "Protection Evil, 10' Radius",
+        "Sticks to Snakes", "Cure Critical Wounds", "Flesh to Stone", "Dispel Evil", "Flame Strike",
+        "Raise Dead", "Slay Living", "Detect Magic", "Entangle", "Faerie Fire",
+        "Invisibility to Animals", "Charm Monsters", "Confusion", "Dimension Door", "Fear",
+        "Fire Shield", "Fumble", "Ice Storm", "Minor Globe Of Invulnerability", "Remove Curse",
+        "Iron Skin", "Cloud Kill", "Cone of Cold", "Feeblemind", "Hold Monsters",
+        "", "", "", "Fire Touch", "",
+        "Bestow Curse", "Protection From Evil 10' Radius", "Silence 15' radius", "Detect Magic", "Remove Curse",
+        "Bless", "Charm Person", "Burning Hands", "Delay Blast Fireball", "Mass Invisibility",
+        "Power Word Stun", "Mass Charm", "Mind Blank", "Otto's Irresitable Dance", "Power Word Blind",
+    };
+    const auto describe = [&](unsigned id) {
+        auto name = "Spell " + std::to_string(id);
+        if (id < std::size(names) && !names[id].empty())
+            name += " - " + std::string(names[id]);
+        return name;
+    };
+    RecordRow row{record.id, 0, owner ? *owner : "Monster " + std::to_string(record.id), {}};
+    field(row, "Record ID", record.id);
+    const auto& bytes = record.bytes;
+    for (unsigned i = 0; i < memorized_count; ++i) {
+        const auto id = bytes[i] & 0x7f;
+        if (id)
+            row.fields.emplace_back("Memorization slot " + std::to_string(i + 1),
+                describe(id) + (bytes[i] & 0x80 ? " (pending rest)" : " (ready)"));
+    }
+    for (unsigned id = 1; id <= known_count; ++id)
+        if (bytes[memorized_count + id - 1])
+            row.fields.emplace_back("Known spell", describe(id));
+    // Several shipped monster blocks have leftover data in the slot table.
+    row.fields.emplace_back("Spell slot bytes (stored)",
+        raw_bytes(bytes.data(), memorized_count + known_count, slot_bytes));
+    return row;
+}
+
+RecordRow item(unsigned id, unsigned slot, const std::uint8_t* b, const std::string* owner,
+               bool pool_names = true, bool pc98 = false, std::size_t owner_size = 0)
+{
+    const bool silver_blades = owner_size == 439;
+    const bool death_knights = owner_size == 216;
+    const bool champions = owner_size == 409;
+    const bool generated_name = silver_blades || death_knights || champions;
+    RecordRow row{id, slot, generated_name ? std::string{} : name_at(b, 40, pc98), {}};
     std::string resolved;
     for (unsigned offset : {49, 48, 47}) {
-        const auto component = pool_names ? item_components[b[offset]] : std::string_view{};
+        const auto component_id = b[offset];
+        std::string_view component;
+        if (silver_blades && component_id < std::size(silver_blades_item_components))
+            component = silver_blades_item_components[component_id];
+        else if (death_knights && component_id < std::size(death_knights_item_components))
+            component = death_knights_item_components[component_id];
+        else if (champions && component_id < std::size(champions_item_components))
+            component = champions_item_components[component_id];
+        else if (pool_names && !generated_name)
+            component = item_components[component_id];
         if (!component.empty()) {
             if (!resolved.empty())
                 resolved += ' ';
             resolved += component;
         }
     }
-    const auto base = pool_names && b[46] < std::size(item_templates) ? item_templates[b[46]] : std::string_view{};
+    const auto base = pool_names && !generated_name && b[46] < std::size(item_templates) ? item_templates[b[46]] : std::string_view{};
     if (row.name.empty()) {
         row.name = resolved;
         if (row.name.empty())
@@ -1129,14 +1250,18 @@ RecordKind record_kind(const std::filesystem::path& path)
     if (name.compare(0, 6, "SAVGAM") == 0 && upper(path.extension().string()) == ".CSV")
         return RecordKind::frua_save;
     if (name == "STRINGS.GLB") return RecordKind::amiga_text;
+    if (name == "MONCHA.LIB") return RecordKind::monsters;
     if (name == "SOUNDS.GLB") return RecordKind::sound_samples;
     static const std::regex monster_name(R"(MON[0-9]*(CHA|ITM|SPC)\.(DAX|GLB))");
     std::smatch match;
-    if (std::regex_match(name, match, monster_name)) {
+    static const std::regex dat_monster(R"(MON[0-9]+(CHA|ITM|SPC)\.DAT)");
+    if (std::regex_match(name, match, monster_name) || std::regex_match(name, match, dat_monster)) {
         if (match[1] == "CHA") return RecordKind::monsters;
         if (match[1] == "ITM") return RecordKind::inventory;
         return RecordKind::monster_effects;
     }
+    static const std::regex spell_archive(R"(MON[0-9]+WIZ\.(DAX|DAT))");
+    if (std::regex_match(name, spell_archive)) return RecordKind::monster_spells;
     static const std::regex item_name(R"(ITEM[0-9]*\.(DAX|GLB))");
     if (std::regex_match(name, item_name)) return RecordKind::items;
     const auto extension = upper(path.extension().string());
@@ -1206,7 +1331,16 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
     if (kind == RecordKind::saved_character || kind == RecordKind::saved_inventory ||
         kind == RecordKind::saved_effects)
         return read_save_rows(path, kind);
-    if (upper(path.extension().string()) == ".GLB")
+    const auto extension = upper(path.extension().string());
+    if (kind == RecordKind::monsters && (extension == ".GLB" || extension == ".LIB")) {
+        std::ifstream stream(path, std::ios::binary);
+        char signature[4]{};
+        if (stream.read(signature, sizeof(signature)) && std::string_view(signature, 4) == "HLIB")
+            return dark_queen_monsters(path);
+        if (extension == ".LIB")
+            throw std::runtime_error("Unsupported MONCHA.LIB container");
+    }
+    if (extension == ".GLB")
         return later_amiga_records(path, kind);
     auto records = try_amiga_dax(path);
     const bool amiga = !records.empty();
@@ -1217,13 +1351,15 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
     std::map<unsigned, std::string> owners;
     std::size_t owner_size = 0;
     if (kind == RecordKind::inventory || kind == RecordKind::monster_effects ||
-        (kind == RecordKind::items && filename != "ITEM.DAX" && filename != "ITEM0.DAX")) {
+        kind == RecordKind::monster_spells || (kind == RecordKind::items && filename != "ITEM.DAX" && filename != "ITEM0.DAX")) {
         const auto folder = path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
         const auto companion = kind == RecordKind::items
             ? "MON" + filename.substr(4, filename.size() - 8) + "CHA.DAX"
             : filename.substr(0, filename.size() - 7) + "CHA.DAX";
         for (const auto& entry : std::filesystem::directory_iterator(folder)) {
-            if (upper(entry.path().filename().string()) != companion)
+            const auto candidate = upper(entry.path().filename().string());
+            if (candidate != companion && !(!amiga && upper(path.extension().string()) == ".DAT" &&
+                candidate == companion.substr(0, companion.size() - 3) + "DAT"))
                 continue;
             try {
                 const auto companions = amiga ? try_amiga_dax(entry.path()) : read_dax(entry.path());
@@ -1242,6 +1378,17 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
             }
             break;
         }
+    }
+    if (kind == RecordKind::monster_spells) {
+        std::vector<RecordRow> rows;
+        for (const auto& record : records) {
+            if (record.bytes.empty() || (trailer && record.id >= 253))
+                continue;
+            const auto owner = owners.find(record.id);
+            rows.push_back(death_knights_spells(record,
+                owner == owners.end() || owner->second.empty() ? nullptr : &owner->second));
+        }
+        return rows;
     }
     if (amiga)
         return amiga_record_rows(records, kind, owners);
@@ -1297,7 +1444,8 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
                     rows.push_back(compact_item(record.id, slot, b, stride, owner));
                 else
                     rows.push_back(item(record.id, slot, b, owner, owner_size == monster_size ||
-                        (!owner_size && (kind != RecordKind::items || filename == "ITEM.DAX")), record.pc98));
+                        (!owner_size && (kind != RecordKind::items || filename == "ITEM.DAX")), record.pc98,
+                        kind == RecordKind::inventory ? owner_size : 0));
             }
         }
     }

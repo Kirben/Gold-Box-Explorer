@@ -76,4 +76,67 @@ inline constexpr std::string_view item_templates[] = {
     "Hole", "Token",
 };
 
+inline constexpr std::string_view silver_blades_item_components[] = {
+    "", "Battle Axe", "Hand Axe", "Club", "Dagger", "Dart", "Hammer",
+    "Javelin", "Mace", "Morning Star", "Military Pick", "Awl Pike", "Quarrel", "Scimitar",
+    "Spear", "Quarter Staff", "Bastard Sword", "Broad Sword", "Long Sword", "Short Sword", "Two-Handed Sword",
+    "Trident", "Composite Long Bow", "Composite Short Bow", "Long Bow", "Short Bow", "Fine", "Light Crossbow",
+    "Sling", "Staff", "Arrow", "Leather", "Ring", "Scale", "Chain",
+    "Banded", "Plate", "Shield", "Cler", "Scroll", "Mage", "Helm",
+    "Belt", "Robe", "Cloak", "Boots", "Ring", "Mail", "Armor",
+    "Of Prot", "Bracers", "Wand", "Elixer", "Potion", "Youth", "Ruby",
+    "Boulder", "Dragon Breath", "Displacement", "Eyes", "Drow", "Elven Chain", "Ice Storm",
+    "Saphire", "Emerald", "Wizardry", "Hornet's Nest", "Fire Resistance", "Stone", "Good Luck",
+    "Flail", "Halberd", "Gauntlets", "Periapt", "Health", "", "",
+    "Bundle of", "Ogre Power", "Girdle", "Giant Strength", "Mirror", "Necklace", "Dragon",
+    "vs Giants", "", "", "Diamond", "Lightning", "Fireballs", "of",
+    "Vulnerability", "Speed", "Silver", "Extra", "Healing", "Charming", "Fear",
+    "Magic Missiles", "Missiles", "1 Spell", "2 Spells", "3 Spells", "Paralyzation", "Invisibility",
+    "Cute Yellow Canary", "AC 10", "AC 6", "AC 4", "AC 3", "AC 2", "+1",
+    "+2", "+3", "+4", "+5", "-1", "-2", "-3",
+    "", "", "Spiritual", "Gem", "Jewelry",
+};
+
+inline constexpr std::string_view death_knights_item_components[] = {
+    "", "Battle Axe", "Hand Axe", "Club", "Dagger", "Dart", "Hammer",
+    "Javelin", "Mace", "Morning Star", "Military Pick", "Awl Pike", "Quarrel", "Scimitar",
+    "Spear", "Quarter Staff", "Bastard Sword", "Broad Sword", "Long Sword", "Short Sword", "Two-Handed Sword",
+    "Trident", "Composite Long Bow", "Composite Short Bow", "Long Bow", "Short Bow", "Fine", "Light Crossbow",
+    "Sling", "Staff", "Arrow", "Leather", "Ring", "Scale", "Chain",
+    "Banded", "Plate", "Shield", "Cler", "Scroll", "MU Scroll", "Helm",
+    "Belt", "Robe", "Cloak", "Boots", "Ring", "Mail", "Armor",
+    "Of Prot", "Bracers", "Wand", "Amulet", "Potion", "Holy Water", "Ruby",
+    "Boulder", "Dragon Breath", "Displacement", "Bag", "Drow", "Elven Chain", "Ice Storm",
+    "Saphire", "Emerald", "Wizardry", "Hornet's Nest", "Hoopak", "Solamnic Plate", "Dragonlance",
+    "Flail", "Halberd", "Gauntlets", "Periapt", "Proof vs Poison", "Elixir Of Youth", "Eyes Of Charming",
+    "Disruption", "Ogre Power", "Girdle", "Giant Strength", "Mirror", "Necklace", "Dragon",
+    "vs Reptiles", "Frost Brand", "Berserker", "Diamond", "Lightning", "Fireballs", "of",
+    "Vulnerability", "Speed", "Silver", "Extra", "Healing", "Olin's", "Fear",
+    "Magic Missiles", "Missiles", "1 Spell", "2 Spells", "3 Spell", "Paralyzation", "Invisibility",
+    "Footman's", "AC 10", "AC 6", "AC 4", "AC 3", "AC 2", "+1",
+    "+2", "+3", "+4", "+5", "-1", "-2", "-3",
+    "White", "Red", "Spiritual", "Gem", "Jewelry", "Blank", "Item",
+};
+
+inline constexpr std::string_view champions_item_components[] = {
+    "", "Battle Axe", "Hand Axe", "Club", "Dagger", "Dart", "Hammer",
+    "Javelin", "Mace", "Morning Star", "Military Pick", "Awl Pike", "Quarrel", "Scimitar",
+    "Spear", "Quarter Staff", "Bastard Sword", "Broad Sword", "Long Sword", "Short Sword", "Two-Handed Sword",
+    "Trident", "Composite Long Bow", "Composite Short Bow", "Long Bow", "Short Bow", "Fine", "Light Crossbow",
+    "Sling", "Staff", "Arrow", "Leather", "Ring", "Scale", "Chain",
+    "Banded", "Plate", "Shield", "Cler", "Scroll", "MU Scroll", "Helm",
+    "Belt", "Robe", "Cloak", "Boots", "Ring", "Mail", "Armor",
+    "Of Prot", "Bracers", "Wand", "Amulet", "Potion", "Holy Water", "Ruby",
+    "Boulder", "Dragon Breath", "Displacement", "Bag", "Drow", "Elven Chain", "Ice Storm",
+    "Saphire", "Emerald", "Wizardry", "Hornet's Nest", "Hoopak", "Solamnic Plate", "Dragonlance",
+    "Flail", "Halberd", "Gauntlets", "Periapt", "Proof vs Poison", "Dust", "Disappearance",
+    "Disruption", "Ogre Power", "Girdle", "Giant Strength", "Mirror", "Necklace", "Dragon",
+    "vs Reptiles", "Frost Brand", "Berserker", "Diamond", "Lightning", "Fireballs", "of",
+    "Vulnerability", "Speed", "Silver", "Extra", "Healing", "Opening", "Fear",
+    "Magic Missiles", "Missiles", "1 Spell", "2 Spells", "3 Spell", "Paralyzation", "Invisibility",
+    "Footman's", "AC 10", "AC 6", "AC 4", "AC 3", "AC 2", "+1",
+    "+2", "+3", "+4", "+5", "-1", "-2", "-3",
+    "White", "Red", "Spiritual", "Gem", "Jewelry",
+};
+
 }
