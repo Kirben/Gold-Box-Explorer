@@ -1,0 +1,38 @@
+cmake_minimum_required(VERSION 3.20)
+project(GoldBoxExplorerPortable LANGUAGES CXX)
+
+add_library(goldbox_pictures pictures.cpp geo.cpp walls.cpp records.cpp save_map.cpp)
+target_compile_features(goldbox_pictures PUBLIC cxx_std_17)
+target_include_directories(goldbox_pictures PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+
+add_executable(goldbox-inspect inspect.cpp)
+target_link_libraries(goldbox-inspect PRIVATE goldbox_pictures)
+install(TARGETS goldbox-inspect RUNTIME DESTINATION .)
+
+option(GOLDBOX_BUILD_GUI "Build the wxWidgets gallery" ON)
+if(GOLDBOX_BUILD_GUI)
+    find_package(wxWidgets 3.2 CONFIG QUIET)
+    if(NOT wxWidgets_FOUND)
+        find_package(wxWidgets 3.2 MODULE REQUIRED COMPONENTS core base)
+        include(${wxWidgets_USE_FILE})
+    endif()
+    add_executable(goldbox-explorer WIN32 MACOSX_BUNDLE gallery.cpp)
+    target_link_libraries(goldbox-explorer PRIVATE goldbox_pictures ${wxWidgets_LIBRARIES})
+    install(TARGETS goldbox-explorer RUNTIME DESTINATION . BUNDLE DESTINATION .)
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(goldbox-dos-tests tests/dos_core.cpp)
+    target_link_libraries(goldbox-dos-tests PRIVATE goldbox_pictures)
+    foreach(section IN ITEMS pictures geo walls records saves)
+        add_test(NAME dos-${section} COMMAND goldbox-dos-tests
+            ${section} "${CMAKE_CURRENT_BINARY_DIR}/fixtures/${section}")
+    endforeach()
+endif()
+
+install(FILES ../LICENSE DESTINATION .)
+set(CPACK_PACKAGE_NAME "Gold-Box-Explorer-wx")
+set(CPACK_PACKAGE_VERSION "0.1.0")
+set(CPACK_GENERATOR "ZIP")
+include(CPack)

@@ -1,0 +1,210 @@
+#include "dax.h"
+#include "geo.h"
+#include "pictures.h"
+#include "records.h"
+#include "save_map.h"
+#include "walls.h"
+
+#include <algorithm>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+#include <string_view>
+
+namespace {
+namespace fs = std::filesystem;
+using namespace goldbox;
+using Bytes = std::vector<std::uint8_t>;
+
+void check(bool condition, const char* message)
+{
+    if (!condition)
+        throw std::runtime_error(message);
+}
+
+void write(const fs::path& path, const Bytes& bytes)
+{
+    std::ofstream stream(path, std::ios::binary);
+    stream.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    stream.close();
+    check(bool(stream), "Could not write fixture");
+}
+
+void dax(const fs::path& path, std::uint8_t id, const Bytes& data)
+{
+    Bytes bytes{9, 0, id, 0, 0, 0, 0, 0, 0,
+                static_cast<std::uint8_t>(data.size()), static_cast<std::uint8_t>(data.size() >> 8)};
+    bytes.insert(bytes.end(), data.begin(), data.end());
+    write(path, bytes);
+}
+
+void pictures(const fs::path& dir)
+{
+    Bytes data{2};
+    for (unsigned i = 0; i < 2; ++i) {
+        Bytes frame(25);
+        frame[0] = i ? 4 : 2;
+        frame[4] = frame[6] = 1;
+        frame[21] = i ? 0x14 : 0x4f;
+        data.insert(data.end(), frame.begin(), frame.end());
+    }
+    const auto path = dir / "PIC.DAX";
+    dax(path, 7, data);
+    const auto archive = read_pictures(path);
+    check(archive.frames.size() == 2 && archive.clips.size() == 1, "Missing animation frames or clip");
+    const auto& first = archive.frames[0];
+    const auto& second = archive.frames[1];
+    check(first.id == 7 && first.width == 8 && first.height == 1, "Unexpected frame geometry");
+    check(first.rgba.at(0) == 170 && first.rgba.at(1) == 0 && first.rgba.at(3) == 255,
+          "Unexpected EGA red pixel");
+    check(second.rgba.at(0) == 170 && second.rgba.at(2) == 170, "Animation delta was not applied");
+    const auto& steps = archive.clips[0].steps;
+    check(steps.size() == 2 && steps[0].frame == 0 && steps[1].frame == 1 &&
+          steps[0].duration_ms == 220 && steps[1].duration_ms == 439, "Unexpected DOS playback timing");
+}
+
+void geo(const fs::path& dir)
+{
+    constexpr unsigned index = 3 * 16 + 2;
+    Bytes data(1026);
+    data[2 + index] = 0x12;
+    data[258 + index] = 0x34;
+    data[514 + index] = 0x85;
+    data[770 + index] = 0xe4;
+    const auto path = dir / "GEO5.DAX";
+    dax(path, 15, data);
+    const auto records = read_dax(path);
+    check(records.size() == 1 && records[0].id == 15, "Unexpected GEO directory");
+    const auto map = read_geo_map(records[0]);
+    const auto& cell = map[index];
+    check(cell.walls == std::array<unsigned, 4>{1, 2, 3, 4}, "Wall order changed");
+    check(cell.doors == std::array<unsigned, 4>{0, 1, 2, 3}, "Door order changed");
+    check(cell.event == 5 && cell.event_flag && map[index + 1].event == 0, "Unexpected event plane");
+}
+
+void walls(const fs::path& dir)
+{
+    Bytes tile(17 + 32);
+    tile[0] = 8;
+    tile[2] = tile[8] = 1;
+    std::fill(tile.begin() + 17, tile.end(), 0x44);
+    dax(dir / "8X8D.DAX", 1, tile);
+    const auto path = dir / "WALLDEF.DAX";
+    dax(path, 1, Bytes(780, 1));
+    const auto frames = read_wall_pieces(path);
+    check(frames.size() == 50 && frames[0].width == 8 && frames[0].height == 16,
+          "Unexpected wall piece count or geometry");
+    check(frames[0].rgba.at(0) == 173 && frames[0].rgba.at(3) == 255,
+          "Wall piece did not use the companion tile");
+    GeoMap map{};
+    map[8 * 16 + 8].walls[0] = 1;
+    WallBanks banks;
+    banks[0] = frames;
+    const auto view = wall_perspective(map, banks, 8, 8, 0);
+    check(view.width == 88 && view.height == 88, "Unexpected wall perspective geometry");
+    const auto pixel = (20 * 88 + 40) * 4;
+    check(view.rgba.at(pixel) == 173 && view.rgba.at(pixel + 1) == 0,
+          "Front wall is missing from the perspective");
+}
+
+Bytes character()
+{
+    Bytes bytes(285);
+    bytes[0] = 3;
+    bytes[1] = 'O';
+    bytes[2] = 'r';
+    bytes[3] = 'c';
+    bytes[45] = 41;
+    bytes[50] = 8;
+    bytes[283] = 6;
+    return bytes;
+}
+
+Bytes item()
+{
+    Bytes bytes(63);
+    bytes[46] = bytes[49] = 37;
+    bytes[50] = 255;
+    return bytes;
+}
+
+bool has_field(const RecordRow& row, const Field& field)
+{
+    return std::find(row.fields.begin(), row.fields.end(), field) != row.fields.end();
+}
+
+void records(const fs::path& dir)
+{
+    dax(dir / "MONCHA.DAX", 2, character());
+    dax(dir / "ITEM.DAX", 2, item());
+    dax(dir / "MONITM.DAX", 2, item());
+    const auto monsters = read_record_rows(dir / "MONCHA.DAX");
+    check(monsters.size() == 1 && monsters[0].name == "Orc" &&
+          has_field(monsters[0], {"Base THAC0", "19"}) && has_field(monsters[0], {"Current HP", "6"}),
+          "Unexpected MONCHA fields");
+    const auto items = read_record_rows(dir / "ITEM.DAX");
+    check(items.size() == 1 && has_field(items[0], {"Magic bonus", "-1"}), "Item bonus lost its sign");
+    const auto inventory = read_record_rows(dir / "MONITM.DAX");
+    check(inventory.size() == 1 && has_field(inventory[0], {"Owner", "Orc"}), "Missing inventory owner");
+}
+
+void saves(const fs::path& dir)
+{
+    const auto folder = dir / "SAVE";
+    fs::create_directories(folder);
+    write(folder / "ORC.SAV", character());
+    write(folder / "ORC.ITM", item());
+    write(folder / "ORC.SPC", {38, 0x34, 0x12, 1, 1, 0, 0, 0, 0});
+    const auto saved = read_record_rows(folder / "ORC.SAV");
+    const auto inventory = read_record_rows(folder / "ORC.ITM");
+    const auto effects = read_record_rows(folder / "ORC.SPC");
+    check(saved.size() == 1 && saved[0].name == "Orc", "Missing saved character");
+    check(inventory.size() == 1 && has_field(inventory[0], {"Owner", "Orc"}), "Missing saved item owner");
+    check(effects.size() == 1 && effects[0].id == 38 &&
+          has_field(effects[0], {"Duration (stored)", "4660"}), "Unexpected saved effect");
+
+    Bytes world(13137);
+    world[0] = 2;
+    world[0x18b] = world[0x1e5] = 15;
+    world[12801] = 8;
+    world[12802] = 5;
+    world[12803] = 2;
+    world[12806] = 1;
+    write(folder / "SAVGAMA.DAT", world);
+    constexpr unsigned position = 5 * 16 + 8;
+    Bytes map(1026);
+    dax(dir / "GEO2.DAX", 15, map);
+    map[2 + position] = 0x10;
+    dax(folder / "GEO2.DAX", 15, map);
+    Bytes explored{4, 'E', 'X', 'P', 'L', 1, 1, 15, 15};
+    explored.resize(41);
+    explored[7 + 2 + 2 * 5 + 1] = 1;
+    write(folder / "SAVGAMA.MAP", explored);
+    const auto area = read_saved_map(folder / "SAVGAMA.DAT");
+    check(area.disk == 2 && area.script == 15 && area.map_id == 15 && area.x == 8 &&
+          area.y == 5 && area.facing == 1, "Unexpected saved party position");
+    check(area.original && area.copied && area.changed.count() == 1 && area.changed.test(position),
+          "Unexpected saved map changes");
+    check(area.visited && area.visited->count() == 1 && area.visited->test(position),
+          "Unexpected explored cells");
+}
+}
+
+int main(int argc, char** argv)
+{
+    try {
+        check(argc == 3, "Expected a test name and a fixture directory");
+        const std::string_view name(argv[1]);
+        const fs::path dir(argv[2]);
+        fs::create_directories(dir);
+        if (name == "pictures") pictures(dir);
+        else if (name == "geo") geo(dir);
+        else if (name == "walls") walls(dir);
+        else if (name == "records") records(dir);
+        else if (name == "saves") saves(dir);
+        else throw std::runtime_error("Unknown DOS regression test");
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}
