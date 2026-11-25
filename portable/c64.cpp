@@ -151,11 +151,13 @@ PictureArchive pictures(const Bytes& bytes, unsigned id, std::optional<unsigned>
         throw std::runtime_error("Invalid C64 picture dimensions");
     PictureArchive result;
     PictureArchive::Clip clip{id, {}};
+    const bool still = id == 0x4f && relocated(word(bytes, 0)) &&
+        std::all_of(bytes.begin() + 2, bytes.begin() + 34, [](auto command) { return command == 0; });
     Bytes bitmap(cells * 8), colors(cells);
     std::size_t at = 58;
     while (at < bytes.size()) {
         const auto index = static_cast<unsigned>(result.frames.size());
-        if (index >= 32 || bytes[2 + index] < 'A' || bytes[2 + index] > 'L')
+        if (!still && (index >= 32 || bytes[2 + index] < 'A' || bytes[2 + index] > 'L'))
             throw std::runtime_error("Invalid C64 animation command");
         xor_plane(bytes, at, bitmap);
         xor_plane(bytes, at, colors);
@@ -167,6 +169,15 @@ PictureArchive pictures(const Bytes& bytes, unsigned id, std::optional<unsigned>
                  bytes[54] & 15, shared.value_or(bytes[55] & 15), bytes[56] & 15, colors[i] & 8, false);
         }
         result.frames.push_back(std::move(frame));
+        if (still) {
+            // Buck Rogers PIC4F stores the same packet twice, followed by zero padding.
+            const auto packet_size = at - 58;
+            if (packet_size > bytes.size() - at ||
+                !std::equal(bytes.begin() + 58, bytes.begin() + at, bytes.begin() + at) ||
+                !std::all_of(bytes.begin() + at + packet_size, bytes.end(), [](auto byte) { return byte == 0; }))
+                throw std::runtime_error("Invalid C64 still picture packet");
+            return result;
+        }
         const auto ticks = std::min(255, (bytes[46] + 1) * bytes[34 + bytes[2 + index] - 'A']);
         clip.steps.push_back({index, std::max(1, (ticks * 1000 + 30) / 60)});
     }
@@ -223,15 +234,19 @@ Frame map_image(const Bytes& bytes, unsigned id)
 }
 
 void sprite(Frame& frame, unsigned left, unsigned top, const std::uint8_t* data, unsigned flags,
-            unsigned one, unsigned two)
+            unsigned one, unsigned two, unsigned scale_x = 1, unsigned scale_y = 1)
 {
     const bool multi = flags & 128;
     for (unsigned y = 0; y < 21; ++y)
         for (unsigned x = 0; x < 24; ++x) {
             const auto bits = data[y * 3 + x / 8];
             const unsigned code = multi ? (bits >> (6 - 2 * ((x % 8) / 2))) & 3 : (bits >> (7 - x % 8)) & 1;
-            if (code)
-                pixel(frame, left + x, top + y, palette[multi && code != 2 ? (code == 1 ? one : two) : flags & 15]);
+            if (!code)
+                continue;
+            const auto ink = palette[multi && code != 2 ? (code == 1 ? one : two) : flags & 15];
+            for (unsigned dy = 0; dy < scale_y; ++dy)
+                for (unsigned dx = 0; dx < scale_x; ++dx)
+                    pixel(frame, left + x * scale_x + dx, top + y * scale_y + dy, ink);
         }
 }
 
@@ -239,23 +254,50 @@ PictureArchive encounter_sprites(const Bytes& bytes, unsigned id)
 {
     const auto address = word(bytes, 0);
     if (relocated(address) || address == 0x1000) {
-        // Later games store groups of six hardware sprites and placement descriptors
-        // separately. Preview the stored shapes without inferring their live positions.
-        unsigned first, count;
+        // DUNGEON indexes six-byte descriptors at E300 (E000 in Silver Blades).
+        // Distance groups are 0..1, 2..5, and 6..11. VIC $D010 is cleared.
+        unsigned first, count, descriptor;
         if (bytes.size() == 850) {
             first = 2;
             count = 12;
+            descriptor = 770;
         } else if (bytes.size() == 463 || bytes.size() == 847) {
             first = 79;
             count = (bytes.size() - first) / 64;
+            descriptor = 2;
         } else {
             throw std::runtime_error("Invalid later C64 encounter sprite bank");
         }
         PictureArchive result;
+        const unsigned one = bytes[descriptor + 72] & 15, two = bytes[descriptor + 73] & 15;
+        // Use one crop for all distances so moving between them preserves screen-relative placement.
+        unsigned x0 = 256, y0 = 256, x1 = 0, y1 = 0;
         for (unsigned n = 0; n < count; ++n) {
-            auto frame = image(id, n, 24, 21);
+            const auto* pos = bytes.data() + descriptor + n * 6;
+            x0 = std::min(x0, unsigned(pos[0]));
+            y0 = std::min(y0, unsigned(pos[1]));
+            x1 = std::max(x1, pos[0] + (pos[2] ? 48u : 24u));
+            y1 = std::max(y1, pos[1] + (pos[3] ? 42u : 21u));
+        }
+        unsigned start = 0;
+        for (unsigned parts : {2u,4u,6u}) {
+            if (start + parts > count)
+                break;
+            auto frame = image(id, static_cast<unsigned>(result.frames.size()), x1 - x0, y1 - y0);
+            for (unsigned n = start + parts; n-- > start;) {
+                const auto* pos = bytes.data() + descriptor + n * 6;
+                const auto* bits = bytes.data() + first + 64 * n;
+                sprite(frame, pos[0] - x0, pos[1] - y0, bits, (pos[5] & 15) | (pos[4] ? 128 : 0),
+                       one, two, pos[2] ? 2 : 1, pos[3] ? 2 : 1);
+            }
+            result.frames.push_back(std::move(frame));
+            start += parts;
+        }
+        for (unsigned n = 0; n < count; ++n) {
+            auto frame = image(id, static_cast<unsigned>(result.frames.size()), 24, 21);
             const auto* bits = bytes.data() + first + 64 * n;
-            sprite(frame, 0, 0, bits, bits[63], 10, 15);
+            const auto* pos = bytes.data() + descriptor + n * 6;
+            sprite(frame, 0, 0, bits, (pos[5] & 15) | (pos[4] ? 128 : 0), one, two);
             result.frames.push_back(std::move(frame));
         }
         return result;
@@ -384,9 +426,70 @@ Frame title(const fs::path& path, const Bytes& bytes)
 
 PictureArchive credits(const fs::path& path, const Bytes& bytes)
 {
-    require(bytes, 2941, 0x1000);
+    const bool original = bytes.size() == 2941 && word(bytes, 0) == 0x1000;
     const auto font = companion(path, "CHARSET.PRG");
-    require(font, 514, 0x1000);
+    require_shared(font, 514, 0x1000);
+    if (!original) {
+        // Match the original INIT command reader and its LDA/STA split pointer lookup.
+        // The executable is relocated to $0800 regardless of the PRG transfer address.
+        constexpr unsigned base = 0x7fe;
+        for (unsigned i = 2; i + 20 <= bytes.size(); ++i) {
+            if (bytes[i] != 0x8c || bytes[i+3] != 0xbe || bytes[i+6] != 0x30 ||
+                bytes[i+8] != 0x20 || bytes[i+11] != 0x4c ||
+                bytes[i+14] != 0xe0 || bytes[i+15] != 0xff ||
+                bytes[i+18] != 0xe0 || bytes[i+19] != 0xfe)
+                continue;
+            const auto call = word(bytes, i + 9);
+            const auto stream = word(bytes, i + 4);
+            if (call < 0x800 || stream < 0x800 || call - base + 13 > bytes.size() ||
+                stream - base >= bytes.size())
+                continue;
+            const auto p = call - base;
+            if (bytes[p] != 0xbd || bytes[p+3] != 0x85 || bytes[p+4] != 7 ||
+                bytes[p+5] != 0xbd || bytes[p+8] != 0x85 || bytes[p+9] != 8 || bytes[p+10] != 0x4c)
+                continue;
+            const auto lo = word(bytes, p + 1), hi = word(bytes, p + 6);
+            if (lo < 0x800 || hi <= lo || hi - base >= bytes.size())
+                continue;
+            const bool shifted = bytes.size() == 3368; // Silver Blades starts on row 6.
+            auto frame = image(0, 0, 320, 200);
+            for (std::size_t at = 3; at < frame.rgba.size(); at += 4)
+                frame.rgba[at] = 255;
+            unsigned row = shifted ? 6 : 0, col = 0, ink = 5;
+            for (auto at = stream - base; at < bytes.size() && at < stream - base + 256; ++at) {
+                const auto cmd = bytes[at];
+                if (cmd == 255)
+                    return {{std::move(frame)}, {}};
+                if (cmd == 254) {
+                    ++row;
+                    col = shifted ? 1 : 0;
+                } else if (cmd >= 192) {
+                    col = cmd & 63;
+                } else if (cmd >= 128) {
+                    ink = cmd & ((bytes.size() == 2191 || bytes.size() == 5453) ? 7 : 15);
+                } else {
+                    if (cmd >= hi - lo || hi - base + cmd >= bytes.size())
+                        throw std::runtime_error("C64 credits string ID outside its pointer table");
+                    const auto target = unsigned(bytes[lo - base + cmd]) |
+                                        unsigned(bytes[hi - base + cmd]) << 8;
+                    if (target < 0x800 || target - base >= bytes.size())
+                        throw std::runtime_error("C64 credits string pointer outside INIT");
+                    auto pos = target - base;
+                    while (pos < bytes.size() && bytes[pos]) {
+                        if (row < 25 && col < 40)
+                            cell(frame, col * 8, row * 8, font.data() + 2 + (bytes[pos] & 63) * 8,
+                                 ink, 0, 0, 0, false, false);
+                        ++pos;
+                        ++col;
+                    }
+                    if (pos == bytes.size())
+                        throw std::runtime_error("Unterminated C64 credits text");
+                }
+            }
+            throw std::runtime_error("Unterminated C64 credits command stream");
+        }
+        throw std::runtime_error("Unknown C64 INIT credits interpreter");
+    }
     std::array<unsigned, 1000> glyphs, inks{};
     glyphs.fill(32);
     for (unsigned row = 0; row < 24; ++row) {
@@ -624,6 +727,72 @@ PictureArchive wall_pictures(const fs::path& path, const Bytes& bytes, unsigned 
             result.frames.push_back(std::move(frame));
         }
     }
+    return result;
+}
+
+PictureArchive scene_picture(const fs::path& path, const Bytes& bytes, unsigned id)
+{
+    const auto font = companion(path, "CHARSET.PRG");
+    require_shared(font, 514, 0x1000);
+    const bool full = bytes.size() >= 2681;
+    const unsigned columns = full ? 38 : 22, rows = full ? 15 : bytes.size() == 1778 ? 12 : 22;
+    const unsigned cells = columns * rows, glyph_start = 2 + 2 * cells;
+    const unsigned colors = glyph_start + 1536;
+    const unsigned glyph_bytes = full ? 1536 : bytes.size() == 1778 ? 1248 : 512;
+    const auto folder = upper(fs::absolute(path).parent_path().parent_path().filename().string());
+    const bool shifted = full && (id == 0x71 || id == 0x72) &&
+        (folder.find("BUCK_ROGERS") != std::string::npos || folder.find("BUCK ROGERS") != std::string::npos);
+    std::array<std::uint8_t, 2048> glyphs{};
+    std::copy(font.begin() + 2, font.end(), glyphs.begin());
+    std::copy_n(bytes.begin() + glyph_start, glyph_bytes, glyphs.begin() + 512 - shifted);
+    auto frame = image(id, 0, columns * 8, rows * 8);
+    for (unsigned i = 0; i < cells; ++i) {
+        const unsigned code = bytes[2 + i], ink = bytes[2 + cells + i] & 15;
+        cell(frame, i % columns * 8, i / columns * 8, glyphs.data() + code * 8, ink,
+             full ? bytes[colors] : 0, full ? bytes[colors + 1] : 12,
+             full ? bytes[colors + 2] : 15, ink & 8, false);
+    }
+    PictureArchive result;
+    result.frames.push_back(std::move(frame));
+    return result;
+}
+
+PictureArchive later_spell_art(const Bytes& bytes)
+{
+    unsigned tile_end, sprite_start, shape_count = 20;
+    const bool buck = bytes.size() == 3198;
+    switch (bytes.size()) {
+    case 1994: tile_end = sprite_start = 394; break;
+    case 2674: tile_end = sprite_start = 430; break;
+    case 2746: tile_end = sprite_start = 412; break;
+    case 3198: tile_end = 430; sprite_start = 736; shape_count = 27; break;
+    default: throw std::runtime_error("Unsupported C64 spell artwork bank");
+    }
+    constexpr std::array<std::uint8_t, 8> blank{};
+    PictureArchive result;
+    for (unsigned offset = 250; offset < tile_end; offset += 18) {
+        auto frame = image(0, (offset - 250) / 18, 24, 24);
+        for (unsigned i = 0; i < 9; ++i) {
+            const unsigned code = bytes[offset + i], ink = bytes[offset + 9 + i] & 15;
+            if (code != 32 && (code < 64 || code > 94))
+                throw std::runtime_error("Invalid C64 spell tile glyph");
+            const auto* glyph = code == 32 ? blank.data() : bytes.data() + 2 + (code - 64) * 8;
+            cell(frame, i % 3 * 8, i / 3 * 8, glyph, ink, 11, 10, 0, ink & 8, false);
+        }
+        result.frames.push_back(std::move(frame));
+    }
+    for (unsigned shape = 0; shape < shape_count; ++shape) {
+        auto frame = image(1, shape, 24, 21);
+        const auto* bits = bytes.data() + sprite_start + 64 * shape;
+        sprite(frame, 0, 0, bits, buck ? bits[63] : 1, 12, 15);
+        result.frames.push_back(std::move(frame));
+    }
+    if (buck)
+        return result;
+    auto skull = image(2, 0, 24, 21);
+    sprite(skull, 0, 0, bytes.data() + sprite_start + 21 * 64, 0, 0, 0);
+    sprite(skull, 0, 0, bytes.data() + sprite_start + 20 * 64, 2, 0, 0);
+    result.frames.push_back(std::move(skull));
     return result;
 }
 
@@ -897,7 +1066,7 @@ bool is_c64_picture(const fs::path& path)
 {
     const auto name = upper(path.filename().string());
     return name == "TITLEPG.PRG" || name == "INIT.PRG" || name == "CHARSET.PRG" ||
-           name == "SPR.TP" || name == "SPELLE65.PRG" || name == "SPELLE64.PRG" ||
+           name == "SPR.TP" || name == "SPELLE65.PRG" || name == "SPELLE66.PRG" || name == "SPELLE64.PRG" ||
            name == "COM.PREP.PRG" || name == "SQRPACI00.PRG" || name == "FINAL.PRG" ||
            std::regex_match(name, graphics);
 }
@@ -1128,7 +1297,13 @@ PictureArchive read_c64_picture(const fs::path& path)
             throw std::runtime_error("Missing C64 SQRDATA companion");
         return read_c64_picture(*region);
     } else if (name == "SPELLE65.PRG") {
+        constexpr std::array<std::uint8_t, 7> overlay{0xad, 0, 0x7d, 0x29, 7, 0xc9, 1};
+        if (bytes.size() >= 2 + overlay.size() &&
+            std::equal(overlay.begin(), overlay.end(), bytes.begin() + 2))
+            return later_spell_art(companion(path, "SPELLE66.PRG"));
         return combat_terrain(bytes);
+    } else if (name == "SPELLE66.PRG") {
+        return later_spell_art(bytes);
     } else if (name == "SPELLE64.PRG") {
         return character_picker(path, bytes);
     } else if (name == "COM.PREP.PRG") {
@@ -1153,6 +1328,11 @@ PictureArchive read_c64_picture(const fs::path& path)
             throw std::runtime_error("Unrecognized C64 graphics resource");
         const auto kind = match[1].str();
         const auto id = static_cast<unsigned>(std::stoul(match[2].str(), nullptr, 16));
+        if (kind == "PIC" && (relocated(word(bytes, 0)) || word(bytes, 0) == 0x1000) &&
+            ((id >= 0x70 && (bytes.size() == 2681 || bytes.size() == 2682)) ||
+             (id >= 0x7a && id <= 0x7e && bytes.size() == 1778) ||
+             (id == 0x6d && bytes.size() == 1538)))
+            return scene_picture(path, bytes, id);
         if (kind == "PIC" && id == 0x3a && bytes.size() == 706 && word(bytes, 0) == 0x0800) {
             for (unsigned n = 0; n < 11; ++n) {
                 auto frame = image(id, n, 24, 21);

@@ -860,6 +860,23 @@ void c64_assets(const fs::path& dir)
     const auto views = read_c64_picture(wall_path);
     check(views.frames.size() == 50 && views.frames.front().id == 7 &&
           views.frames.front().rgba[3] == 255, "Later C64 wall planes did not assemble");
+
+    Bytes encounter(850);
+    encounter[1] = 0x40;
+    encounter[2] = encounter[66] = 0x80;
+    for (unsigned part = 0; part < 12; ++part) {
+        encounter[770 + part * 6] = 60;
+        encounter[771 + part * 6] = 70;
+    }
+    const std::array<std::uint8_t, 12> placement{60, 70, 1, 1, 0, 2, 61, 71, 0, 0, 0, 7};
+    std::copy(placement.begin(), placement.end(), encounter.begin() + 770);
+    const auto encounter_path = dir / "SPRITE01.PRG";
+    write(encounter_path, encounter);
+    const auto sprites = read_c64_picture(encounter_path);
+    const auto& far = sprites.frames.at(0);
+    check(sprites.frames.size() == 15 && far.width == 48 && far.height == 42 &&
+          far.rgba[0] == 129 && far.rgba[(far.width + 1) * 4] == 129 && far.rgba[11] == 0,
+          "Later C64 encounter placement, expansion or hardware sprite priority changed");
 }
 }
 
