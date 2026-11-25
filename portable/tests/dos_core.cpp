@@ -415,6 +415,16 @@ void cmp(const fs::path& dir)
           tiles.frames[0].rgba[2] == 170 && tiles.frames[1].rgba[1] == 170,
           "CMP maze tile count, stride or order mismatch");
 
+    Bytes amiga(35);
+    amiga[3] = 0xf0; // Index 1 is bright green.
+    amiga[34] = 2;
+    amiga.insert(amiga.end(), {0,0,1,0, 1,0x80, 0,0x7c,0xfe,0});
+    amiga[33] = static_cast<std::uint8_t>(amiga.size() - 34);
+    write(title, amiga);
+    const auto amiga_picture = read_cmp(title);
+    check(amiga_picture.frames[0].rgba[(320 * 4) + 1] == 255 &&
+          amiga_picture.frames[0].rgba[1] == 0, "Amiga CMP RGB4 or column-major planes changed");
+
     write(title, file(2, {0, 0x01, 0x7d, 0}));
     try {
         read_cmp(title);
@@ -474,6 +484,23 @@ void packwall(const fs::path& dir)
     check(sheet.width == 272 && sheet.height == 96 && sheet.rgba[0] == 170 &&
           sheet.rgba[3] == 255 && sheet.rgba[7] == 0 && sheet.rgba[16 * 4 + 3] == 0 &&
           sheet.rgba[20 * 4 + 1] == 170, "PACKWALL sheet layout or transparency mismatch");
+    auto amiga = bytes;
+    for (unsigned set = 0; set < 25; ++set) {
+        unsigned offset = set * static_cast<unsigned>(record.size());
+        for (unsigned piece = 0; piece < 11; ++piece) {
+            const unsigned length = widths[piece] * heights[piece] / 2;
+            offset += 4;
+            for (unsigned i = 0; i < length; i += 4) {
+                std::fill_n(amiga.begin() + offset + i, 4, 0);
+                amiga[offset + i + (piece == 0 ? 2 : 1)] = 0xaa;
+            }
+            offset += length;
+        }
+    }
+    const auto planar = dir / "PACKWALL.OST";
+    write(planar, amiga);
+    check(is_packwall_archive(planar) && read_packwall(planar).frames.front().rgba == sheet.rgba,
+          "Amiga wall bitplanes differ from the same DOS indices");
     bytes[2] = 0;
     write(path, bytes);
     try {
@@ -967,6 +994,32 @@ void ecl_scripts(const fs::path& dir)
 namespace {
 void c64_assets(const fs::path& dir)
 {
+    Bytes bitmap(8002), colors(2002);
+    bitmap[1] = colors[1] = 0x10;
+    bitmap[2] = 0x1b; // Four selector values in one multicolour bitmap byte.
+    colors[2] = 7;
+    colors[1002] = 0x12;
+    const auto title_bits = dir / "T0";
+    const auto title_colors = dir / "T1.PRG";
+    write(title_bits, bitmap);
+    write(title_colors, colors);
+    check(is_c64_picture(title_bits) && is_c64_picture(title_colors), "Missing C64 Hillsfar title routing");
+    const auto title = read_c64_picture(title_bits);
+    const auto& pixels = title.frames.at(0).rgba;
+    check(title.frames[0].width == 320 && title.frames[0].height == 200 &&
+          pixels[0] == 46 && pixels[8] == 0 && pixels[16] == 129 && pixels[24] == 237 &&
+          pixels == read_c64_picture(title_colors).frames[0].rgba, "C64 Hillsfar tile or title color order changed");
+    Bytes credit_data(6221);
+    credit_data[1] = 0x20;
+    credit_data[2] = 0x1b;
+    credit_data[3050] = 15;
+    const auto credits = dir / "CR";
+    write(credits, credit_data);
+    const auto credit = read_c64_picture(credits);
+    const auto& colors_out = credit.frames.at(0).rgba;
+    check(is_c64_picture(credits) && colors_out[0] == 46 && colors_out[8] == 196 &&
+          colors_out[16] == 129 && colors_out[24] == 237, "C64 Hillsfar credits colour order changed");
+
     Bytes picture(58);
     picture[1] = 0x50;
     picture[2] = 'A';

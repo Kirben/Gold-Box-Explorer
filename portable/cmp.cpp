@@ -37,7 +37,8 @@ unsigned word(const Bytes& bytes, std::size_t offset)
     return bytes[offset] | (unsigned(bytes[offset + 1]) << 8);
 }
 
-void expand_runs(const Bytes& source, std::size_t& input, Bytes& packed, bool delta)
+void expand_runs(const Bytes& source, std::size_t& input, Bytes& packed, bool delta,
+                 bool big_endian, bool allow_trailing_zero = false)
 {
     std::size_t output = 0;
     while (output < packed.size()) {
@@ -49,13 +50,20 @@ void expand_runs(const Bytes& source, std::size_t& input, Bytes& packed, bool de
         if (!token) {
             if (source.size() - input < 2)
                 throw std::runtime_error("Truncated Hillsfar graphics long run");
-            // ANM stores extended run counts in the opposite byte order from CMP.
-            count = delta ? (unsigned(source[input]) << 8) | source[input + 1] : word(source, input);
+            count = big_endian ? (unsigned(source[input]) << 8) | source[input + 1] : word(source, input);
             input += 2;
         }
         const auto consumed = repeat ? 1u : count;
-        if (!count || count > packed.size() - output || consumed > source.size() - input)
+        const auto remaining = packed.size() - output;
+        if (!count || consumed > source.size() - input)
             throw std::runtime_error("Invalid Hillsfar graphics run length");
+        if (count > remaining) {
+            // Amiga ARENA.CMP ends in a two-byte zero run with one raster byte left.
+            if (!allow_trailing_zero || !repeat || count != remaining + 1 ||
+                input + consumed != source.size() || source[input] != 0)
+                throw std::runtime_error("Invalid Hillsfar graphics run length");
+            count = static_cast<unsigned>(remaining);
+        }
         if (delta) {
             for (unsigned i = 0; i < count; ++i)
                 packed[output + i] ^= source[input + (repeat ? 0 : i)];
@@ -68,9 +76,9 @@ void expand_runs(const Bytes& source, std::size_t& input, Bytes& packed, bool de
     }
 }
 
-void put_pixel(std::uint8_t* rgba, unsigned index)
+void put_pixel(std::uint8_t* rgba, unsigned index, const unsigned* colors = palette)
 {
-    const auto color = palette[index];
+    const auto color = colors[index];
     rgba[0] = static_cast<std::uint8_t>(color >> 16);
     rgba[1] = static_cast<std::uint8_t>(color >> 8);
     rgba[2] = static_cast<std::uint8_t>(color);
@@ -89,6 +97,55 @@ Frame render(const std::uint8_t* packed, unsigned id, unsigned width, unsigned h
         }
     }
     return frame;
+}
+
+unsigned planar_index(const std::uint8_t* bytes, unsigned plane_stride, unsigned byte, unsigned bit)
+{
+    unsigned index = 0;
+    for (unsigned plane = 0; plane < 4; ++plane)
+        index |= ((bytes[plane * plane_stride + byte] >> bit) & 1) << plane;
+    return index;
+}
+
+PictureArchive read_amiga_cmp(const Bytes& source, std::string_view name)
+{
+    constexpr unsigned palette_bytes = 32;
+    constexpr unsigned header = palette_bytes + 3;
+    constexpr unsigned row_bytes = screen_width / 8;
+    constexpr unsigned plane_bytes = row_bytes * screen_height;
+    const unsigned storage = source[palette_bytes + 2];
+    if (storage != 1 && storage != 2)
+        throw std::runtime_error("Invalid Amiga Hillsfar CMP storage order");
+    unsigned colors[16]{};
+    for (unsigned i = 0; i < 16; ++i) {
+        const unsigned value = (unsigned(source[2 * i]) << 8) | source[2 * i + 1];
+        if (value > 0x0fff)
+            throw std::runtime_error("Invalid Amiga Hillsfar CMP palette");
+        colors[i] = (((value >> 8) & 15) * 17 << 16) | (((value >> 4) & 15) * 17 << 8) |
+            ((value & 15) * 17);
+    }
+    Bytes planes(4 * plane_bytes);
+    std::size_t input = header;
+    expand_runs(source, input, planes, false, true, name == "ARENA");
+    if (input != source.size())
+        throw std::runtime_error("Unexpected bytes after Amiga Hillsfar CMP raster");
+
+    PictureArchive archive;
+    const bool maze = is_maze(name);
+    const unsigned width = maze ? tile_size : screen_width;
+    const unsigned height = maze ? tile_size : screen_height;
+    for (unsigned tile = 0; tile < (maze ? tile_count : 1); ++tile) {
+        Frame frame{maze ? tile : 1, 0, width, height, Bytes(width * height * 4)};
+        for (unsigned y = 0; y < height; ++y)
+            for (unsigned x = 0; x < width; ++x) {
+                const unsigned offset = (tile * width * height + y * width + x) / 8;
+                const auto stored = storage == 1 ? offset : offset % row_bytes * screen_height + offset / row_bytes;
+                const auto index = planar_index(planes.data(), plane_bytes, stored, 7 - x % 8);
+                put_pixel(frame.rgba.data() + (y * width + x) * 4, index, colors);
+            }
+        archive.frames.push_back(std::move(frame));
+    }
+    return archive;
 }
 }
 
@@ -118,16 +175,20 @@ PictureArchive read_cmp(const std::filesystem::path& path)
     file.seekg(0);
     if (!file.read(reinterpret_cast<char*>(source.data()), length))
         throw std::runtime_error("Unable to read the Hillsfar CMP file");
+    const auto name = upper(path.stem().string());
+    if (source.size() >= 35 && ((unsigned(source[32]) << 8) | source[33]) == source.size() - 34 &&
+        word(source, 0) != source.size() - 2)
+        return read_amiga_cmp(source, name);
     if (word(source, 0) != source.size() - 2 || (source[2] != 1 && source[2] != 2))
         throw std::runtime_error("Invalid Hillsfar CMP header");
 
     Bytes packed(screen_width * screen_height / 2);
     std::size_t input = 3;
-    expand_runs(source, input, packed, false);
+    expand_runs(source, input, packed, false, false);
     if (input != source.size())
         throw std::runtime_error("Unexpected bytes after the Hillsfar CMP raster");
     PictureArchive result;
-    if (is_maze(upper(path.stem().string()))) {
+    if (is_maze(name)) {
         if (source[2] != 1)
             throw std::runtime_error("Invalid Hillsfar maze tile storage order");
         // The DOS loader walks 48 tiles at a 0x120-byte stride.
@@ -173,7 +234,7 @@ PictureArchive read_anm(const std::filesystem::path& path)
     PictureArchive result;
     const auto count = static_cast<unsigned>(end - source.begin());
     for (unsigned i = 0; i < count; ++i) {
-        expand_runs(source, input, packed, true);
+        expand_runs(source, input, packed, true, true);
         result.frames.push_back(render(packed.data(), i + 1, width, height, false));
     }
     if (input != source.size())
@@ -183,7 +244,8 @@ PictureArchive read_anm(const std::filesystem::path& path)
 
 bool is_packwall_archive(const std::filesystem::path& path)
 {
-    return upper(path.filename().string()) == "PACKWALL.OUT";
+    const auto name = upper(path.filename().string());
+    return name == "PACKWALL.OUT" || name == "PACKWALL.OST";
 }
 
 PictureArchive read_packwall(const std::filesystem::path& path)
@@ -192,13 +254,14 @@ PictureArchive read_packwall(const std::filesystem::path& path)
     constexpr unsigned sheet_height = 96;
     constexpr unsigned perspectives = 11;
     constexpr auto archive_size = wall_count * wall_record_size;
+    const bool amiga = upper(path.extension().string()) == ".OST";
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file || file.tellg() != archive_size)
-        throw std::runtime_error("Expected a 108300-byte Hillsfar PACKWALL.OUT archive");
+        throw std::runtime_error("Expected a 108300-byte Hillsfar PACKWALL archive");
     Bytes source(archive_size);
     file.seekg(0);
     if (!file.read(reinterpret_cast<char*>(source.data()), source.size()))
-        throw std::runtime_error("Unable to read Hillsfar PACKWALL.OUT");
+        throw std::runtime_error("Unable to read Hillsfar PACKWALL");
 
     PictureArchive result;
     result.frames.reserve(wall_count);
@@ -217,13 +280,12 @@ PictureArchive read_packwall(const std::filesystem::path& path)
             if (!width || left + width > sheet_width || height > sheet_height || length > end - offset)
                 throw std::runtime_error("Invalid Hillsfar wall perspective dimensions");
             for (unsigned y = 0; y < height; ++y) {
-                for (unsigned x = 0; x < width / 2; ++x) {
-                    const auto pair = source[offset + y * (width / 2) + x];
-                    auto* target = sheet.rgba.data() + (y * sheet_width + left + 2 * x) * 4;
-                    if (const auto index = pair >> 4)
-                        put_pixel(target, index);
-                    if (const auto index = pair & 15)
-                        put_pixel(target + 4, index);
+                for (unsigned x = 0; x < width; ++x) {
+                    const auto index = amiga
+                        ? planar_index(source.data() + offset, 1, (y * (width / 8) + x / 8) * 4, 7 - x % 8)
+                        : (source[offset + y * (width / 2) + x / 2] >> (x % 2 ? 0 : 4)) & 15;
+                    if (index)
+                        put_pixel(sheet.rgba.data() + (y * sheet_width + left + x) * 4, index);
                 }
             }
             left += width + 4;

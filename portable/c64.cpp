@@ -1136,6 +1136,70 @@ bool is_extra_buck_spell_bank(const std::string& name)
 {
     return name == "SPELLE67.PRG" || name == "SPELLE68.PRG" || name == "SPELLE69.PRG";
 }
+
+bool is_hillsfar_display(const fs::path& path)
+{
+    const auto name = upper(path.filename().string());
+    const bool bitmap = name == "T0" || name == "T0.PRG";
+    const bool credits = name == "CR" || name == "CR.PRG";
+    if (!bitmap && !credits && name != "T1" && name != "T1.PRG")
+        return false;
+    std::error_code ec;
+    if (fs::file_size(path, ec) != (bitmap ? 8002u : credits ? 6221u : 2002u))
+        return false;
+    std::ifstream stream(path, std::ios::binary);
+    char address[2]{};
+    return stream.read(address, sizeof(address)) && address[0] == 0 &&
+        (address[1] == 0x10 || (credits && address[1] == 0x20));
+}
+
+PictureArchive hillsfar_display(const fs::path& path, const Bytes& bytes)
+{
+    if (bytes.size() == 6221) {
+        auto frame = image(0, 0, 320, 200);
+        // H0 copies the first $800 bytes of CR to the charset, then
+        // $3E8 bytes each to screen and colour RAM. The rest drives the credits.
+        for (unsigned i = 0; i < 1000; ++i) {
+            const unsigned code = bytes[2050 + i], ink = bytes[3050 + i] & 15;
+            cell(frame, i % 40 * 8, i / 40 * 8, bytes.data() + 2 + code * 8,
+                 ink, 6, 10, 2, (ink & 8) != 0, false);
+        }
+        PictureArchive archive;
+        archive.frames.push_back(std::move(frame));
+        archive.frame_labels.push_back("Hillsfar credits artwork");
+        return archive;
+    }
+    const bool selected_bitmap = bytes.size() == 8002;
+    const auto other_name = selected_bitmap ? "T1" : "T0";
+    auto other = companion(path, other_name);
+    if (other.empty())
+        other = companion(path, std::string(other_name) + ".PRG");
+    if (other.empty())
+        throw std::runtime_error("Hillsfar title requires both C64 T0 and T1 files");
+    const auto& bitmap = selected_bitmap ? bytes : other;
+    const auto& attributes = selected_bitmap ? other : bytes;
+    require(bitmap, 8002, 0x1000);
+    require(attributes, 2002, 0x1000);
+    auto frame = image(0, 0, 320, 200);
+    const auto remap = [](unsigned color) { return color == 1 ? 0u : color; };
+    // WESTWOOD loads T0 at $E000 and T1 at $C818. T1's first 1000
+    // bytes go to colour RAM, and its last 1000 are screen RAM at $CC00.
+    for (unsigned i = 0; i < 1000; ++i) {
+        const unsigned screen = attributes[1002 + i];
+        const unsigned colors[]{6, remap(screen >> 4), remap(screen & 15), remap(attributes[2 + i] & 15)};
+        for (unsigned y = 0; y < 8; ++y) {
+            const unsigned bits = bitmap[2 + i * 8 + y];
+            for (unsigned x = 0; x < 8; ++x) {
+                const auto index = (bits >> (6 - (x / 2) * 2)) & 3;
+                pixel(frame, i % 40 * 8 + x, i / 40 * 8 + y, palette[colors[index]]);
+            }
+        }
+    }
+    PictureArchive archive;
+    archive.frames.push_back(std::move(frame));
+    archive.frame_labels.push_back("Hillsfar title");
+    return archive;
+}
 }
 
 bool is_c64_picture(const fs::path& path)
@@ -1144,7 +1208,7 @@ bool is_c64_picture(const fs::path& path)
     return name == "TITLEPG.PRG" || name == "INIT.PRG" || name == "CHARSET.PRG" ||
            name == "SPR.TP" || name == "SPELLE65.PRG" || name == "SPELLE66.PRG" || name == "SPELLE64.PRG" ||
            name == "COM.PREP.PRG" || name == "SQRPACI00.PRG" || name == "FINAL.PRG" ||
-           name == "GE031.PRG" || is_extra_buck_spell_bank(name) ||
+           name == "GE031.PRG" || is_extra_buck_spell_bank(name) || is_hillsfar_display(path) ||
            std::regex_match(name, graphics);
 }
 
@@ -1354,7 +1418,9 @@ PictureArchive read_c64_picture(const fs::path& path)
     const auto name = upper(path.filename().string());
     const auto bytes = read_prg(path);
     PictureArchive result;
-    if (name == "TITLEPG.PRG") {
+    if (is_hillsfar_display(path)) {
+        return hillsfar_display(path, bytes);
+    } else if (name == "TITLEPG.PRG") {
         result.frames.push_back(title(path, bytes));
     } else if (name == "INIT.PRG") {
         return credits(path, bytes);
