@@ -43,9 +43,20 @@ unsigned word(const Bytes& b, std::size_t at)
     return unsigned(b.at(at)) | unsigned(b.at(at + 1)) << 8;
 }
 
+bool relocated(unsigned address)
+{
+    return address == 0x3000 || address == 0x4000;
+}
+
 void require(const Bytes& bytes, std::size_t size, unsigned address)
 {
     if (bytes.size() != size || word(bytes, 0) != address)
+        throw std::runtime_error("Unexpected C64 resource size or load address");
+}
+
+void require_shared(const Bytes& bytes, std::size_t size, unsigned address)
+{
+    if (bytes.size() != size || (word(bytes, 0) != address && !relocated(word(bytes, 0))))
         throw std::runtime_error("Unexpected C64 resource size or load address");
 }
 
@@ -133,7 +144,7 @@ void xor_plane(const Bytes& bytes, std::size_t& at, Bytes& plane)
 
 PictureArchive pictures(const Bytes& bytes, unsigned id, std::optional<unsigned> shared = {})
 {
-    if (bytes.size() < 60 || word(bytes, 0) != 0x5000)
+    if (bytes.size() < 60 || (word(bytes, 0) != 0x5000 && !relocated(word(bytes, 0))))
         throw std::runtime_error("Unsupported C64 picture header");
     const unsigned cols = bytes[47], rows = bytes[48], cells = cols * rows;
     if (!cols || cols > 40 || !rows || rows > 25 || word(bytes, 49) != cells * 8 || word(bytes, 51) != cells)
@@ -184,7 +195,9 @@ Frame glyph_atlas(const Bytes& bytes, unsigned id, bool combat)
 
 Frame map_image(const Bytes& bytes, unsigned id)
 {
-    require(bytes, 1026, 0x0400);
+    if (bytes.size() != 1026 ||
+        (word(bytes, 0) != 0x0400 && word(bytes, 0) != 0x0004 && !relocated(word(bytes, 0))))
+        throw std::runtime_error("Invalid C64 GEO map");
     const auto map = read_geo_map({id, 1024, bytes});
     constexpr unsigned step = 12;
     auto frame = image(id, 0, 16 * step + 1, 16 * step + 1);
@@ -224,6 +237,29 @@ void sprite(Frame& frame, unsigned left, unsigned top, const std::uint8_t* data,
 
 PictureArchive encounter_sprites(const Bytes& bytes, unsigned id)
 {
+    const auto address = word(bytes, 0);
+    if (relocated(address) || address == 0x1000) {
+        // Later games store groups of six hardware sprites and placement descriptors
+        // separately. Preview the stored shapes without inferring their live positions.
+        unsigned first, count;
+        if (bytes.size() == 850) {
+            first = 2;
+            count = 12;
+        } else if (bytes.size() == 463 || bytes.size() == 847) {
+            first = 79;
+            count = (bytes.size() - first) / 64;
+        } else {
+            throw std::runtime_error("Invalid later C64 encounter sprite bank");
+        }
+        PictureArchive result;
+        for (unsigned n = 0; n < count; ++n) {
+            auto frame = image(id, n, 24, 21);
+            const auto* bits = bytes.data() + first + 64 * n;
+            sprite(frame, 0, 0, bits, bits[63], 10, 15);
+            result.frames.push_back(std::move(frame));
+        }
+        return result;
+    }
     if (bytes.size() < 130 || word(bytes, 0) != 0xd800 || (bytes.size() - 66) % 64)
         throw std::runtime_error("Invalid C64 encounter sprite bank");
     const unsigned count = (bytes.size() - 66) / 64;
@@ -265,7 +301,7 @@ PictureArchive encounter_sprites(const Bytes& bytes, unsigned id)
 PictureArchive combat_pictures(const Bytes& bytes, unsigned id)
 {
     const unsigned address = word(bytes,0), count = (bytes.size() - 2) / 162;
-    if ((address != 0x2f5c && address != 0x4000) || (count != 1 && count != 2 && count != 4) ||
+    if ((address != 0x2f5c && !relocated(address)) || (count != 1 && count != 2 && count != 4) ||
         (bytes.size() - 2) % 162 > 1 || (address == 0x2f5c && bytes.size() != 164))
         throw std::runtime_error("Invalid C64 combat sprite bank");
     PictureArchive result;
@@ -304,15 +340,17 @@ PictureArchive combat_pictures(const Bytes& bytes, unsigned id)
 
 Frame title(const fs::path& path, const Bytes& bytes)
 {
-    require(bytes, 3933, 0x3a98);
+    if (bytes.size() < 3 || (word(bytes, 0) != 0x3a98 && !relocated(word(bytes, 0))))
+        throw std::runtime_error("Invalid C64 title header");
+    const bool pool = bytes.size() == 3933 && word(bytes, 0) == 0x3a98;
     Bytes raw;
     raw.reserve(9216);
     std::size_t at = 2;
-    while (at < bytes.size() && bytes[at] != 255) {
+    while (at + 1 < bytes.size()) {
         const auto control = bytes[at++];
         const unsigned count = (control & 127) ? control & 127 : 256;
         const unsigned input = control & 128 ? 1 : count;
-        if (count > 9216 - raw.size() || input > bytes.size() - at)
+        if (count > 9216 - raw.size() || input > bytes.size() - 1 - at)
             throw std::runtime_error("Invalid C64 title RLE");
         if (input == 1 && (control & 128))
             raw.insert(raw.end(), count, bytes[at]);
@@ -320,10 +358,12 @@ Frame title(const fs::path& path, const Bytes& bytes)
             raw.insert(raw.end(), bytes.begin() + at, bytes.begin() + at + input);
         at += input;
     }
-    if (raw.size() != 9216 || at + 1 != bytes.size() || bytes[at] != 255)
+    if ((raw.size() != 9216 && raw.size() != 9024) || at + 1 != bytes.size() ||
+        (bytes[at] != 255 && bytes[at] != 0))
         throw std::runtime_error("Incomplete C64 title RLE");
-    const auto sprites = companion(path, "SPR.TP");
-    require(sprites, 450, 0x0800);
+    const auto sprites = pool ? companion(path, "SPR.TP") : Bytes{};
+    if (pool)
+        require(sprites, 450, 0x0800);
     auto frame = image(0, 0, 320, 200);
     constexpr unsigned starts[]{132,150,173};
     for (unsigned y = 0; y < 200; ++y)
@@ -331,7 +371,7 @@ Frame title(const fs::path& path, const Bytes& bytes)
             const auto i = y / 8 * 40 + x / 8;
             const bool foreground = raw[1024 + i * 8 + y % 8] & (128 >> (x % 8));
             unsigned ink = foreground ? raw[i] >> 4 : raw[i] & 15;
-            if (!foreground && y >= 2 && y < 23)
+            if (pool && !foreground && y >= 2 && y < 23)
                 for (unsigned s = 0; s < 3; ++s) {
                     const unsigned dx = x - starts[s];
                     if (dx < 24 && (sprites[2 + s * 64 + (y - 2) * 3 + dx / 8] & (128 >> (dx % 8))))
@@ -456,14 +496,44 @@ PictureArchive wilderness(const fs::path& path, const Bytes& bytes, unsigned id)
 
 PictureArchive wall_pictures(const fs::path& path, const Bytes& bytes, unsigned id, bool combined)
 {
-    const unsigned size = combined ? 2340 : 780;
+    const bool later = !combined && relocated(word(bytes, 0));
+    unsigned size = combined ? 2340 : 780;
+    Bytes expanded;
     if (combined)
         require(bytes, 4682, 0x23d0);
-    else if (bytes.size() < 784 || word(bytes, 0) != 0x1388)
+    else if (!later && (bytes.size() < 784 || word(bytes, 0) != 0x1388))
         throw std::runtime_error("Invalid C64 wall definition header");
     const auto* definitions = bytes.data() + 2;
     Bytes colors;
-    if (combined) {
+    if (later) {
+        std::size_t pos = 2;
+        auto plane = [&] {
+            Bytes out;
+            while (pos < bytes.size()) {
+                const auto code = bytes[pos++];
+                if (!code)
+                    return out;
+                const bool repeat = code >= 128;
+                const unsigned count = repeat ? (code == 128 ? 128 : code & 127) : code;
+                const unsigned stored = repeat ? 1 : count;
+                if (stored > bytes.size() - pos || count > 2340 - out.size())
+                    throw std::runtime_error("Invalid later C64 wall run");
+                if (repeat)
+                    out.insert(out.end(), count, bytes[pos]);
+                else
+                    out.insert(out.end(), bytes.begin() + pos, bytes.begin() + pos + count);
+                pos += stored;
+            }
+            throw std::runtime_error("Missing C64 wall plane terminator");
+        };
+        expanded = plane();
+        colors = plane();
+        if ((expanded.size() != 780 && expanded.size() != 2340) ||
+            colors.size() != expanded.size() || pos != bytes.size())
+            throw std::runtime_error("Invalid later C64 wall planes");
+        size = static_cast<unsigned>(expanded.size());
+        definitions = expanded.data();
+    } else if (combined) {
         colors.assign(bytes.begin() + 2 + size, bytes.end());
     } else {
         std::size_t at = 2 + size;
@@ -484,21 +554,26 @@ PictureArchive wall_pictures(const fs::path& path, const Bytes& bytes, unsigned 
         std::fill_n(loaded.begin() + bank, count, true);
     };
     const auto basic = companion(path, "CHARSET.PRG");
-    if (basic.size() == 514 && word(basic, 0) == 0x1000)
+    if (basic.size() == 514 && (word(basic, 0) == 0x1000 || relocated(word(basic, 0))))
         load(basic, 0, 64);
     const auto secondary = companion(path, combined ? "SECSET00.PRG" : "SECSET02.PRG");
     const unsigned shared = combined ? 192 : 42;
-    if (secondary.size() == shared * 8 + 2 && word(secondary, 0) == (combined ? 0x3a00 : 0x1388))
+    if (secondary.size() == shared * 8 + 2 &&
+        (word(secondary, 0) == (combined ? 0x3a00 : 0x1388) || relocated(word(secondary, 0))))
         load(secondary, 64, shared);
     loaded[32] = true;
     if (!combined) {
         const auto name = upper(path.stem().string());
         auto matching = companion(path, "WALLSET" + name.substr(7) + ".PRG");
         unsigned placed = 0;
-        if (matching.size() == 402) {
+        if (later && matching.size() == 1538) {
+            load(matching, 64, 192);
+        } else if (later && matching.size() == 1202) {
+            load(matching, 106, 150);
+        } else if (matching.size() == 402) {
             const auto address = word(matching, 0);
-            if (address == 0x3b50 || address == 0x3ce0 || address == 0x3e70) {
-                placed = std::all_of(definitions, definitions + size, [](auto code) { return code < 156; })
+            if (relocated(address) || address == 0x3b50 || address == 0x3ce0 || address == 0x3e70) {
+                placed = relocated(address) || std::all_of(definitions, definitions + size, [](auto code) { return code < 156; })
                     ? 106 : (address - 0x3800) / 8;
                 load(matching, placed, 50);
             }
@@ -599,9 +674,9 @@ PictureArchive combat_terrain(const Bytes& bytes)
 
 PictureArchive character_picker(const fs::path& path, const Bytes& bank)
 {
-    require(bank, 1884, 0x8800);
+    require_shared(bank, 1884, 0x8800);
     const auto glyphs = companion(path, "CHARPIC00.PRG");
-    require(glyphs, 2032, 0x8000);
+    require_shared(glyphs, 2032, 0x8000);
     auto add_part = [&](std::array<unsigned, 9>& codes, unsigned address, unsigned id, unsigned pose, bool head) {
         const auto at = address - 0xa700 + 2 + id + pose * 40;
         const auto first = bank[at + 80];
@@ -841,26 +916,45 @@ std::vector<RecordRow> read_c64_records(const fs::path& path)
         row.fields.emplace_back(label, std::to_string(value));
     };
     auto signed_byte = [](unsigned value) { return value < 128 ? int(value) : int(value) - 256; };
-    using Names = std::array<std::string, 256>;
+    using Names = std::vector<std::pair<unsigned, std::string>>;
     auto read_names = [](const Bytes& file) {
-        if (file.size() < 515 || word(file, 0) != 0x6f00)
+        if (file.size() < 515)
+            throw std::runtime_error("Truncated C64 ITEMNAMES header");
+        const auto address = word(file, 0);
+        if (address != 0x6f00 && address != 0x1517 && !relocated(address))
             throw std::runtime_error("Invalid C64 ITEMNAMES header");
-        Names names;
+        const bool later = address != 0x6f00;
+        const bool buck = file.size() == 2185 && word(file, 0) == 0x4000;
+        Names names(buck ? 239 : 256);
+        const unsigned base = buck ? 0xa5de : later ? 0xa000 : 0x7100;
+        const auto first = 2 + 2 * names.size();
+        for (unsigned id = 0; id < names.size(); ++id)
+            names[id].first = unsigned(file[2 + id]) | unsigned(file[2 + names.size() + id]) << 8;
         for (unsigned id = 0; id < names.size(); ++id) {
-            const unsigned pointer = unsigned(file[2 + id]) | unsigned(file[258 + id]) << 8;
+            const auto pointer = names[id].first;
             if (!pointer)
                 continue;
-            std::size_t at = pointer - 0x6f00 + 2;
-            if (pointer < 0x7100 || at >= file.size())
+            std::size_t at = pointer - base + first;
+            auto& text = names[id].second;
+            if (later && at == file.size())
+                continue; // Tail entries point just past the last stored string.
+            if (pointer < base || at >= file.size())
                 throw std::runtime_error("Invalid C64 item name pointer");
-            while (at < file.size() && file[at]) {
-                const auto c = file[at++];
-                if (c < 32 || c > 126 || names[id].size() == 40)
-                    throw std::runtime_error("Invalid C64 item name text");
-                names[id] += static_cast<char>(c);
+            auto end = std::find(file.begin() + at, file.end(), 0) - file.begin();
+            if (end == static_cast<std::ptrdiff_t>(file.size())) {
+                if (!later)
+                    throw std::runtime_error("Unterminated C64 item name");
+                // Some ports append a table of loader filenames with no NUL separators.
+                for (const auto& other : names)
+                    if (other.first > pointer)
+                        end = std::min(end, static_cast<std::ptrdiff_t>(other.first - base + first));
             }
-            if (at == file.size())
-                throw std::runtime_error("Unterminated C64 item name");
+            while (at < static_cast<std::size_t>(end)) {
+                const auto c = file[at++];
+                if (c < 32 || c > 126 || text.size() == 40)
+                    throw std::runtime_error("Invalid C64 item name text");
+                text += static_cast<char>(c);
+            }
         }
         return names;
     };
@@ -868,21 +962,29 @@ std::vector<RecordRow> read_c64_records(const fs::path& path)
     if (name == "ITEMNAMES.PRG") {
         const auto names = read_names(bytes);
         for (unsigned id = 0; id < names.size(); ++id) {
-            RecordRow row{id, 0, names[id].empty() ? "Empty name" : names[id], {{"Name component", names[id]}}};
-            number(row, "Pointer", unsigned(bytes[2 + id]) | unsigned(bytes[258 + id]) << 8);
+            const auto& [pointer,text] = names[id];
+            RecordRow row{id, 0, text.empty() ? "Empty name" : text, {{"Name component", text}}};
+            number(row, "Pointer", pointer);
             rows.push_back(std::move(row));
         }
         return rows;
     }
     if (name == "ITEMS.PRG") {
-        require(bytes, 2050, 0x7600);
+        const bool buck = bytes.size() == 353 && word(bytes, 0) == 0x4000;
+        if (!buck && !(bytes.size() == 1282 && word(bytes, 0) == 0x4000))
+            require_shared(bytes, 2050, 0x7600);
         constexpr const char* fields[]{"Equipment slot", "Hands", "Large-target damage rolls",
             "Large-target damage dice", "Large-target damage bonus", "Rate of fire ×2", "AC descriptor",
             "Weapon class bits", "Reserved 8", "Small-target damage rolls", "Small-target damage dice",
             "Small-target damage bonus", "Range (exclusive)", "Class mask", "Property mask", "Reserved 15"};
-        for (unsigned id = 0; id < 128; ++id) {
+        const unsigned count = (bytes.size() - 2) / (buck ? 9 : 16);
+        for (unsigned id = 0; id < count; ++id) {
             RecordRow row{id, 0, "Item type " + std::to_string(id), {}};
-            for (unsigned i = 0; i < std::size(fields); ++i) {
+            for (unsigned i = 0; i < (buck ? 9 : std::size(fields)); ++i) {
+                if (buck) {
+                    row.fields.emplace_back("Byte " + std::to_string(i), std::to_string(bytes[2 + 9 * id + i]));
+                    continue;
+                }
                 const auto value = bytes[2 + 16 * id + i];
                 number(row, fields[i], i == 4 || i == 11 ? signed_byte(value) : int(value));
             }
@@ -895,8 +997,12 @@ std::vector<RecordRow> read_c64_records(const fs::path& path)
         throw std::runtime_error("Unrecognized C64 record resource");
     const auto id = static_cast<unsigned>(std::stoul(match[2].str(), nullptr, 16));
     const bool monster = match[1] == "MON";
+    const auto address = word(bytes, 0);
+    const bool compact_buck = monster && bytes.size() == 204 && address == 0x4000;
+    const bool long_buck = monster && bytes.size() == 546 && address == 0x4000;
     if (monster) {
-        if ((bytes.size() != 482 && bytes.size() != 546) || word(bytes, 0) != 0x6400)
+        if (!compact_buck && ((bytes.size() != 482 && bytes.size() != 546) ||
+            (address != 0x6400 && address != 0 && !relocated(address))))
             throw std::runtime_error("Unsupported C64 monster record");
         RecordRow row{id, 0, {}, {}};
         for (unsigned i = 2; i < 18 && bytes[i]; ++i) {
@@ -909,6 +1015,21 @@ std::vector<RecordRow> read_c64_records(const fs::path& path)
         }
         if (row.name.empty())
             throw std::runtime_error("Missing C64 monster name");
+        if (compact_buck || long_buck) {
+            constexpr char hex[] = "0123456789ABCDEF";
+            number(row, "Payload bytes", static_cast<int>(bytes.size() - 2));
+            for (unsigned i = 2; i < bytes.size(); i += 16) {
+                std::string raw;
+                for (unsigned j = i; j < bytes.size() && j < i + 16; ++j) {
+                    if (!raw.empty())
+                        raw += ' ';
+                    raw += hex[bytes[j] >> 4];
+                    raw += hex[bytes[j] & 15];
+                }
+                row.fields.emplace_back("Bytes at payload offset " + std::to_string(i - 2), std::move(raw));
+            }
+            return {std::move(row)};
+        }
         constexpr const char* abilities[]{"Strength","Intelligence","Wisdom","Dexterity","Constitution","Charisma","Exceptional strength"};
         for (unsigned i = 0; i < std::size(abilities); ++i)
             number(row, abilities[i], bytes[2 + 0x14 + i]);
@@ -924,7 +1045,7 @@ std::vector<RecordRow> read_c64_records(const fs::path& path)
         number(row, "Portrait body", bytes[2+0xff]);
         number(row, "Inventory slots", (bytes.size() - 2 - 0x120) / 16);
         rows.push_back(std::move(row));
-    } else if (word(bytes, 0) != 0x2710 || (bytes.size() - 2) % 16) {
+    } else if ((address != 0x2710 && address != 0x1710 && !relocated(address)) || (bytes.size() - 2) % 16) {
         throw std::runtime_error("Invalid C64 placed item bank");
     }
     Names names;
@@ -944,7 +1065,9 @@ std::vector<RecordRow> read_c64_records(const fs::path& path)
         auto item_name = [&](bool visible) {
             std::string result;
             for (unsigned i = 0; i < 3; ++i) {
-                const auto& part = names[b[3-i]];
+                if (b[3-i] >= names.size())
+                    continue;
+                const auto& part = names[b[3-i]].second;
                 if (part.empty() || (visible && (b[6] & (1 << i))))
                     continue;
                 if (!result.empty())
@@ -1011,10 +1134,10 @@ PictureArchive read_c64_picture(const fs::path& path)
     } else if (name == "COM.PREP.PRG") {
         return combat_cursor(bytes);
     } else if (name == "CHARSET.PRG") {
-        require(bytes, 514, 0x1000);
+        require_shared(bytes, 514, 0x1000);
         result.frames.push_back(glyph_atlas(bytes, 0, false));
     } else if (name == "SPR.TP") {
-        require(bytes, 450, 0x0800);
+        require_shared(bytes, 450, 0x0800);
         for (unsigned i = 0; i < 7; ++i) {
             auto frame = image(0, i, 24, 21);
             sprite(frame, 0, 0, bytes.data() + 2 + 64 * i, i < 3 ? 2 : 1, 0, 0);
@@ -1054,13 +1177,16 @@ PictureArchive read_c64_picture(const fs::path& path)
             const auto size = bytes.size() - 2;
             const auto address = word(bytes, 0);
             if (kind == "CHARPIC") {
-                require(bytes, 2032, 0x8000);
+                if (bytes.size() != 5834 || word(bytes, 0) != 0x4000)
+                    require_shared(bytes, 2032, 0x8000);
                 if (id)
                     throw std::runtime_error("Invalid C64 character glyph bank");
             } else if (kind == "WALLSET") {
-                if (size != 400 || (address != 0x3b50 && address != 0x3ce0 && address != 0x3e70))
+                if (!(relocated(address) && (size == 400 || size == 1200 || size == 1536)) &&
+                    (size != 400 || (address != 0x3b50 && address != 0x3ce0 && address != 0x3e70)))
                     throw std::runtime_error("Invalid C64 wall glyph bank");
-            } else if (!((address == 0x1388 && size == 336) || (address == 0x1390 && size == 1500) ||
+            } else if (!((relocated(address) && size >= 336 && size <= 1536) ||
+                         (address == 0x1388 && size == 336) || (address == 0x1390 && size == 1500) ||
                          (size && size <= 2048 && size % 8 == 0 &&
                           (address == 0x3a00 || address == 0x3a08 || address == 0x1390 ||
                            address == 0x1588 || address == 0x1000)))) {

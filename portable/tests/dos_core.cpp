@@ -831,6 +831,35 @@ void c64_assets(const fs::path& dir)
     check(rows.size() == 1 && rows[0].id == 2 && has_field(rows[0], {"Weight","4660"}) &&
           has_field(rows[0], {"Magic bonus","-1"}) && has_field(rows[0], {"Hidden name mask","7"}),
           "C64 native item record offsets or flags disagree");
+
+    picture[1] = 0x40;
+    write(pic, picture);
+    check(read_c64_picture(pic).frames[0].rgba == gallery.frames[0].rgba,
+          "Relocated C64 picture changed original pixels");
+    Bytes names(516);
+    names[1] = 0x40;
+    names[258] = 0xa0;
+    names[514] = 'X';
+    const auto names_path = dir / "ITEMNAMES.PRG";
+    write(names_path, names);
+    const auto components = read_record_rows(names_path);
+    check(components.size() == 256 && components.front().name == "X", "Relocated C64 name pointer mismatch");
+
+    Bytes walls{0, 0x40};
+    for (unsigned value : {32u, 1u}) {
+        for (unsigned left = 780; left;) {
+            const unsigned count = std::min(left, 127u);
+            walls.push_back(static_cast<std::uint8_t>(128 + count));
+            walls.push_back(static_cast<std::uint8_t>(value));
+            left -= count;
+        }
+        walls.push_back(0);
+    }
+    const auto wall_path = dir / "WALLDEF07.PRG";
+    write(wall_path, walls);
+    const auto views = read_c64_picture(wall_path);
+    check(views.frames.size() == 50 && views.frames.front().id == 7 &&
+          views.frames.front().rgba[3] == 255, "Later C64 wall planes did not assemble");
 }
 }
 
