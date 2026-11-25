@@ -1,4 +1,5 @@
 #include "pictures.h"
+#include "tlb.h"
 #include "dax.h"
 #include "records.h"
 #include "save_map.h"
@@ -37,7 +38,8 @@ int main(int argc, char** argv)
                 }
                 continue;
             }
-            if (!goldbox::is_picture_archive(argv[arg])) {
+            const bool tlb = goldbox::is_tlb_archive(argv[arg]);
+            if (!tlb && !goldbox::is_picture_archive(argv[arg])) {
                 const auto records = goldbox::read_dax(argv[arg]);
                 std::cout << argv[arg] << ": " << records.size() << " records\n";
                 for (const auto& record : records)
@@ -45,7 +47,7 @@ int main(int argc, char** argv)
                               << record.bytes.size() << " decoded\n";
                 continue;
             }
-            const auto archive = goldbox::read_pictures(argv[arg]);
+            const auto archive = tlb ? goldbox::read_tlb(argv[arg]) : goldbox::read_pictures(argv[arg]);
             std::cout << argv[arg] << ": " << archive.frames.size() << " frames";
             if (!archive.skipped_ids.empty()) {
                 std::cout << " (skipped record IDs:";

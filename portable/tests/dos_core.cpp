@@ -4,6 +4,7 @@
 #include "records.h"
 #include "save_map.h"
 #include "walls.h"
+#include "tlb.h"
 
 #include <algorithm>
 #include <fstream>
@@ -61,6 +62,61 @@ void pictures(const fs::path& dir)
     const auto& steps = archive.clips[0].steps;
     check(steps.size() == 2 && steps[0].frame == 0 && steps[1].frame == 1 &&
           steps[0].duration_ms == 220 && steps[1].duration_ms == 439, "Unexpected DOS playback timing");
+}
+
+Bytes tlb_library(const char* type, const std::vector<Bytes>& records, bool has_ids = false)
+{
+    Bytes bytes(16 + 4 * (records.size() + 1));
+    std::copy_n("HLIB", 4, bytes.begin());
+    std::copy_n(type, 4, bytes.begin() + 12);
+    bytes[8] = static_cast<std::uint8_t>(records.size());
+    bytes[11] = has_ids;
+    const auto set_dword = [&](std::size_t offset, std::size_t value) {
+        for (unsigned i = 0; i < 4; ++i)
+            bytes[offset + i] = static_cast<std::uint8_t>(value >> (i * 8));
+    };
+    for (std::size_t i = 0; i < records.size(); ++i) {
+        set_dword(16 + 4 * i, bytes.size());
+        bytes.insert(bytes.end(), records[i].begin(), records[i].end());
+    }
+    set_dword(16 + 4 * records.size(), bytes.size());
+    set_dword(4, bytes.size());
+    return bytes;
+}
+
+Bytes tlb_image(std::uint8_t method, const Bytes& pixels)
+{
+    Bytes bytes{1, 0, 0, 0, 0, 0, 1, method}; // 4 by 1 pixels
+    bytes.insert(bytes.end(), pixels.begin(), pixels.end());
+    return bytes;
+}
+
+void tlb(const fs::path& dir)
+{
+    const Bytes palette{5, 0, 32, 0, 1, 0, 0, 24, 10, 20, 30};
+    const auto tile = tlb_library("TILE", {palette, tlb_image(16, {32, 0, 32, 0}),
+        tlb_image(17, {255, 0, 0, 0, 32, 32, 32, 32}), tlb_image(18, {253, 32}),
+        tlb_image(21, {32, 255, 32, 255}), tlb_image(23, {255, 0, 1, 32, 0, 0, 1, 32, 0}),
+        tlb_image(25, {1, 2, 0, 0, 0, 0, 4, 2, 0, 0, 4, 0})});
+    const auto path = dir / "PIC.tlb";
+    write(path, tlb_library("HLIB", {{1, 0, 42, 0, 1, 0}, tile}, true));
+    check(is_tlb_archive(path), "Mixed case TLB extension not recognized");
+    const auto images = read_tlb(path);
+    check(images.frames.size() == 6 && images.skipped_ids.empty(), "Unexpected TLB frame count");
+    check(images.frames[0].id == 42 && images.frames[0].rgba == Bytes{
+        10,20,30,255, 0,0,0,255, 10,20,30,255, 0,0,0,255}, "Wrong TLB IDs, palette or pixels");
+    check(images.frames[1].rgba[3] == 0 && images.frames[1].rgba[7] == 255 &&
+          images.frames[2].rgba[12] == 10 && images.frames[2].rgba[15] == 255 &&
+          images.frames[3].rgba[7] == 0, "Wrong TLB mask, repetition or transparent index");
+    check(images.frames[4].rgba[3] == 0 && images.frames[4].rgba[4] == 10 &&
+          images.frames[4].rgba[11] == 0, "Wrong TLB sparse row");
+    check(images.frames[5].width == 8 && images.frames[5].rgba[16] == 10 &&
+          images.frames[5].rgba[23] == 0, "Wrong TLB composite placement");
+
+    write(dir / "dungcom.tlb", tile);
+    write(dir / "CPIC0001.TLB", tlb_library("TILE", {tlb_image(21, {32, 32, 32, 32})}));
+    check(read_tlb(dir / "CPIC0001.TLB").frames[0].rgba[0] == 10,
+          "FRUA combat icon did not load the companion palette");
 }
 
 void geo(const fs::path& dir)
@@ -198,6 +254,7 @@ int main(int argc, char** argv)
         const fs::path dir(argv[2]);
         fs::create_directories(dir);
         if (name == "pictures") pictures(dir);
+        else if (name == "tlb") tlb(dir);
         else if (name == "geo") geo(dir);
         else if (name == "walls") walls(dir);
         else if (name == "records") records(dir);

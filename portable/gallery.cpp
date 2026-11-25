@@ -1,5 +1,6 @@
 #include "pictures.h"
 #include "apng.h"
+#include "tlb.h"
 #include "dax.h"
 #include "geo.h"
 #include "walls.h"
@@ -507,7 +508,8 @@ private:
     {
         const auto selected = files_->GetSelection();
         return !frames_.empty() && selected != wxNOT_FOUND &&
-               goldbox::is_picture_archive(paths_.at(selected));
+               (goldbox::is_picture_archive(paths_.at(selected)) ||
+                goldbox::is_tlb_archive(paths_.at(selected)));
     }
 
     void export_frames()
@@ -633,8 +635,9 @@ private:
         original_map_->SetValue(false);
         const auto selected = files_->GetSelection();
         const bool wall = selected != wxNOT_FOUND && goldbox::is_wall_archive(paths_.at(selected));
+        const bool tlb = selected != wxNOT_FOUND && goldbox::is_tlb_archive(paths_.at(selected));
         const bool picture = selected != wxNOT_FOUND &&
-            (wall || goldbox::is_picture_archive(paths_.at(selected)));
+            (wall || tlb || goldbox::is_picture_archive(paths_.at(selected)));
         show_view(picture, selected != wxNOT_FOUND && !picture);
         SetStatusText("Choose a file to inspect.");
         if (selected != wxNOT_FOUND) {
@@ -700,7 +703,7 @@ private:
                     return;
                 }
                 auto archive = wall ? goldbox::PictureArchive{goldbox::read_wall_pieces(path), {}}
-                                    : goldbox::read_pictures(path);
+                                    : tlb ? goldbox::read_tlb(path) : goldbox::read_pictures(path);
                 if (archive.frames.empty())
                     throw std::runtime_error("Archive contains no wall pieces");
                 frames_ = std::move(archive.frames);
@@ -717,7 +720,7 @@ private:
                 SetStatusText(status);
             } catch (const std::exception& error) {
                 auto message = wxString::FromUTF8(error.what());
-                if (archive_file || kind != goldbox::RecordKind::none || world) {
+                if (archive_file || tlb || kind != goldbox::RecordKind::none || world) {
                     try {
                         hex_->open(paths_.at(selected));
                         show_view(false, true);

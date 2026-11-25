@@ -1,0 +1,367 @@
+#include "tlb.h"
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <fstream>
+#include <iterator>
+#include <optional>
+#include <stdexcept>
+
+namespace goldbox {
+namespace {
+namespace fs = std::filesystem;
+using Bytes = std::vector<std::uint8_t>;
+using Color = std::array<std::uint8_t, 4>;
+using Palette = std::array<Color, 256>;
+
+std::string upper(std::string value)
+{
+    for (auto& c : value)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return value;
+}
+
+Bytes read_bytes(const fs::path& path)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        throw std::runtime_error("Unable to open the TLB library");
+    Bytes bytes{std::istreambuf_iterator<char>(file), {}};
+    if (file.bad())
+        throw std::runtime_error("Unable to read the TLB library");
+    return bytes;
+}
+
+struct Slice {
+    const std::uint8_t* data;
+    std::size_t size;
+
+    Slice part(std::size_t start, std::size_t count) const
+    {
+        if (start > size || count > size - start)
+            throw std::runtime_error("TLB record extends beyond its library");
+        return {data + start, count};
+    }
+
+    unsigned byte(std::size_t offset) const { return *part(offset, 1).data; }
+
+    unsigned word(std::size_t offset) const
+    {
+        const auto* p = part(offset, 2).data;
+        return unsigned(p[0]) | (unsigned(p[1]) << 8);
+    }
+
+    int signed_word(std::size_t offset) const
+    {
+        const int value = word(offset);
+        return value < 0x8000 ? value : value - 0x10000;
+    }
+
+    std::uint32_t dword(std::size_t offset) const
+    {
+        return word(offset) | (std::uint32_t(word(offset + 2)) << 16);
+    }
+
+    bool tag(std::size_t offset, const char* value) const
+    {
+        const auto* p = part(offset, 4).data;
+        return std::equal(p, p + 4, value);
+    }
+};
+
+struct Library {
+    explicit Library(Slice source) : data(source)
+    {
+        if (!data.tag(0, "HLIB") || data.byte(10) != 0)
+            throw std::runtime_error("Unsupported TLB library header");
+        const auto size = data.dword(4);
+        if (size < 16)
+            throw std::runtime_error("Invalid TLB library size");
+        data = data.part(0, size);
+        const auto count = data.word(8);
+        const auto directory_end = 16 + 4 * (count + 1);
+        auto previous = directory_end;
+        for (unsigned i = 0; i <= count; ++i) {
+            const auto offset = data.dword(16 + 4 * i);
+            if (offset < previous || offset > data.size)
+                throw std::runtime_error("Invalid TLB directory offset");
+            offsets.push_back(offset);
+            previous = offset;
+        }
+        ids.resize(count);
+        if (data.byte(11) == 1 && count) {
+            const auto table = item(0);
+            const auto entries = table.word(0);
+            table.part(2, 4 * entries);
+            for (unsigned i = 0; i < entries; ++i) {
+                const auto index = table.word(4 + 4 * i);
+                if (index < ids.size() && !ids[index])
+                    ids[index] = table.word(2 + 4 * i);
+            }
+        }
+    }
+
+    Slice item(std::size_t index) const
+    {
+        return data.part(offsets.at(index), offsets.at(index + 1) - offsets[index]);
+    }
+
+    unsigned first_item() const { return data.byte(11) == 1 ? 1 : 0; }
+
+    Slice data;
+    std::vector<std::uint32_t> offsets;
+    std::vector<std::optional<unsigned>> ids;
+};
+
+Palette default_palette()
+{
+    constexpr Color ega[] = {
+        {0,0,0,255}, {0,0,171,255}, {0,171,0,255}, {0,171,171,255},
+        {171,0,0,255}, {171,0,171,255}, {172,87,0,255}, {171,171,171,255},
+        {87,87,87,255}, {87,87,255,255}, {87,255,87,255}, {87,255,255,255},
+        {255,87,87,255}, {255,87,255,255}, {255,255,87,255}, {255,255,255,255}
+    };
+    Palette result{};
+    std::copy(std::begin(ega), std::end(ega), result.begin());
+    result[255] = {103, 247, 159, 255};
+    return result;
+}
+
+void apply_palette(Slice record, Palette& palette)
+{
+    const auto first = record.word(2);
+    const auto count = record.word(4);
+    if (first > palette.size() || count > palette.size() - first)
+        throw std::runtime_error("Invalid TLB palette range");
+    const auto* rgb = record.part(8, 3 * count).data;
+    for (unsigned i = 0; i < count; ++i)
+        palette[first + i] = {rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2], 255};
+}
+
+std::optional<fs::path> combat_palette_path(const fs::path& archive)
+{
+    const auto folder = fs::absolute(archive).parent_path();
+    for (const auto& directory : {folder, folder / "DEFAULT.DSN", folder / "DISK2",
+                                  folder.parent_path() / "DISK2"}) {
+        std::error_code error;
+        for (fs::directory_iterator it(directory, error), end; !error && it != end; it.increment(error)) {
+            if (upper(it->path().filename().string()) == "DUNGCOM.TLB" && it->is_regular_file(error))
+                return it->path();
+        }
+    }
+    return {};
+}
+
+void load_combat_palette(const fs::path& path, Palette& palette)
+{
+    const auto bytes = read_bytes(path);
+    const Library library({bytes.data(), bytes.size()});
+    if (library.data.tag(12, "TILE")) {
+        apply_palette(library.item(library.first_item()), palette);
+    } else if (library.data.tag(12, "HLIB")) {
+        for (std::size_t i = library.first_item(); i < library.ids.size(); ++i) {
+            const Library member(library.item(i));
+            if (member.data.tag(12, "TILE"))
+                apply_palette(member.item(member.first_item()), palette);
+        }
+    }
+}
+
+Frame decode_image(Slice image, unsigned method, unsigned id, unsigned index, const Palette& palette)
+{
+    const unsigned height = image.word(0);
+    const unsigned width = image.byte(6) * 4;
+    if (!width || !height || height > 1024)
+        throw std::runtime_error("Invalid TLB image dimensions");
+    const auto size = width * height;
+    const unsigned plane_bytes = width / 4;
+    unsigned pos = 8;
+    constexpr unsigned transparent = 256;
+    std::vector<unsigned short> pixels(size, method == 23 ? transparent : 0);
+    if (method == 18) {
+        // PackBits traverses four VGA planes for each row.
+        unsigned written = 0;
+        while (written < size) {
+            const auto code = image.byte(pos++);
+            const auto count = code < 128 ? code + 1 : 257 - code;
+            if (count > size - written)
+                throw std::runtime_error("TLB pixel run exceeds image dimensions");
+            const bool literal = code < 128;
+            const auto* run = image.part(pos, literal ? count : 1).data;
+            pos += literal ? count : 1;
+            for (unsigned i = 0; i < count; ++i, ++written) {
+                const auto in_row = written % width;
+                pixels[(written / width) * width + (in_row % plane_bytes) * 4 +
+                       in_row / plane_bytes] = run[literal ? i : 0];
+            }
+        }
+    } else if (method == 23) {
+        for (unsigned plane = 0; plane < 4; ++plane) {
+            for (unsigned y = 0; y < height; ++y) {
+                unsigned column = 0;
+                for (auto code = image.byte(pos++); code; code = image.byte(pos++)) {
+                    const auto count = code < 128 ? code : 256 - code;
+                    if (count > plane_bytes - column)
+                        throw std::runtime_error("TLB sparse pixel run exceeds row width");
+                    if (code < 128) {
+                        const auto* run = image.part(pos, count).data;
+                        pos += count;
+                        for (unsigned i = 0; i < count; ++i)
+                            pixels[y * width + (column + i) * 4 + plane] = run[i];
+                    }
+                    column += count;
+                }
+            }
+        }
+    } else {
+        const auto* mask = method == 17 ? image.part(pos, size).data : nullptr;
+        if (mask)
+            pos += size;
+        const auto* source = image.part(pos, size).data;
+        for (unsigned i = 0; i < size; ++i)
+            pixels[(i % (size / 4)) * 4 + i / (size / 4)] = mask && mask[i] == 255 ? 255 : source[i];
+    }
+
+    Frame frame{id, index, width, height, Bytes(size * 4)};
+    for (unsigned i = 0; i < size; ++i) {
+        if (pixels[i] == transparent || ((method == 17 || method == 21) && pixels[i] == 255))
+            continue;
+        const auto& color = palette[pixels[i]];
+        std::copy(color.begin(), color.end(), frame.rgba.data() + 4 * i);
+    }
+    return frame;
+}
+
+struct Component {
+    int x;
+    int y;
+    Frame frame;
+};
+
+// Type 25 draws an ordered list of references to other glyphs in the same TILE.
+void place_glyph(const Library& library, unsigned item, int x, int y, const Palette& palette,
+                 std::vector<Component>& components, unsigned depth)
+{
+    if (depth > 16 || item >= library.ids.size() || components.size() >= 4096)
+        throw std::runtime_error("Invalid TLB composite glyph");
+    const auto image = library.item(item);
+    x -= image.signed_word(4);
+    y -= image.signed_word(2);
+    const auto method = image.byte(7);
+    switch (method) {
+    case 25:
+        for (unsigned i = 0, count = 1; i < count; ++i) {
+            const auto part = image.part(8 + 6 * i, 6);
+            place_glyph(library, part.byte(0), x + part.signed_word(4),
+                        y + part.signed_word(2), palette, components, depth + 1);
+            count = part.byte(1);
+        }
+        break;
+    case 16:
+    case 17:
+    case 18:
+    case 21:
+    case 23:
+        components.push_back({x, y, decode_image(image, method, 0, 0, palette)});
+        break;
+    default:
+        throw std::runtime_error("Unsupported TLB composite component");
+    }
+}
+
+Frame compose_glyph(const Library& library, unsigned item, unsigned id, unsigned index,
+                    const Palette& palette)
+{
+    std::vector<Component> components;
+    place_glyph(library, item, 0, 0, palette, components, 0);
+    int left = components.front().x;
+    int top = components.front().y;
+    int right = left;
+    int bottom = top;
+    for (const auto& part : components) {
+        left = std::min(left, part.x);
+        top = std::min(top, part.y);
+        right = std::max(right, part.x + static_cast<int>(part.frame.width));
+        bottom = std::max(bottom, part.y + static_cast<int>(part.frame.height));
+    }
+    const auto width = static_cast<unsigned>(right - left);
+    const auto height = static_cast<unsigned>(bottom - top);
+    if (width > 1024 || height > 1024)
+        throw std::runtime_error("Invalid TLB composite dimensions");
+    Frame frame{id, index, width, height, Bytes(width * height * 4)};
+    for (const auto& part : components) {
+        for (unsigned y = 0; y < part.frame.height; ++y) {
+            for (unsigned x = 0; x < part.frame.width; ++x) {
+                const auto* source = part.frame.rgba.data() + 4 * (y * part.frame.width + x);
+                const auto target = 4 * ((part.y - top + y) * width + part.x - left + x);
+                if (source[3])
+                    std::copy_n(source, 4, frame.rgba.data() + target);
+            }
+        }
+    }
+    return frame;
+}
+
+void read_tiles(const Library& library, bool external_only, Palette& palette,
+                PictureArchive& result, std::optional<unsigned> group = {})
+{
+    if (!library.data.tag(12, "TILE"))
+        throw std::runtime_error("Expected a TILE graphics library");
+    const auto palette_index = library.first_item();
+    if (palette_index >= library.ids.size())
+        return;
+    if (!external_only)
+        apply_palette(library.item(palette_index), palette);
+    const auto first_image = palette_index + (external_only ? 0 : 1);
+    for (auto i = first_image; i < library.ids.size(); ++i) {
+        const auto image = library.item(i);
+        if (!image.size)
+            continue;
+        const auto index = i - first_image;
+        const auto id = group.value_or(library.ids[i].value_or(i));
+        const auto method = image.byte(7);
+        if (method == 16 || method == 17 || method == 18 || method == 21 || method == 23)
+            result.frames.push_back(decode_image(image, method, id, group ? index : 0, palette));
+        else if (method == 25)
+            result.frames.push_back(compose_glyph(library, i, id, group ? index : 0, palette));
+        else if (method && method != 24) // Type 24 is an alternate interface palette.
+            result.skipped_ids.push_back(id);
+    }
+}
+}
+
+bool is_tlb_archive(const fs::path& path)
+{
+    return upper(path.extension().string()) == ".TLB";
+}
+
+PictureArchive read_tlb(const fs::path& path)
+{
+    const auto bytes = read_bytes(path);
+    const Library library({bytes.data(), bytes.size()});
+    auto palette = default_palette();
+    const auto name = upper(path.filename().string());
+    const bool external_only = name.compare(0, 4, "CPIC") == 0 && name != "CPIC.TLB";
+    if (external_only || name == "CBODY.TLB") {
+        if (const auto companion = combat_palette_path(path))
+            load_combat_palette(*companion, palette);
+        else if (external_only)
+            throw std::runtime_error("This TLB combat icon requires DUNGCOM.TLB for its palette");
+    }
+    PictureArchive result;
+    if (library.data.tag(12, "TILE")) {
+        read_tiles(library, external_only, palette, result);
+    } else if (library.data.tag(12, "HLIB")) {
+        for (std::size_t i = library.first_item(); i < library.ids.size(); ++i) {
+            const Library member(library.item(i));
+            read_tiles(member, false, palette, result, library.ids[i].value_or(i));
+        }
+    } else {
+        throw std::runtime_error("Unsupported TLB library content");
+    }
+    if (result.frames.empty())
+        throw std::runtime_error("The TLB library contains no supported graphics");
+    return result;
+}
+}
