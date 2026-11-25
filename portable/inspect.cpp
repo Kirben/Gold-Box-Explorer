@@ -74,7 +74,7 @@ int main(int argc, char** argv)
                               << record.bytes.size() << " decoded\n";
                 continue;
             }
-            const auto archive = wall ? goldbox::PictureArchive{goldbox::read_wall_pieces(argv[arg]), {}}
+            const auto archive = wall ? goldbox::read_wall_archive(argv[arg])
                 : tlb ? goldbox::read_tlb(argv[arg])
                 : glb ? goldbox::read_geo_glb(argv[arg])
                 : cmp ? goldbox::read_cmp(argv[arg])

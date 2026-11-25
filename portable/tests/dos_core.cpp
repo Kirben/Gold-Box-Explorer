@@ -233,6 +233,23 @@ void tlb(const fs::path& dir)
     check(samples.size() == 1 && samples[0].fields.back().second == "2",
           "Amiga GLIB sample metadata mismatch");
 
+    const Bytes span_tile{0,1,0,0,0,0,1,3, 0,3,0,1, 0x41,0x80,0, 0x80,0,0,0};
+    const auto plain = tlb_library("TILE", {amiga_palette, span_tile}, false, true);
+    Bytes packed(plain.begin(), plain.begin() + 16);
+    packed[10] = 5;
+    packed.insert(packed.end(), {0, 0});
+    for (std::size_t at = 16; at < plain.size();) {
+        const auto count = std::min<std::size_t>(plain.size() - at, 15);
+        packed.push_back(static_cast<std::uint8_t>(0xd0 + count));
+        packed.insert(packed.end(), plain.begin() + at, plain.begin() + at + count);
+        at += count;
+    }
+    packed.push_back(255);
+    write(amiga_path, packed);
+    const auto spans = read_tlb(amiga_path);
+    check(spans.frames.size() == 1 && spans.frames[0].rgba[3] == 255 &&
+          spans.frames[0].rgba[7] == 0, "Amiga LZ library or blended span decode mismatch");
+
     const Bytes palette{5, 0, 32, 0, 1, 0, 0, 24, 10, 20, 30};
     const auto tile = tlb_library("TILE", {palette, tlb_image(16, {32, 0, 32, 0}),
         tlb_image(17, {255, 0, 0, 0, 32, 32, 32, 32}), tlb_image(18, {253, 32}),

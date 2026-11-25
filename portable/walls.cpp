@@ -1,6 +1,7 @@
 #include "walls.h"
 #include "amiga_pictures.h"
 #include "ecl_containers.h"
+#include "tlb.h"
 
 #include <algorithm>
 #include <cctype>
@@ -192,8 +193,101 @@ private:
 
 bool is_wall_archive(const fs::path& path)
 {
-    static const std::regex name(R"(WALLDEF[0-9]*\.DAX)", std::regex::icase);
+    static const std::regex name(R"(WALLDEF[0-9]*\.(DAX|GLB))", std::regex::icase);
     return std::regex_match(path.filename().string(), name);
+}
+
+PictureArchive read_wall_archive(const fs::path& path)
+{
+    if (upper(path.extension().string()) != ".GLB")
+        return {read_wall_pieces(path), {}};
+
+    const auto folder = fs::absolute(path).parent_path();
+    std::vector<fs::path> folders{folder, folder.parent_path()};
+    auto is_disk = [](const fs::path& dir) {
+        const auto name = upper(dir.filename().string());
+        return name.size() >= 5 && name.compare(0, 4, "DISK") == 0 &&
+               std::all_of(name.begin() + 4, name.end(), [](unsigned char c) { return std::isalnum(c); });
+    };
+    auto add_disks = [&](const fs::path& root) {
+        for (const auto& entry : fs::directory_iterator(root))
+            if (entry.is_directory() && is_disk(entry.path()) &&
+                std::find(folders.begin(), folders.end(), entry.path()) == folders.end())
+                folders.push_back(entry.path());
+    };
+    add_disks(folder.parent_path());
+    if (is_disk(folder) && is_disk(folder.parent_path())) {
+        add_disks(folder.parent_path().parent_path());
+        const auto count = folders.size();
+        for (std::size_t i = 2; i < count; ++i) {
+            const auto dir = folders[i];
+            add_disks(dir);
+        }
+    }
+
+    std::map<unsigned, std::vector<Frame>> tiles;
+    for (const auto& dir : folders) {
+        for (const auto& entry : fs::directory_iterator(dir)) {
+            const auto name = upper(entry.path().filename().string());
+            if (name != "WALLS.TLB" && name != "8X8D.TLB" && name != "8X8DA.TLB" &&
+                name != "8X8DB.TLB" && name != "8X8DC.TLB")
+                continue;
+            try {
+                auto archive = read_tlb(entry.path());
+                for (auto& frame : archive.frames) {
+                    if (frame.width != 8 || frame.height != 8)
+                        continue;
+                    auto& bank = tiles[frame.id];
+                    if (bank.size() <= frame.index)
+                        bank.resize(frame.index + 1);
+                    if (bank[frame.index].rgba.empty())
+                        bank[frame.index] = std::move(frame);
+                }
+            } catch (const std::runtime_error&) {
+                // Some titles use separate shared and area-specific banks.
+            }
+        }
+    }
+    PictureArchive result;
+    for (const auto& record : read_amiga_glb(path, "DATA")) {
+        if (record.bytes.empty() || record.bytes.size() % 780) {
+            result.skipped_ids.push_back(record.id);
+            continue;
+        }
+        auto append = [&](std::vector<const Frame*>& bank, unsigned id) {
+            const auto found = tiles.find(id);
+            if (found != tiles.end())
+                for (const auto& tile : found->second)
+                    bank.push_back(tile.rgba.empty() ? nullptr : &tile);
+        };
+        auto fits = [&](const std::vector<const Frame*>& bank) {
+            return std::all_of(record.bytes.begin(), record.bytes.end(), [&](auto index) {
+                return index == 0 || (index < bank.size() && bank[index]);
+            });
+        };
+        std::vector<const Frame*> bank{nullptr};
+        append(bank, record.id);
+        if (bank.size() == 257)
+            bank.erase(bank.begin() + 1);
+        if (bank.size() < 255 || !fits(bank)) {
+            bank.resize(1);
+            append(bank, 203);
+            const auto sets = record.bytes.size() / 780;
+            if (tiles.count(record.id))
+                append(bank, record.id);
+            else
+                for (unsigned part = 1; part <= sets; ++part)
+                    append(bank, record.id * 10 + part);
+        }
+        if (!fits(bank)) {
+            result.skipped_ids.push_back(record.id);
+            continue;
+        }
+        auto pieces = compose_pieces(record, bank, true);
+        result.frames.insert(result.frames.end(), std::make_move_iterator(pieces.begin()),
+                             std::make_move_iterator(pieces.end()));
+    }
+    return result;
 }
 
 std::vector<Frame> read_wall_pieces(const fs::path& path)

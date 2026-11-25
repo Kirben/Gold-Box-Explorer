@@ -230,6 +230,135 @@ std::vector<RecordRow> amiga_record_rows(const std::vector<DaxRecord>& records, 
     return rows;
 }
 
+std::vector<std::uint8_t> unpack_amiga_monster(const std::vector<std::uint8_t>& packed, unsigned start)
+{
+    std::vector<std::uint8_t> bytes;
+    for (std::size_t at = start; at < packed.size();) {
+        const auto code = packed[at++];
+        if (code == 128)
+            continue;
+        const unsigned count = code < 128 ? code + 1 : 257 - code;
+        const unsigned input = code < 128 ? count : 1;
+        if (input > packed.size() - at || count > 4096 - bytes.size())
+            return {};
+        if (code < 128)
+            bytes.insert(bytes.end(), packed.begin() + at, packed.begin() + at + input);
+        else
+            bytes.insert(bytes.end(), count, packed[at]);
+        at += input;
+    }
+    return bytes;
+}
+
+RecordRow later_amiga_monster(const DaxRecord& record)
+{
+    const auto& original = record.bytes;
+    std::vector<std::uint8_t> expanded;
+    unsigned name_offset = 0;
+    if (original.size() != 422 && original.size() != 440) {
+        if (original.size() >= 2 && original[0] >= 1 && original[0] <= 4) {
+            expanded = unpack_amiga_monster(original, 2);
+            if (expanded.size() == amiga_word(original.data(), 0) && expanded.size() >= 124)
+                name_offset = 96;
+            else
+                expanded.clear();
+        }
+        if (expanded.empty()) {
+            expanded = unpack_amiga_monster(original, 0);
+            if (expanded.size() != 422 && expanded.size() != 440)
+                throw std::runtime_error("Unsupported packed Amiga monster record");
+        }
+    }
+    const auto& bytes = expanded.empty() ? original : expanded;
+    const auto* b = bytes.data();
+    auto name = name_offset ? amiga_name(b + name_offset, 16) : amiga_name(b + 1, std::min<unsigned>(b[0], 15));
+    RecordRow row{record.id, 0, std::move(name), {{"Format", "Amiga GLIB creature"}}};
+    if (row.name.empty())
+        row.name = "Monster " + std::to_string(record.id);
+    field(row, "Stored bytes", original.size());
+    field(row, "Decoded bytes", bytes.size());
+    constexpr const char* stats[]{"Strength", "Intelligence", "Wisdom", "Dexterity", "Constitution", "Charisma"};
+    for (unsigned i = 0; i < std::size(stats); ++i) {
+        const auto at = name_offset + 16 + 2 * i;
+        amiga_field(row, at, std::string(stats[i]) + " (base)", std::to_string(b[at]));
+        amiga_field(row, at + 1, std::string(stats[i]) + " (current)", std::to_string(b[at + 1]));
+    }
+    for (unsigned at = 0; at < bytes.size(); at += 16)
+        amiga_field(row, at, "Decoded bytes", raw_bytes(b, at, std::min<unsigned>(16, bytes.size() - at)));
+    return row;
+}
+
+std::vector<RecordRow> later_amiga_records(const std::filesystem::path& path, RecordKind kind)
+{
+    const auto records = read_amiga_glb(path, nullptr);
+    std::map<unsigned, std::string> owners;
+    if (kind == RecordKind::inventory || kind == RecordKind::monster_effects) {
+        const auto folder = path.has_parent_path() ? path.parent_path() : std::filesystem::path(".");
+        for (const auto& entry : std::filesystem::directory_iterator(folder)) {
+            if (upper(entry.path().filename().string()) != "MONCHA.GLB")
+                continue;
+            for (const auto& owner : read_amiga_glb(entry.path(), nullptr)) {
+                if (!owner.bytes.empty()) {
+                    try {
+                        owners.emplace(owner.id, later_amiga_monster(owner).name);
+                    } catch (const std::runtime_error&) {
+                        // An inventory remains readable when its owner record is unknown.
+                    }
+                }
+            }
+            break;
+        }
+    }
+    std::vector<RecordRow> rows;
+    for (const auto& record : records) {
+        if (record.bytes.empty())
+            continue;
+        if (kind == RecordKind::monsters) {
+            rows.push_back(later_amiga_monster(record));
+            continue;
+        }
+        const bool effect_record = kind == RecordKind::monster_effects;
+        const unsigned stride = effect_record ? 9 : 63;
+        const auto count = record.bytes.size() / stride;
+        const auto trailing = record.bytes.size() % stride;
+        if (trailing && (trailing != 1 || !(count * stride & 1)))
+            throw std::runtime_error("Unexpected Amiga GLIB record stride");
+        for (unsigned slot = 0; slot < count; ++slot) {
+            const auto* b = record.bytes.data() + slot * stride;
+            RecordRow row{record.id, slot, {}, {{"Format", effect_record ? "Amiga GLIB effect" : "Amiga GLIB item"}}};
+            if (const auto owner = owners.find(record.id); owner != owners.end())
+                row.fields.emplace_back("Owner", owner->second);
+            if (effect_record) {
+                row.name = "Effect " + std::to_string(b[0]);
+                field(row, "Effect ID", b[0]);
+                field(row, "Stored duration", amiga_word(b, 1));
+                field(row, "Strength / effect data", b[3]);
+                field(row, "Removal callback", b[4]);
+                row.fields.emplace_back("Runtime next pointer", raw_bytes(b, 5, 4));
+            } else {
+                row.name = amiga_name(b + 1, std::min<unsigned>(b[0], 40));
+                if (row.name.empty())
+                    row.name = "Item type " + std::to_string(b[46]);
+                field(row, "Type", b[46]);
+                row.fields.emplace_back("Name component IDs", std::to_string(b[49]) + ", " +
+                                        std::to_string(b[48]) + ", " + std::to_string(b[47]));
+                field(row, "Magic bonus", signed_byte(b[50]));
+                field(row, "Save bonus", signed_byte(b[51]));
+                field(row, "Readied", b[52]);
+                field(row, "Unidentified mask", b[53]);
+                field(row, "Cursed", b[54]);
+                field(row, "Weight", amiga_word(b, 55));
+                field(row, "Quantity", b[57]);
+                field(row, "Value", amiga_word(b, 58));
+                row.fields.emplace_back("Charges / effect / special", raw_bytes(b, 60, 3));
+            }
+            row.fields.emplace_back("Stored record bytes", raw_bytes(b, 0, stride));
+            rows.push_back(std::move(row));
+        }
+    }
+    return rows;
+}
+
 bool merged(const std::vector<DaxRecord>& records)
 {
     return std::any_of(records.begin(), records.end(), [](const auto& record) {
@@ -588,14 +717,14 @@ RecordKind record_kind(const std::filesystem::path& path)
     const auto name = upper(path.filename().string());
     if (name == "STRINGS.GLB") return RecordKind::amiga_text;
     if (name == "SOUNDS.GLB") return RecordKind::amiga_sound;
-    static const std::regex monster_name(R"(MON[0-9]*(CHA|ITM|SPC)\.DAX)");
+    static const std::regex monster_name(R"(MON[0-9]*(CHA|ITM|SPC)\.(DAX|GLB))");
     std::smatch match;
     if (std::regex_match(name, match, monster_name)) {
         if (match[1] == "CHA") return RecordKind::monsters;
         if (match[1] == "ITM") return RecordKind::inventory;
         return RecordKind::monster_effects;
     }
-    static const std::regex item_name(R"(ITEM[0-9]*\.DAX)");
+    static const std::regex item_name(R"(ITEM[0-9]*\.(DAX|GLB))");
     if (std::regex_match(name, item_name)) return RecordKind::items;
     const auto extension = upper(path.extension().string());
     const auto stem = upper(path.stem().string());
@@ -644,6 +773,8 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
     if (kind == RecordKind::saved_character || kind == RecordKind::saved_inventory ||
         kind == RecordKind::saved_effects)
         return read_save_rows(path, kind);
+    if (upper(path.extension().string()) == ".GLB")
+        return later_amiga_records(path, kind);
     auto records = try_amiga_dax(path);
     const bool amiga = !records.empty();
     if (!amiga)

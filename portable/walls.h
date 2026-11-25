@@ -8,6 +8,7 @@
 namespace goldbox {
 bool is_wall_archive(const std::filesystem::path& path);
 std::vector<Frame> read_wall_pieces(const std::filesystem::path& path);
+PictureArchive read_wall_archive(const std::filesystem::path& path);
 
 // The three banks are laid out in the same order as the map's wall types.
 using WallBanks = std::array<std::vector<Frame>, 3>;

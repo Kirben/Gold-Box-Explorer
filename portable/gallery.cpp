@@ -806,7 +806,7 @@ private:
                         static_cast<unsigned long long>(hex_->size())));
                     return;
                 }
-                auto archive = wall ? goldbox::PictureArchive{goldbox::read_wall_pieces(path), {}}
+                auto archive = wall ? goldbox::read_wall_archive(path)
                                     : tlb ? goldbox::read_tlb(path)
                                     : glb ? goldbox::read_geo_glb(path)
                                     : cmp ? goldbox::read_cmp(path)

@@ -153,8 +153,11 @@ std::vector<DaxRecord> try_amiga_glb(const Bytes& file, const char* content)
     const auto count = be16(file, 8);
     const auto flags = be16(file, 10);
     const auto table_end = 16 + 4 * (count + 1);
+    const auto tag = [&](const char* name) {
+        return std::equal(file.begin() + 12, file.begin() + 16, name);
+    };
     if (file.size() != be32(file, 4) || flags > 1 ||
-        !std::equal(file.begin() + 12, file.begin() + 16, content) ||
+        (content ? !tag(content) : !tag("DATA") && !tag("GLIB") && !tag("HLIB")) ||
         !count || table_end > file.size())
         throw std::runtime_error("Invalid Amiga GLIB header");
     std::vector<std::uint32_t> offsets;

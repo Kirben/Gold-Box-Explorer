@@ -5,6 +5,7 @@
 #include <cctype>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 
@@ -73,10 +74,127 @@ struct Slice {
     }
 };
 
+Bytes expand_amiga_library(Slice packed)
+{
+    const auto size = packed.dword(4);
+    if (size < 20 || size > 64 * 1024 * 1024)
+        throw std::runtime_error("Invalid expanded Amiga GLIB size");
+    const auto header = packed.part(0, 16);
+    Bytes out(header.data, header.data + header.size);
+    out[10] = 0;
+    out.reserve(size);
+    std::size_t at = 18; // The word after the header is the in-place expansion margin.
+    if (packed.byte(10) == 3) {
+        std::array<unsigned, 1024> prefix{};
+        std::array<std::uint8_t, 1024> suffix{};
+        std::array<int, 1024> used{};
+        unsigned next = 256;
+        while (out.size() < size) {
+            const auto end = std::min<std::size_t>(size, out.size() + 8192);
+            unsigned buffer = 0, bits = 0;
+            auto get_code = [&] {
+                while (bits < 10) {
+                    buffer = (buffer << 8) | packed.byte(at++);
+                    bits += 8;
+                }
+                bits -= 10;
+                return (buffer >> bits) & 1023;
+            };
+            auto emit = [&](unsigned code) {
+                std::array<std::uint8_t, 768> reversed{};
+                unsigned count = 0;
+                while (code >= 256) {
+                    if (!used[code] || count == reversed.size())
+                        throw std::runtime_error("Invalid Amiga GLIB LZW code");
+                    reversed[count++] = suffix[code];
+                    code = prefix[code];
+                }
+                if (count + 1 > end - out.size())
+                    throw std::runtime_error("Amiga GLIB LZW data exceeds its block");
+                out.push_back(static_cast<std::uint8_t>(code));
+                while (count)
+                    out.push_back(reversed[--count]);
+                return static_cast<std::uint8_t>(code);
+            };
+            auto previous = get_code();
+            emit(previous);
+            while (out.size() < end) {
+                const auto code = get_code();
+                const auto first = emit(code);
+                if (next == 1024) {
+                    unsigned freed = 0;
+                    while (freed < 85) {
+                        for (unsigned i = 256; i < used.size(); ++i) {
+                            if (used[i] < 0 && i != previous) {
+                                used[i] = 0;
+                                ++freed;
+                                next = std::min(next, i);
+                            } else if (used[i] > 0) {
+                                used[i] = -1;
+                            }
+                        }
+                        for (unsigned i = 256; i < used.size(); ++i)
+                            if (used[i])
+                                used[prefix[i]] = 1;
+                    }
+                }
+                prefix[next] = previous;
+                suffix[next] = first;
+                used[previous] = 1;
+                used[next] = -1;
+                do {
+                    ++next;
+                } while (next < used.size() && used[next]);
+                previous = code;
+            }
+        }
+        return out;
+    }
+    while (out.size() < size) {
+        const auto end = std::min<std::size_t>(size, out.size() + 8192);
+        for (;;) {
+            const auto code = packed.byte(at++);
+            if (code == 255)
+                break;
+            unsigned literal, repeat = 0, distance = 0;
+            if (code < 128) {
+                const auto next = packed.byte(at++);
+                literal = (next >> 3) & 3;
+                repeat = (next & 7) + 3;
+                distance = ((next >> 5) * 128 + code) + 1;
+            } else if (code < 192) {
+                const auto second = packed.byte(at++);
+                const auto third = packed.byte(at++);
+                literal = third & 3;
+                repeat = (second & 31) + 3;
+                distance = ((third >> 2) * 512 + (second >> 5) * 64 + (code & 63)) + 1;
+            } else {
+                literal = code < 208 ? 4 * ((code & 15) + 1) : code & 15;
+            }
+            if (literal + repeat > end - out.size())
+                throw std::runtime_error("Amiga GLIB LZ data exceeds its block");
+            const auto bytes = packed.part(at, literal);
+            out.insert(out.end(), bytes.data, bytes.data + literal);
+            at += literal;
+            if (repeat && distance > out.size() - 16)
+                throw std::runtime_error("Invalid Amiga GLIB LZ back-reference");
+            for (unsigned i = 0; i < repeat; ++i)
+                out.push_back(out[out.size() - distance]);
+        }
+        if (out.size() != end)
+            throw std::runtime_error("Truncated Amiga GLIB LZ block");
+    }
+    return out;
+}
+
 struct Library {
     explicit Library(Slice source) : data(source)
     {
         data.big_endian = data.tag(0, "GLIB");
+        if (data.big_endian && (data.byte(10) == 3 || data.byte(10) == 5)) {
+            storage = std::make_shared<Bytes>(expand_amiga_library(data));
+            data = {storage->data(), storage->size(), true};
+        }
         if ((!data.big_endian && !data.tag(0, "HLIB")) || data.byte(10) != 0)
             throw std::runtime_error("Unsupported TLB library header");
         const auto size = data.dword(4);
@@ -116,6 +234,7 @@ struct Library {
     unsigned first_item() const { return data.byte(11) == 1 ? 1 : 0; }
 
     Slice data;
+    std::shared_ptr<Bytes> storage;
     std::vector<std::uint32_t> offsets;
     std::vector<std::optional<unsigned>> ids;
     std::vector<std::pair<unsigned, unsigned>> directory;
@@ -287,6 +406,8 @@ struct Component {
     Frame frame;
 };
 
+Frame amiga_tile(Slice record, unsigned id, unsigned index, const Palette& palette);
+
 // Type 25 draws an ordered list of references to other glyphs in the same TILE.
 void place_glyph(const Library& library, unsigned item, int x, int y, const Palette& palette,
                  std::vector<Component>& components, unsigned depth)
@@ -297,6 +418,15 @@ void place_glyph(const Library& library, unsigned item, int x, int y, const Pale
     x -= image.signed_word(4);
     y -= image.signed_word(2);
     const auto method = image.byte(7);
+    if (library.data.big_endian && method != 25) {
+        switch (method) {
+        case 0: case 1: case 2: case 3: case 210: case 224: case 225: case 226: case 227:
+            components.push_back({x, y, amiga_tile(image, 0, 0, palette)});
+            return;
+        default:
+            throw std::runtime_error("Unsupported Amiga composite component");
+        }
+    }
     switch (method) {
     case 25:
         for (unsigned i = 0, count = 1; i < count; ++i) {
@@ -389,16 +519,54 @@ Frame amiga_tile(Slice record, unsigned id, unsigned index, const Palette& palet
     if (!stride || !height || height > 1024)
         throw std::runtime_error("Invalid Amiga TILE dimensions");
     const unsigned colors = method >= 224 ? 5 : 4;
-    const bool masked = method == 1 || method == 225;
+    const bool spans = method == 3 || method == 227;
+    const bool masked = method == 1 || method == 225 || spans;
     const auto span = stride * height;
     const auto required = span * (colors + masked);
     Bytes unpacked;
     const std::uint8_t* data;
-    if (method == 2 || method == 226) {
+    if (spans) {
+        const auto code_size = record.word(8);
+        const auto plane_size = record.word(10);
+        const auto codes = record.part(12, code_size);
+        unpacked.resize(required);
+        std::fill_n(unpacked.begin(), span, 255);
+        std::array<Slice, 5> planes{};
+        for (unsigned plane = 0; plane < colors; ++plane)
+            planes[plane] = record.part(12 + code_size + plane_size * plane, plane_size);
+        unsigned at = 0, pixel = 0;
+        for (unsigned row = 0; row < height; ++row) {
+            unsigned col = 0;
+            for (auto code = codes.byte(at++); code; code = codes.byte(at++)) {
+                const unsigned count = code & 63;
+                const auto kind = code >> 6;
+                if (count > stride - col)
+                    throw std::runtime_error("Amiga TILE span exceeds row width");
+                const auto masks = kind == 1 ? codes.part(at, count).data : nullptr;
+                if (masks)
+                    at += count;
+                if (kind) {
+                    for (unsigned i = 0; i < count; ++i) {
+                        const unsigned index = row * stride + col + i;
+                        const auto mask = masks ? masks[i] : 255;
+                        unpacked[index] = static_cast<std::uint8_t>(~mask);
+                        for (unsigned plane = 0; plane < colors; ++plane)
+                            unpacked[(plane + 1) * span + index] =
+                                planes[plane].byte(pixel + (kind == 2 ? 0 : i)) & mask;
+                    }
+                    pixel += kind == 2 ? 1 : count;
+                }
+                col += count;
+            }
+        }
+        data = unpacked.data();
+    } else if (method == 2 || method == 210 || method == 226) {
         std::size_t at = 8;
         unpacked.reserve(required);
         while (unpacked.size() < required) {
             const auto code = record.byte(at++);
+            if (code == 128)
+                continue;
             const auto count = code < 128 ? code + 1 : 257 - code;
             if (count > required - unpacked.size())
                 throw std::runtime_error("Amiga TILE run exceeds image dimensions");
@@ -410,11 +578,12 @@ Frame amiga_tile(Slice record, unsigned id, unsigned index, const Palette& palet
                 unpacked.insert(unpacked.end(), count, record.byte(at++));
             }
         }
-        if (record.size - at > 1)
+        // Later title glyphs include up to eight bytes of trailing placement data plus alignment.
+        if (record.size - at > 9)
             throw std::runtime_error("Unexpected data after Amiga TILE runs");
         data = unpacked.data();
     } else {
-        if (record.size != 8 + required)
+        if (record.size != 8 + required && (!(required & 1) || record.size != 9 + required))
             throw std::runtime_error("Unexpected Amiga planar TILE size");
         data = record.part(8, required).data;
     }
@@ -448,12 +617,18 @@ void append_amiga_tiles(const Library& library, Palette palette, PictureArchive&
         const auto tile = library.item(i);
         if (tile.size < 8 || amiga_palette(tile, palette))
             continue;
+        if (tile.size == 8 && tile.byte(6) == 255) {
+            ++index;
+            continue;
+        }
         const auto id = group.value_or(library.ids[i].value_or(i));
         const auto method = tile.byte(7);
         switch (method) {
-        case 0: case 1: case 2: case 224: case 225: case 226:
+        case 0: case 1: case 2: case 3: case 210: case 224: case 225: case 226: case 227:
+        case 25:
             try {
-                result.frames.push_back(amiga_tile(tile, id, group ? index : 0, palette));
+                result.frames.push_back(method == 25 ? compose_glyph(library, i, id, group ? index : 0, palette) :
+                    amiga_tile(tile, id, group ? index : 0, palette));
             } catch (const std::runtime_error&) {
                 result.skipped_ids.push_back(id);
             }
