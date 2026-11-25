@@ -955,6 +955,23 @@ void c64_assets(const fs::path& dir)
     check(rows.size() == 1 && rows[0].id == 2 && has_field(rows[0], {"Weight","4660"}) &&
           has_field(rows[0], {"Magic bonus","-1"}) && has_field(rows[0], {"Hidden name mask","7"}),
           "C64 native item record offsets or flags disagree");
+    const auto numbered_items = dir / "item10.prg";
+    item[0] = 0;
+    item[1] = 0x40;
+    write(numbered_items, item);
+    const auto numbered_rows = read_record_rows(numbered_items);
+    check(numbered_rows.size() == 1 && numbered_rows[0].id == 0x10 &&
+          numbered_rows[0].fields == rows[0].fields, "C64 numbered item bank routing");
+
+    Bytes map(1026);
+    map[1] = 4;
+    map[2] = 0x10;
+    const auto alternate = dir / "GE031.PRG";
+    write(alternate, map);
+    const auto view = read_c64_picture(alternate);
+    check(is_c64_picture(alternate) && view.frames.size() == 1 &&
+          view.frames[0].id == 0x31 && view.frames[0].width == 193 &&
+          view.frames[0].rgba[0] == 255, "Gateway alternate map routing or wall pixel");
 
     picture[1] = 0x40;
     write(pic, picture);
@@ -1030,6 +1047,21 @@ void c64_assets(const fs::path& dir)
           duration >= 92 && duration <= 95 &&
           read_c64_picture(spell_bank).clips.size() == spell.clips.size(),
           "C64 animated spell order, palette cycling or PAL flight timing changed");
+
+    Bytes buck_art(3198);
+    buck_art[1] = 0x40;
+    for (unsigned tile = 250; tile < 430; tile += 18)
+        std::fill_n(buck_art.begin() + tile, 9, 32);
+    buck_art[736] = 0x80;
+    write(spell_bank, buck_art);
+    const auto primary = read_c64_picture(spell_bank);
+    for (const auto* name : {"SPELLE67.PRG", "SPELLE68.PRG", "SPELLE69.PRG"}) {
+        const auto path = dir / name;
+        write(path, buck_art);
+        const auto gallery = read_c64_picture(path);
+        check(is_c64_picture(path) && gallery.gallery_count() == 37 && gallery.clips.empty() &&
+              gallery.frames[10].rgba == primary.frames[10].rgba, "Buck Rogers alternate artwork bank");
+    }
 }
 }
 

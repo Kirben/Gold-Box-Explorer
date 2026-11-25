@@ -802,7 +802,7 @@ void spell_flight(PictureArchive& archive, unsigned id, const std::uint8_t* spri
     archive.clips.push_back(std::move(clip));
 }
 
-PictureArchive later_spell_art(const Bytes& bytes)
+PictureArchive later_spell_art(const Bytes& bytes, bool animate = true)
 {
     unsigned tile_end, sprite_start;
     const bool buck = bytes.size() == 3198;
@@ -859,8 +859,9 @@ PictureArchive later_spell_art(const Bytes& bytes)
         sprite(skull, 0, 0, sprites + 20 * 64, 2, 0, 0);
         result.frames.push_back(std::move(skull));
     }
-    for (unsigned style = 0; style < style_count; ++style)
-        spell_flight(result, style + 1, sprites, styles[style]);
+    if (animate)
+        for (unsigned style = 0; style < style_count; ++style)
+            spell_flight(result, style + 1, sprites, styles[style]);
     return result;
 }
 
@@ -1129,7 +1130,12 @@ PictureArchive ending(const fs::path& path, const Bytes& bytes)
 }
 
 const std::regex graphics(R"(^(GEO|HEAD|BODY|PIC|SPRITE|COMPIC|CHARPIC|SECSET|WALLSET|WALLDEF|WALLS|SQRDATA)([0-9A-F]{2})\.PRG$)");
-const std::regex records(R"(^(MON|ITEMFILE)([0-9A-F]{2})\.PRG$)");
+const std::regex records(R"(^(MON|ITEM(?:FILE)?)([0-9A-F]{2})\.PRG$)");
+
+bool is_extra_buck_spell_bank(const std::string& name)
+{
+    return name == "SPELLE67.PRG" || name == "SPELLE68.PRG" || name == "SPELLE69.PRG";
+}
 }
 
 bool is_c64_picture(const fs::path& path)
@@ -1138,6 +1144,7 @@ bool is_c64_picture(const fs::path& path)
     return name == "TITLEPG.PRG" || name == "INIT.PRG" || name == "CHARSET.PRG" ||
            name == "SPR.TP" || name == "SPELLE65.PRG" || name == "SPELLE66.PRG" || name == "SPELLE64.PRG" ||
            name == "COM.PREP.PRG" || name == "SQRPACI00.PRG" || name == "FINAL.PRG" ||
+           name == "GE031.PRG" || is_extra_buck_spell_bank(name) ||
            std::regex_match(name, graphics);
 }
 
@@ -1374,6 +1381,12 @@ PictureArchive read_c64_picture(const fs::path& path)
         return combat_terrain(bytes);
     } else if (name == "SPELLE66.PRG") {
         return later_spell_art(bytes);
+    } else if (is_extra_buck_spell_bank(name)) {
+        if (bytes.size() != 3198 || word(bytes, 0) != 0x4000)
+            throw std::runtime_error("Invalid Buck Rogers combat artwork bank");
+        return later_spell_art(bytes, false);
+    } else if (name == "GE031.PRG") {
+        result.frames.push_back(map_image(bytes, 0x31));
     } else if (name == "SPELLE64.PRG") {
         return character_picker(path, bytes);
     } else if (name == "COM.PREP.PRG") {
