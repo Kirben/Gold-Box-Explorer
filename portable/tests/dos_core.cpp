@@ -515,6 +515,43 @@ void records(const fs::path& dir)
     check(inventory.size() == 1 && has_field(inventory[0], {"Owner", "Orc"}), "Missing inventory owner");
 }
 
+void item_archives(const fs::path& dir)
+{
+    auto named = item();
+    named[0] = 3;
+    named[1] = 'A';
+    named[2] = 'x';
+    named[3] = 'e';
+    dax(dir / "item3.dax", 4, named);
+    const auto loose = read_record_rows(dir / "item3.dax");
+    check(loose.size() == 1 && loose[0].id == 4 && loose[0].name == "Axe" &&
+          has_field(loose[0], {"Magic bonus", "-1"}) &&
+          record_kind("ITEMS.DAX") == RecordKind::none, "Wrong numbered item routing or fields");
+
+    const auto path = dir / "ITEM0.DAX";
+    Bytes compact(254 * 17);
+    compact[0] = 1;
+    compact[3] = 18;
+    compact[9] = 21;
+    compact[17] = 255;
+    dax(path, 1, compact);
+    const auto templates = read_record_rows(path);
+    check(templates.size() == 254 && templates[0].name == "Long Sword" &&
+          has_field(templates[0], {"Weight", "21"}) && templates[1].name == "Empty template",
+          "Wrong late Gold Box item template layout");
+
+    Bytes buck(127 * 16);
+    buck[0] = 2;
+    buck[6] = 128;
+    buck[8] = 34;
+    buck[11] = 5;
+    dax(path, 1, buck);
+    const auto gear = read_record_rows(path);
+    check(gear.size() == 127 && has_field(gear[0], {"Equipped", "1"}) &&
+          has_field(gear[0], {"Weight", "34"}) && has_field(gear[0], {"Value (credits)", "5"}),
+          "Wrong Buck Rogers item template layout");
+}
+
 void numbered_monsters(const fs::path& dir)
 {
     auto older = character();
@@ -667,6 +704,7 @@ int main(int argc, char** argv)
         else if (name == "anm") anm(dir);
         else if (name == "vault") vault(dir);
         else if (name == "monsters") numbered_monsters(dir);
+        else if (name == "items") item_archives(dir);
         else if (name == "vace") vace(dir);
         else if (name == "geo") geo(dir);
         else if (name == "walls") walls(dir);

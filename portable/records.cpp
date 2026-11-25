@@ -226,11 +226,18 @@ RecordRow item(unsigned id, unsigned slot, const std::uint8_t* b, const std::str
 RecordRow compact_item(unsigned id, unsigned slot, const std::uint8_t* b, unsigned stride,
                        const std::string* owner)
 {
-    const bool buck = stride == 62;
-    RecordRow row{id, slot, buck ? name_at(b, 40) : std::string{}, {}};
-    if (buck)
+    const bool buck = stride == 62 || stride == 16;
+    RecordRow row{id, slot, stride == 62 ? name_at(b, 40) : std::string{}, {}};
+    if (stride == 62)
         b += 46;
-    else {
+    if (stride <= 17 && b[0] == 255) {
+        row.name = "Empty template";
+        field(row, "Record ID", id);
+        field(row, "Template index", slot + 1);
+        field(row, "Base item type", b[0]);
+        return row;
+    }
+    if (!buck) {
         for (unsigned offset : {3u, 2u, 1u}) {
             const auto code = b[offset];
             if (!code)
@@ -410,7 +417,8 @@ RecordKind record_kind(const std::filesystem::path& path)
         if (match[1] == "ITM") return RecordKind::inventory;
         return RecordKind::monster_effects;
     }
-    if (name == "ITEM.DAX") return RecordKind::items;
+    static const std::regex item_name(R"(ITEM[0-9]*\.DAX)");
+    if (std::regex_match(name, item_name)) return RecordKind::items;
     const auto extension = upper(path.extension().string());
     const auto stem = upper(path.stem().string());
     if (extension == ".DAT" && (stem == "VAULT" ||
@@ -434,12 +442,15 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
         return read_save_rows(path, kind);
     const auto records = read_dax(path);
     const bool trailer = merged(records);
+    const auto filename = upper(path.filename().string());
     std::map<unsigned, std::string> owners;
     std::size_t owner_size = 0;
-    if (kind == RecordKind::inventory || kind == RecordKind::monster_effects) {
+    if (kind == RecordKind::inventory || kind == RecordKind::monster_effects ||
+        (kind == RecordKind::items && filename != "ITEM.DAX" && filename != "ITEM0.DAX")) {
         const auto folder = path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
-        auto companion = upper(path.filename().string());
-        companion.replace(companion.size() - 7, 3, "CHA");
+        const auto companion = kind == RecordKind::items
+            ? "MON" + filename.substr(4, filename.size() - 8) + "CHA.DAX"
+            : filename.substr(0, filename.size() - 7) + "CHA.DAX";
         for (const auto& entry : std::filesystem::directory_iterator(folder)) {
             if (upper(entry.path().filename().string()) != companion)
                 continue;
@@ -447,7 +458,8 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
                 for (const auto& record : read_dax(entry.path())) {
                     if (known_monster_size(record.bytes.size())) {
                         owner_size = record.bytes.size();
-                        owners.emplace(record.id, name_at(record.bytes.data(), 15));
+                        if (kind != RecordKind::items)
+                            owners.emplace(record.id, name_at(record.bytes.data(), 15));
                     }
                 }
             } catch (const std::exception&) {
@@ -457,19 +469,34 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
         }
     }
     unsigned stride = item_size;
+    const auto fits = [&](unsigned width) {
+        return std::all_of(records.begin(), records.end(), [&](const auto& record) {
+            return (trailer && record.id >= 253) || record.bytes.size() % width == 0;
+        });
+    };
     if (kind == RecordKind::monster_effects) {
         stride = effect_size;
+    } else if (kind == RecordKind::items && filename == "ITEM0.DAX") {
+        // Later games store an ITEM0 template table rather than named item instances.
+        const auto block = std::find_if(records.begin(), records.end(), [](const auto& record) {
+            return record.id == 1 && !record.bytes.empty();
+        });
+        if (block != records.end() && block->bytes.size() == 127 * 16 && fits(16))
+            stride = 16;
+        else if (block != records.end() && (block->bytes.size() == 127 * 17 ||
+                 block->bytes.size() == 254 * 17) && fits(17))
+            stride = 17;
+        else if (!fits(item_size)) {
+            if (fits(17) == fits(16))
+                throw std::runtime_error("Unrecognized DOS ITEM0 template record size");
+            stride = fits(17) ? 17 : 16;
+        }
     } else if (kind == RecordKind::inventory) {
         if (owner_size == 510) {
             stride = 17;
-        } else if (owner_size == 259 || owner_size == 263 || upper(path.filename().string()) == "MON0ITM.DAX") {
+        } else if (owner_size == 259 || owner_size == 263 || filename == "MON0ITM.DAX") {
             stride = 62;
-        } else if (!owner_size && upper(path.filename().string()) != "MONITM.DAX") {
-            const auto fits = [&](unsigned width) {
-                return std::all_of(records.begin(), records.end(), [&](const auto& record) {
-                    return (trailer && record.id >= 253) || record.bytes.size() % width == 0;
-                });
-            };
+        } else if (!owner_size && filename != "MONITM.DAX") {
             if (!fits(item_size) && fits(17))
                 stride = 17;
         }
@@ -492,7 +519,8 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
                 else if (stride != item_size)
                     rows.push_back(compact_item(record.id, slot, b, stride, owner));
                 else
-                    rows.push_back(item(record.id, slot, b, owner, !owner_size || owner_size == monster_size));
+                    rows.push_back(item(record.id, slot, b, owner, owner_size == monster_size ||
+                        (!owner_size && (kind != RecordKind::items || filename == "ITEM.DAX"))));
             }
         }
     }
