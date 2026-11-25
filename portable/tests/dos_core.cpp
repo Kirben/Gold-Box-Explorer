@@ -625,6 +625,31 @@ void records(const fs::path& dir)
     check(items.size() == 1 && has_field(items[0], {"Magic bonus", "-1"}), "Item bonus lost its sign");
     const auto inventory = read_record_rows(dir / "MONITM.DAX");
     check(inventory.size() == 1 && has_field(inventory[0], {"Owner", "Orc"}), "Missing inventory owner");
+
+    const auto ships = dir / "ships2.dax";
+    Bytes ship(108);
+    ship[0] = 5;
+    std::copy_n("Adder", 5, ship.begin() + 1);
+    ship[16] = 150;
+    ship[22] = 0x58;
+    ship[23] = 2;
+    ship[34] = 0xe8;
+    ship[35] = 3;
+    ship[55] = 255;
+    ship[57] = 6;
+    ship[60] = 0x83;
+    ship[61] = 3;
+    ship[62] = 2;
+    ship[64] = 50;
+    dax(ships, 41, ship);
+    const auto fleet = read_record_rows(ships);
+    check(fleet.size() == 1 && fleet[0].id == 41 && fleet[0].name == "Adder" &&
+          has_field(fleet[0], {"Hull (current / max)", "600 / 1000"}) &&
+          has_field(fleet[0], {"Reaction", "-1"}) &&
+          has_field(fleet[0], {"Ship type", "Md cruiser"}) &&
+          has_field(fleet[0], {"Mount 1", "Gyrocannon (crew)"}) &&
+          has_field(fleet[0], {"Mount 1 (working / max)", "2 / 3"}) &&
+          has_field(fleet[0], {"Mount 1 ammunition", "50"}), "SHIPS2.DAX ship fields changed");
 }
 
 void item_archives(const fs::path& dir)

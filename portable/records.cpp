@@ -907,6 +907,70 @@ std::vector<RecordRow> read_luck(const std::filesystem::path& path)
     return rows;
 }
 
+std::vector<RecordRow> read_countdown_ships(const std::filesystem::path& path)
+{
+    constexpr const char* systems[]{"Hull", "Sensors", "Control systems", "Life support", "Fuel", "Engines"};
+    constexpr const char* types[]{"", "Fighter", "Asterover", "Scout cruiser", "Lt freighter", "Hv freighter",
+        "Md cruiser", "Lt transport", "Hv transport", "Hv cruiser", "Space liner", "Battler"};
+    constexpr const char* races[]{"Monster", "Terran", "Martian", "Venusian", "Mercurian",
+        "Tinker", "Desert Runner", "Lunarian", "Lowlander"};
+    constexpr const char* weapons[]{"None", "Beam laser", "Pumped laser", "Gyrocannon",
+        "Missile mount", "Heavy missile mount", "K-cannon", "Light acceleration gun", "Heavy acceleration gun"};
+    const auto records = read_dax(path);
+    if (records.empty())
+        throw std::runtime_error("No Countdown ship records in SHIPS2.DAX");
+    std::vector<RecordRow> rows;
+    rows.reserve(records.size());
+    for (const auto& record : records) {
+        if (record.bytes.size() != 108 || record.bytes.front() > 15)
+            throw std::runtime_error("Invalid 108-byte Countdown ship record");
+        // The Amiga SHIPS2 archive preserves both the DOS directory and little-endian ship words.
+        const auto* b = record.bytes.data();
+        auto name = name_at(b, 15);
+        RecordRow row{record.id, 0, name.empty() ? "Ship " + std::to_string(record.id) : std::move(name), {}};
+        field(row, "Record ID", record.id);
+        field(row, "Tonnage", signed_word(word(b, 16)));
+        field(row, "Length", signed_word(word(b, 18)));
+        field(row, "Width", signed_word(word(b, 20)));
+        for (unsigned i = 0; i < std::size(systems); ++i)
+            row.fields.emplace_back(std::string(systems[i]) + " (current / max)",
+                std::to_string(signed_word(word(b, 22 + i * 2))) + " / " +
+                std::to_string(signed_word(word(b, 34 + i * 2))));
+        field(row, "Cargo", signed_word(word(b, 46)));
+        field(row, "Crew", signed_word(word(b, 48)));
+        field(row, "Armour class", signed_byte(b[50]));
+        field(row, "Pilot skill", b[51]);
+        field(row, "System skill", b[52]);
+        field(row, "Gunnery skill", b[53]);
+        field(row, "Base speed", signed_byte(b[54]));
+        field(row, "Reaction", signed_byte(b[55]));
+        field(row, "Manoeuvre", b[56]);
+        field(row, "Ship type ID", b[57]);
+        if (b[57] > 0 && b[57] < std::size(types))
+            row.fields.emplace_back("Ship type", types[b[57]]);
+        field(row, "Race ID", b[58]);
+        if (b[58] < std::size(races))
+            row.fields.emplace_back("Race", races[b[58]]);
+
+        for (unsigned i = 0; i < 8; ++i) {
+            const auto* mount = b + 60 + i * 6;
+            const unsigned kind = mount[0] & 0x7f;
+            if (!kind)
+                continue;
+            const auto label = "Mount " + std::to_string(i + 1);
+            const auto weapon = kind < std::size(weapons) ? std::string(weapons[kind]) :
+                "Weapon type " + std::to_string(kind);
+            row.fields.emplace_back(label, weapon + ((mount[0] & 0x80) ? " (crew)" : " (pilot)"));
+            row.fields.emplace_back(label + " (working / max)",
+                std::to_string(mount[2]) + " / " + std::to_string(mount[1]));
+            row.fields.emplace_back(label + " ammunition", std::to_string(mount[4]));
+            row.fields.emplace_back(label + " reloads", std::to_string(mount[5]));
+        }
+        rows.push_back(std::move(row));
+    }
+    return rows;
+}
+
 std::vector<RecordRow> read_vault(const std::filesystem::path& path)
 {
     constexpr unsigned header_size = 16;
@@ -1033,6 +1097,7 @@ RecordKind record_kind(const std::filesystem::path& path)
         return RecordKind::c64;
     const auto name = upper(path.filename().string());
     if (name == "LUCK.DAX" || name == "LUCK.GLB") return RecordKind::luck;
+    if (name == "SHIPS2.DAX") return RecordKind::countdown_ships;
     if (name == "ITEMS" || name == "ITEMS.1") return RecordKind::base_items;
     if (name == "ITEM.DAT" || name == "ITEMS.DAT") return RecordKind::frua_items;
     if (name == "GAME001.DAT") return RecordKind::frua_design;
@@ -1081,6 +1146,8 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
         return read_frua_save(path);
     if (kind == RecordKind::luck)
         return read_luck(path);
+    if (kind == RecordKind::countdown_ships)
+        return read_countdown_ships(path);
     if (kind == RecordKind::ecl)
         return read_ecl_rows(path);
     if (kind == RecordKind::c64)
