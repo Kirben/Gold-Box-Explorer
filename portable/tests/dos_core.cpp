@@ -301,6 +301,33 @@ void cmp(const fs::path& dir)
     throw std::runtime_error("CMP accepted a run beyond the raster");
 }
 
+void anm(const fs::path& dir)
+{
+    Bytes source(0x3d);
+    source[0] = 4;
+    source[1] = 2;
+    source.insert(source.end(), {0, 0x16, 0x80, 0x41,
+                                 2, 0x10, 0x01, 0, 0x16, 0x7e, 0});
+    const auto path = dir / "cleric.anm";
+    write(path, source);
+    check(is_anm_archive(path) && !is_anm_archive("UNKNOWN.ANM"), "ANM routing mismatch");
+    const auto archive = read_anm(path);
+    check(archive.gallery_count() == 2 && archive.frames[0].id == 1 && archive.frames[1].id == 2 &&
+          archive.frames[0].width == 160 && archive.frames[0].height == 72 &&
+          archive.frames[0].rgba[0] == 170 && archive.frames[1].rgba[0] == 0 &&
+          archive.frames[1].rgba[6] == 170 && archive.frames[1].rgba[8] == 170 &&
+          archive.frames[1].rgba[14] == 0 && archive.frames[1].rgba[18] == 0,
+          "ANM frame order, run byte order, or XOR delta mismatch");
+    source.pop_back();
+    write(path, source);
+    try {
+        read_anm(path);
+    } catch (const std::runtime_error&) {
+        return;
+    }
+    throw std::runtime_error("ANM accepted a truncated delta");
+}
+
 void packwall(const fs::path& dir)
 {
     constexpr unsigned widths[]{16, 16, 8, 8, 16, 24, 8, 16, 32, 56, 24};
@@ -516,6 +543,7 @@ int main(int argc, char** argv)
         else if (name == "geo-glb") geo_glb(dir);
         else if (name == "cmp") cmp(dir);
         else if (name == "packwall") packwall(dir);
+        else if (name == "anm") anm(dir);
         else if (name == "vace") vace(dir);
         else if (name == "geo") geo(dir);
         else if (name == "walls") walls(dir);

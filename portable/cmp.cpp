@@ -37,36 +37,35 @@ unsigned word(const Bytes& bytes, std::size_t offset)
     return bytes[offset] | (unsigned(bytes[offset + 1]) << 8);
 }
 
-Bytes unpack_cmp(const Bytes& source)
+void expand_runs(const Bytes& source, std::size_t& input, Bytes& packed, bool delta)
 {
-    Bytes packed(screen_width * screen_height / 2);
-    std::size_t input = 3;
     std::size_t output = 0;
     while (output < packed.size()) {
         if (input == source.size())
-            throw std::runtime_error("Truncated Hillsfar CMP run");
+            throw std::runtime_error("Truncated Hillsfar graphics run");
         const auto token = source[input++];
         const bool repeat = token == 0 || token >= 128;
         unsigned count = token < 128 ? token : 256 - token;
         if (!token) {
             if (source.size() - input < 2)
-                throw std::runtime_error("Truncated Hillsfar CMP long run");
-            count = word(source, input);
+                throw std::runtime_error("Truncated Hillsfar graphics long run");
+            // ANM stores extended run counts in the opposite byte order from CMP.
+            count = delta ? (unsigned(source[input]) << 8) | source[input + 1] : word(source, input);
             input += 2;
         }
         const auto consumed = repeat ? 1u : count;
         if (!count || count > packed.size() - output || consumed > source.size() - input)
-            throw std::runtime_error("Invalid Hillsfar CMP run length");
-        if (repeat)
+            throw std::runtime_error("Invalid Hillsfar graphics run length");
+        if (delta) {
+            for (unsigned i = 0; i < count; ++i)
+                packed[output + i] ^= source[input + (repeat ? 0 : i)];
+        } else if (repeat)
             std::fill_n(packed.data() + output, count, source[input]);
         else
             std::copy_n(source.data() + input, count, packed.data() + output);
         input += consumed;
         output += count;
     }
-    if (input != source.size())
-        throw std::runtime_error("Unexpected bytes after the Hillsfar CMP raster");
-    return packed;
 }
 
 void put_pixel(std::uint8_t* rgba, unsigned index)
@@ -122,7 +121,11 @@ PictureArchive read_cmp(const std::filesystem::path& path)
     if (word(source, 0) != source.size() - 2 || (source[2] != 1 && source[2] != 2))
         throw std::runtime_error("Invalid Hillsfar CMP header");
 
-    const auto packed = unpack_cmp(source);
+    Bytes packed(screen_width * screen_height / 2);
+    std::size_t input = 3;
+    expand_runs(source, input, packed, false);
+    if (input != source.size())
+        throw std::runtime_error("Unexpected bytes after the Hillsfar CMP raster");
     PictureArchive result;
     if (is_maze(upper(path.stem().string()))) {
         if (source[2] != 1)
@@ -134,6 +137,47 @@ PictureArchive read_cmp(const std::filesystem::path& path)
     } else {
         result.frames.push_back(render(packed.data(), 1, screen_width, screen_height, source[2] == 2));
     }
+    return result;
+}
+
+bool is_anm_archive(const std::filesystem::path& path)
+{
+    if (upper(path.extension().string()) != ".ANM")
+        return false;
+    const auto name = upper(path.stem().string());
+    return name == "CLERIC" || name == "FIGHTER" || name == "MU" || name == "THIEF";
+}
+
+PictureArchive read_anm(const std::filesystem::path& path)
+{
+    constexpr unsigned header_size = 0x3d;
+    constexpr unsigned sequence_size = 32;
+    constexpr unsigned width = 160;
+    constexpr unsigned height = 72;
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file)
+        throw std::runtime_error("Unable to open the Hillsfar ANM file");
+    const auto length = file.tellg();
+    if (length <= header_size || length > 10000)
+        throw std::runtime_error("Invalid Hillsfar ANM file size");
+    Bytes source(static_cast<std::size_t>(length));
+    file.seekg(0);
+    if (!file.read(reinterpret_cast<char*>(source.data()), length))
+        throw std::runtime_error("Unable to read the Hillsfar ANM file");
+    const auto end = std::find(source.begin(), source.begin() + sequence_size, 0);
+    if (end == source.begin() || end == source.begin() + sequence_size)
+        throw std::runtime_error("Invalid Hillsfar ANM sequence");
+
+    Bytes packed(width * height / 2);
+    std::size_t input = header_size;
+    PictureArchive result;
+    const auto count = static_cast<unsigned>(end - source.begin());
+    for (unsigned i = 0; i < count; ++i) {
+        expand_runs(source, input, packed, true);
+        result.frames.push_back(render(packed.data(), i + 1, width, height, false));
+    }
+    if (input != source.size())
+        throw std::runtime_error("Unexpected bytes after the Hillsfar ANM frames");
     return result;
 }
 
