@@ -92,6 +92,12 @@ int main(int argc, char** argv)
                     std::cout << ' ' << id;
                 std::cout << ')';
             }
+            if (!archive.partial_ids.empty()) {
+                std::cout << " (wall records with unresolved glyphs:";
+                for (const auto id : archive.partial_ids)
+                    std::cout << ' ' << id;
+                std::cout << ')';
+            }
             std::cout << '\n';
             for (const auto& clip : archive.clips) {
                 if (clip.whole_archive)

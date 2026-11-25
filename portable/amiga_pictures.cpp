@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 
@@ -14,6 +16,7 @@ using Palette = std::array<unsigned, 16>;
 constexpr Palette portrait{0x000,0xdb9,0xb97,0x964,0x521,0x742,0xa84,0xcb6,0xff9,0x007,0x44b,0x444,0x555,0x777,0xaaa,0xfff};
 constexpr Palette scene{0x000,0x06b,0x096,0x0aa,0x000,0x940,0xb44,0xfaa,0xfe9,0x59f,0x0d8,0x5ff,0x555,0x777,0xaaa,0xfff};
 constexpr Palette picture{0x000,0x124,0x953,0xb97,0xecb,0x710,0xa42,0xdb0,0xff5,0x074,0x053,0x369,0x555,0x777,0xaaa,0xfff};
+constexpr Palette daa_shared{0x000,0x00a,0x0a0,0x0aa,0xa00,0xa0a,0xa50,0xaaa,0x555,0x55f,0x5f5,0x5ff,0xf55,0xf5f,0xff5,0xfff};
 
 unsigned word(const Bytes& bytes, std::size_t at)
 {
@@ -142,6 +145,170 @@ void append_record(const DaxRecord& record, const Format& format, PictureArchive
         archive.frames.push_back(render(record, image, index, index / pieces, index % pieces,
                                         image.width_bytes / pieces, nullptr, palette, format.transparent));
 }
+
+Bytes expand_daa(const Bytes& file, std::size_t begin, std::size_t end, std::size_t limit,
+                 bool packbits)
+{
+    Bytes bytes;
+    while (begin < end) {
+        const auto command = file[begin++];
+        if (packbits && command == 128)
+            continue;
+        const bool literal = command < (packbits ? 128 : 127);
+        const unsigned count = literal ? command + 1 : (packbits ? 257 : 256) - command;
+        const unsigned stored = literal ? count : 1;
+        if (stored > end - begin || count > limit - bytes.size())
+            throw std::runtime_error("Invalid Amiga DAA run");
+        if (literal)
+            bytes.insert(bytes.end(), file.begin() + begin, file.begin() + begin + count);
+        else
+            bytes.insert(bytes.end(), count, file[begin]);
+        begin += stored;
+    }
+    return bytes;
+}
+
+void append_daa(PictureArchive& archive, const Bytes& bytes, unsigned id, const std::string& stem)
+{
+    const unsigned height = word(bytes, 0), width = word(bytes, 2) * 8;
+    const bool tiles = stem.compare(0, 4, "8X8D") == 0 || stem == "SPACETVL";
+    const unsigned max_width = tiles && height == 8 ? 1024 : 640;
+    if (!width || width > max_width || !height || height > 512 || bytes.size() < 9 || !bytes[8])
+        throw std::runtime_error("Invalid Amiga DAA image dimensions");
+    unsigned count = bytes[8], image_width = width;
+    if (tiles && height == 8) {
+        count *= width / 8;
+        image_width = 8;
+    }
+    // The native loader aligns the complete horizontal strip to a 16-bit boundary.
+    const unsigned stride = ((count * image_width + 15) / 16) * 2;
+    const unsigned plane_size = height * stride;
+    const unsigned planes = tiles && width == 8 && bytes.size() < 73 + 5 * plane_size ? 4 : 5;
+    const unsigned first = planes == 4 ? 9 : 73;
+    if (first + planes * plane_size > bytes.size() || bytes.size() - first - planes * plane_size > 4)
+        throw std::runtime_error("Invalid Amiga DAA planar strip size");
+    std::array<unsigned, 32> colors{};
+    if (planes == 5)
+        for (unsigned n = 0; n < colors.size(); ++n)
+            colors[n] = word(bytes, 9 + n * 2);
+    if (tiles && std::all_of(colors.begin(), colors.end(), [](auto rgb) { return (rgb & 4095) == 0; })) {
+        std::copy(daa_shared.begin(), daa_shared.end(), colors.begin());
+        std::copy(daa_shared.begin(), daa_shared.end(), colors.begin() + daa_shared.size());
+    }
+    const bool transparent = tiles || stem.compare(0, 4, "CPIC") == 0 || stem == "COMSPR" ||
+        stem.compare(0, 5, "SPRIT") == 0;
+    for (unsigned n = 0; n < count; ++n) {
+        Frame frame{id, n, image_width, height, Bytes(image_width * height * 4)};
+        for (unsigned y = 0; y < height; ++y)
+            for (unsigned x = 0; x < image_width; ++x) {
+                const auto sx = n * image_width + x;
+                const auto source = first + y * stride + sx / 8;
+                unsigned ink = 0;
+                for (unsigned plane = 0; plane < planes; ++plane)
+                    ink |= ((bytes[source + plane * plane_size] >> (7 - sx % 8)) & 1) << plane;
+                if (!ink && transparent)
+                    continue;
+                const auto rgb = colors[ink];
+                const auto dest = (y * image_width + x) * 4;
+                frame.rgba[dest] = (rgb >> 8 & 15) * 17;
+                frame.rgba[dest + 1] = (rgb >> 4 & 15) * 17;
+                frame.rgba[dest + 2] = (rgb & 15) * 17;
+                frame.rgba[dest + 3] = 255;
+            }
+        archive.frames.push_back(std::move(frame));
+    }
+}
+
+void append_daa_animation(PictureArchive& archive, const Bytes& file, std::size_t first,
+                          std::size_t end, unsigned id, const std::string& stem)
+{
+    if (end - first < 2)
+        throw std::runtime_error("Truncated Amiga DAA animation");
+    const auto packed_header = word(file, first);
+    first += 2;
+    if (packed_header > end - first)
+        throw std::runtime_error("Invalid Amiga DAA animation header size");
+    const auto header = expand_daa(file, first, first + packed_header, 256, true);
+    first += packed_header;
+    const unsigned height = word(header, 0), width_bytes = word(header, 2), count = word(header, 8);
+    if (height == 0 || height > 512 || width_bytes == 0 || width_bytes > 80 ||
+        count == 0 || 74 + count * 2 > header.size())
+        throw std::runtime_error("Invalid Amiga DAA animation header");
+    const unsigned plane_bytes = height * ((width_bytes + 1) & ~1u);
+    Bytes image(header.begin(), header.begin() + 9);
+    image[8] = 1;
+    image.insert(image.end(), header.begin() + 10, header.begin() + 74);
+    PictureArchive::Clip clip{id, {}};
+    const bool encounter = stem.compare(0, 5, "SPRIT") == 0;
+    Bytes base;
+    for (unsigned n = 0; n < count; ++n) {
+        const auto packed = word(header, 74 + n * 2);
+        if (end - first < 2 || packed > end - first - 2)
+            throw std::runtime_error("Invalid Amiga DAA frame size");
+        auto pixels = expand_daa(file, first, first + packed, 5 * plane_bytes, true);
+        first += packed;
+        if (pixels.size() != 5 * plane_bytes)
+            throw std::runtime_error("Truncated Amiga DAA frame");
+        if (!n)
+            base = pixels;
+        else if (!encounter)
+            for (std::size_t i = 0; i < pixels.size(); ++i)
+                pixels[i] ^= base[i];
+        if (!encounter && count > 1)
+            clip.steps.push_back({archive.frames.size(), static_cast<int>(std::max(1u, word(file, first)) * 100)});
+        first += 2;
+        image.resize(73);
+        image.insert(image.end(), pixels.begin(), pixels.end());
+        append_daa(archive, image, id, stem);
+        archive.frames.back().index = n;
+    }
+    if (!clip.steps.empty())
+        archive.clips.push_back(std::move(clip));
+}
+
+PictureArchive read_daa(const std::filesystem::path& path, const std::string& stem)
+{
+    std::ifstream stream(path, std::ios::binary);
+    const Bytes file{std::istreambuf_iterator<char>(stream), {}};
+    const auto start = word(file, 0);
+    const bool animation = stem.compare(0, 3, "PIC") == 0 || stem.compare(0, 5, "SPRIT") == 0;
+    const unsigned stride = animation ? 6 : 9;
+    if (start <= 2 || start > file.size() || (start - 2) % stride)
+        throw std::runtime_error("Unsupported Amiga DAA directory");
+    PictureArchive archive;
+    for (unsigned entry = 2; entry < start; entry += stride) {
+        const unsigned id = file[entry];
+        const auto before = archive.frames.size();
+        try {
+            const auto offset = dword(file, entry + (animation ? 2 : 1));
+            if (offset > file.size() - start)
+                throw std::runtime_error("Amiga DAA directory entry outside archive");
+            if (animation) {
+                const auto next = entry + stride < start ? dword(file, entry + stride + 2) : file.size() - start;
+                if (next < offset || next > file.size() - start)
+                    throw std::runtime_error("Invalid Amiga DAA frame directory");
+                append_daa_animation(archive, file, start + offset, start + next, id, stem);
+            } else {
+                const unsigned raw = word(file, entry + 5), stored = word(file, entry + 7);
+                if (stored > file.size() - start - offset)
+                    throw std::runtime_error("Amiga DAA directory entry outside archive");
+                // Champions includes an unused, zero-filled slot before its tile banks.
+                if (id == 201 && stem.compare(0, 4, "8X8D") == 0 &&
+                    std::all_of(file.begin() + start + offset, file.begin() + start + offset + stored,
+                                [](auto byte) { return byte == 0; }))
+                    continue;
+                auto bytes = expand_daa(file, start + offset, start + offset + stored, raw, false);
+                if (bytes.size() != raw)
+                    throw std::runtime_error("Incorrect Amiga DAA expanded size");
+                append_daa(archive, bytes, id, stem);
+            }
+        } catch (const std::runtime_error&) {
+            archive.frames.resize(before);
+            archive.skipped_ids.push_back(id);
+        }
+    }
+    return archive;
+}
 }
 
 std::optional<PictureArchive> try_amiga_pictures(const std::filesystem::path& path)
@@ -149,6 +316,11 @@ std::optional<PictureArchive> try_amiga_pictures(const std::filesystem::path& pa
     auto title = path.stem().string();
     for (auto& ch : title)
         ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    auto ext = path.extension().string();
+    for (auto& ch : ext)
+        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    if (ext == ".DAA")
+        return read_daa(path, title);
     const auto match = std::find_if(std::begin(formats), std::end(formats),
                                     [&](const auto& format) { return title == format.name; });
     if (match == std::end(formats))

@@ -852,6 +852,8 @@ private:
                     status += wxString::Format("   |   %zu animations", clips_.size());
                 if (!archive.skipped_ids.empty())
                     status += wxString::Format(", %zu unsupported records skipped", archive.skipped_ids.size());
+                if (!archive.partial_ids.empty())
+                    status += wxString::Format(", %zu wall records with unresolved glyphs", archive.partial_ids.size());
                 SetStatusText(status);
             } catch (const std::exception& error) {
                 auto message = wxString::FromUTF8(error.what());

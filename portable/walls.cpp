@@ -33,12 +33,19 @@ std::vector<Frame> compose_pieces(const DaxRecord& record, const std::vector<con
             for (unsigned row = 0; row < heights[view]; ++row) {
                 for (unsigned col = 0; col < widths[view]; ++col) {
                     const auto index = record.bytes[start + offsets[view] + row * widths[view] + col];
-                    if (amiga && index >= bank.size())
-                        throw std::runtime_error("Amiga wall tile index outside its banks");
                     for (unsigned y = 0; y < 8; ++y) {
                         auto dest = frame.rgba.begin() + 4 * ((row * 8 + y) * frame.width + col * 8);
-                        if (index && index < bank.size())
+                        if (index && index < bank.size() && bank[index])
                             std::copy_n(bank[index]->rgba.begin() + y * 32, 32, dest);
+                        else if (amiga && index) {
+                            for (unsigned x = 0; x < 8; ++x) {
+                                const bool light = ((x / 2) + (y / 2)) % 2;
+                                *dest++ = light ? 255 : 80;
+                                *dest++ = 0;
+                                *dest++ = light ? 255 : 80;
+                                *dest++ = 255;
+                            }
+                        }
                         else if (!index && !amiga) {
                             for (unsigned x = 0; x < 8; ++x) {
                                 *dest++ = 255; *dest++ = 82; *dest++ = 255; *dest++ = 255;
@@ -226,12 +233,14 @@ PictureArchive read_wall_archive(const fs::path& path)
     }
 
     std::map<unsigned, std::vector<Frame>> tiles;
+    bool gateway = false;
     for (const auto& dir : folders) {
         for (const auto& entry : fs::directory_iterator(dir)) {
             const auto name = upper(entry.path().filename().string());
             if (name != "WALLS.TLB" && name != "8X8D.TLB" && name != "8X8DA.TLB" &&
                 name != "8X8DB.TLB" && name != "8X8DC.TLB")
                 continue;
+            gateway |= name == "WALLS.TLB";
             try {
                 auto archive = read_tlb(entry.path());
                 for (auto& frame : archive.frames) {
@@ -249,7 +258,8 @@ PictureArchive read_wall_archive(const fs::path& path)
         }
     }
     PictureArchive result;
-    for (const auto& record : read_amiga_glb(path, "DATA")) {
+    const auto records = read_amiga_glb(path, "DATA");
+    for (const auto& record : records) {
         if (record.bytes.empty() || record.bytes.size() % 780) {
             result.skipped_ids.push_back(record.id);
             continue;
@@ -266,23 +276,37 @@ PictureArchive read_wall_archive(const fs::path& path)
             });
         };
         std::vector<const Frame*> bank{nullptr};
-        append(bank, record.id);
+        unsigned bank_id = record.id;
+        if (gateway && record.id == 32) {
+            const auto alias = std::find_if(records.begin(), records.end(), [&](const auto& other) {
+                return other.id == 15 && other.bytes == record.bytes;
+            });
+            if (alias != records.end())
+                bank_id = alias->id;
+        }
+        append(bank, bank_id);
         if (bank.size() == 257)
             bank.erase(bank.begin() + 1);
-        if (bank.size() < 255 || !fits(bank)) {
+        if ((bank.size() < 255 && !(gateway && bank.size() == 212 && fits(bank))) || !fits(bank)) {
             bank.resize(1);
             append(bank, 203);
             const auto sets = record.bytes.size() / 780;
-            if (tiles.count(record.id))
-                append(bank, record.id);
+            if (tiles.count(bank_id))
+                append(bank, bank_id);
             else
                 for (unsigned part = 1; part <= sets; ++part)
-                    append(bank, record.id * 10 + part);
+                    append(bank, bank_id * 10 + part);
+            // Secret's LOAD_PIECES pairs wall definitions 7 and 15 with
+            // these third-slot sets. The first two slots come from the multipart record.
+            if (!gateway && sets == 2 && bank.size() == 186) {
+                if (bank_id == 7 && tiles.count(71) && tiles.count(72))
+                    append(bank, 19);
+                else if (bank_id == 15 && tiles.count(151) && tiles.count(152))
+                    append(bank, 9);
+            }
         }
-        if (!fits(bank)) {
-            result.skipped_ids.push_back(record.id);
-            continue;
-        }
+        if (!fits(bank))
+            result.partial_ids.push_back(record.id);
         auto pieces = compose_pieces(record, bank, true);
         result.frames.insert(result.frames.end(), std::make_move_iterator(pieces.begin()),
                              std::make_move_iterator(pieces.end()));

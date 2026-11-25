@@ -45,6 +45,47 @@ void dax(const fs::path& path, std::uint8_t id, const Bytes& data)
 
 void pictures(const fs::path& dir)
 {
+    auto repeat = [](Bytes& packed, unsigned count, unsigned value) {
+        packed.push_back(static_cast<std::uint8_t>(256 - count));
+        packed.push_back(static_cast<std::uint8_t>(value));
+    };
+    const auto static_daa = dir / "CPIC1.DAA";
+    Bytes header(73);
+    header[1] = header[3] = header[8] = 1;
+    header[11] = 0xf;
+    Bytes packed{72};
+    packed.insert(packed.end(), header.begin(), header.end());
+    repeat(packed, 1, 0x80);
+    repeat(packed, 9, 0);
+    Bytes daa{0,11,3,0,0,0,0,0,83,0,static_cast<std::uint8_t>(packed.size())};
+    daa.insert(daa.end(), packed.begin(), packed.end());
+    write(static_daa, daa);
+    const auto static_art = read_pictures(static_daa);
+    check(is_picture_archive(static_daa) && static_art.frames.size() == 1 &&
+          static_art.frames.front().rgba[0] == 255 && static_art.frames.front().rgba[7] == 0,
+          "Amiga DAA directory, one-byte repeat, planar layout or transparency changed");
+
+    const auto animated_daa = dir / "PIC1.DAA";
+    Bytes animation_header(78);
+    animation_header[1] = animation_header[3] = 1;
+    animation_header[9] = 2;
+    animation_header[12] = 0xf;
+    animation_header[75] = animation_header[77] = 11;
+    Bytes animation{0,8,4,0,0,0,0,0,0,79,77};
+    animation.insert(animation.end(), animation_header.begin(), animation_header.end());
+    for (auto bit : {0x80, 0xc0}) {
+        animation.push_back(9);
+        animation.push_back(bit);
+        animation.insert(animation.end(), 9, 0);
+        animation.insert(animation.end(), {0, 2});
+    }
+    write(animated_daa, animation);
+    const auto animated_art = read_pictures(animated_daa);
+    check(animated_art.frames.size() == 2 && animated_art.clips.size() == 1 &&
+          animated_art.frames[0].rgba[0] == 255 && animated_art.frames[1].rgba[0] == 0 &&
+          animated_art.frames[1].rgba[4] == 255 && animated_art.clips[0].steps[1].duration_ms == 200,
+          "Amiga DAA PackBits frame sizes, XOR delta or stored delay changed");
+
     Bytes data{2};
     for (unsigned i = 0; i < 2; ++i) {
         Bytes frame(25);

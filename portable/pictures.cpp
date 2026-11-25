@@ -471,10 +471,14 @@ void add_final_clip(const std::vector<DaxRecord>& records, PictureArchive& archi
 
 bool is_picture_archive(const std::filesystem::path& path)
 {
+    static const std::regex daa(
+        R"((8X8D|BACK|BIGPIC|BODY|BORDERS?|COMSPR|CPIC|DUNGCOM|HEAD|HITEK|LOTEK|MARSCOM|PIC|RANDCOM|SHIPS|SKY|SPACETVL|SPRIT|VENUSCOM|WILDCOM)[0-9]*\.DAA)",
+        std::regex::icase);
     static const std::regex name(
         R"(((PIC|SPRIT)[0-9]*[A-Z]?|(8X8D|BACK|BACPAC|BIGPIC|BODY|BORD(ERS?)?|CBODY|CHEAD|COMSPR|CPIC|CURSOR|DUNGCOM|FINAL|HEAD|ICON|OVER|RANDCOM|SKY|SKYGRND|SQRPACI|TILES|TITLE|WILDCOM)[0-9]*)\.DAX)",
         std::regex::icase);
-    return std::regex_match(path.filename().string(), name);
+    const auto file = path.filename().string();
+    return std::regex_match(file, name) || std::regex_match(file, daa);
 }
 
 std::vector<DaxRecord> read_dax(const std::filesystem::path& path)

@@ -28,6 +28,7 @@ struct PictureArchive {
     };
     std::vector<Clip> clips;
     std::size_t playback_only_frames = 0; // Synthetic frames appended after the gallery frames.
+    std::vector<unsigned> partial_ids;
     std::size_t gallery_count() const { return frames.size() - playback_only_frames; }
 };
 
