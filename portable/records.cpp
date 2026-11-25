@@ -1,14 +1,17 @@
 #include "records.h"
 #include "ecl.h"
+#include "ecl_containers.h"
 #include "item_names.h"
 #include "frua_item_names.h"
 
 #include <algorithm>
 #include <cctype>
 #include <fstream>
+#include <iomanip>
 #include <iterator>
 #include <map>
 #include <regex>
+#include <sstream>
 #include <stdexcept>
 
 namespace goldbox {
@@ -55,6 +58,176 @@ int signed_word(unsigned value) { return static_cast<int>(value) - (value >= 0x8
 void field(RecordRow& row, const char* label, long long value)
 {
     row.fields.emplace_back(label, std::to_string(value));
+}
+
+std::string amiga_name(const std::uint8_t* bytes, unsigned count)
+{
+    std::string name;
+    for (unsigned i = 0; i < count && bytes[i]; ++i) {
+        const auto c = bytes[i];
+        if (c >= 128) {
+            name += static_cast<char>(0xc0 | (c >> 6));
+            name += static_cast<char>(0x80 | (c & 63));
+        } else {
+            name += c >= 32 ? static_cast<char>(c) : '?';
+        }
+    }
+    return name;
+}
+
+unsigned amiga_word(const std::uint8_t* bytes, unsigned at)
+{
+    return unsigned(bytes[at]) << 8 | bytes[at + 1];
+}
+
+std::string raw_bytes(const std::uint8_t* bytes, unsigned at, unsigned size)
+{
+    std::ostringstream text;
+    text << std::uppercase << std::hex << std::setfill('0');
+    for (unsigned i = 0; i < size; ++i) {
+        if (i)
+            text << ' ';
+        text << std::setw(2) << unsigned(bytes[at + i]);
+    }
+    return text.str();
+}
+
+void amiga_field(RecordRow& row, unsigned offset, std::string_view name, std::string value)
+{
+    std::ostringstream label;
+    label << '$' << std::uppercase << std::hex << std::setfill('0') << std::setw(4) << offset << "  " << name;
+    row.fields.emplace_back(label.str(), std::move(value));
+}
+
+bool amiga_character_size(std::size_t size)
+{
+    return size == 287 || size == 288;
+}
+
+RecordRow amiga_monster(const DaxRecord& record)
+{
+    if (!amiga_character_size(record.bytes.size()))
+        throw std::runtime_error("Unsupported Amiga MONCHA character size");
+    const auto* b = record.bytes.data();
+    RecordRow row{record.id, 0, amiga_name(b, 16), {{"Format", "Amiga character"}}};
+    amiga_field(row, 0, "Name", row.name);
+    if (row.name.empty())
+        row.name = "Monster " + std::to_string(record.id);
+    // Offsets in SSI's PC character schema, adjusted for both native alignment bytes.
+    constexpr unsigned offsets[]{
+        16,17,18,19,20,21,22,23,44,45,46,47,48,50,51,107,108,109,114,115,116,117,118,119,
+        127,131,132,133,134,135,136,150,158,159,160,161,162,163,165,167,169,170,171,172,
+        176,177,178,181,184,186,187,188,189,190,191,192,193,199,200,204,256,257,258,
+        260,264,268,269,270,271,272,273,274,275,276,277,279,281,283,284,285
+    };
+    constexpr std::string_view names[]{
+        "Strength","Intelligence","Wisdom","Dexterity","Constitution","Charisma","Exceptional strength",
+        "Memorized spells","Spell preparation time","Base THAC0","Race","Class","Age","Maximum HP",
+        "Known spells","Attack level","Icon dimensions","Saving throws","Base movement","Highest level",
+        "Drained levels","Drained HP","Undead level","Thief skills","Effects pointer","Unknown 083",
+        "NPC","NPC treasure share","Unknown 086","Unknown 087","Coins","Class levels","Gender",
+        "Creature type","Alignment","Attacks","Secondary attacks","Unarmed rolls","Unarmed dice",
+        "Unarmed modifier","Base AC","Use strength","Random byte","Experience","Item limits","Rolled HP",
+        "Cleric spell slots","Mage spell slots","XP award","XP bonus per HP","Portrait head",
+        "Portrait body","Icon head","Icon body","Party order","Icon size","Icon colors","Item count",
+        "Items pointer","Equipped pointers","Hands equipped","Save bonus","Encumbrance",
+        "Next character pointer","Combat pointer","Status","Enabled","Hostile","Quick fight","Current THAC0",
+        "Current AC","Rear AC","Current attacks","Secondary current attacks","Current damage rolls",
+        "Current damage dice","Current damage modifier","Current HP","Current movement"
+    };
+    static_assert(std::size(offsets) == std::size(names) + 1);
+    for (unsigned i = 0; i < std::size(names); ++i) {
+        const auto pc = offsets[i];
+        const auto at = pc + (pc >= 127) + (pc >= 136);
+        const auto size = offsets[i + 1] - pc;
+        std::string value;
+        if (pc == 48 || pc == 184 || pc == 258)
+            value = std::to_string(amiga_word(b, at));
+        else if (pc == 172)
+            value = std::to_string(std::uint32_t(amiga_word(b, at)) << 16 | amiga_word(b, at + 2));
+        else if (pc == 136) {
+            for (unsigned coin = 0; coin < 7; ++coin) {
+                if (coin)
+                    value += ", ";
+                value += std::to_string(amiga_word(b, at + 2 * coin));
+            }
+        } else if (size == 1) {
+            const bool signed_value = pc == 46 || pc == 47 || pc == 115 || pc == 118 || pc == 270;
+            value = std::to_string(signed_value ? signed_byte(b[at]) : int(b[at]));
+        } else {
+            value = raw_bytes(b, at, size);
+        }
+        if (at == 128 || at == 138)
+            amiga_field(row, at - 1, "Alignment padding", std::to_string(b[at - 1]));
+        amiga_field(row, at, names[i], std::move(value));
+    }
+    if (record.bytes.size() == 288)
+        amiga_field(row, 287, "Tail padding", std::to_string(b[287]));
+    return row;
+}
+
+RecordRow amiga_item(unsigned id, unsigned slot, const std::uint8_t* b)
+{
+    RecordRow row{id, slot, amiga_name(b, 41), {{"Format", "Amiga item"}}};
+    amiga_field(row, 0, "Name", row.name);
+    if (row.name.empty())
+        row.name = "Item type " + std::to_string(b[46]);
+    amiga_field(row, 41, "In use", std::to_string(b[41]));
+    amiga_field(row, 42, "Runtime next pointer", raw_bytes(b, 42, 4));
+    constexpr std::string_view names[]{
+        "Type","Name component 3","Name component 2","Name component 1","Magic bonus",
+        "Save bonus","Readied","Unidentified mask","Cursed","Alignment padding"
+    };
+    for (unsigned i = 0; i < std::size(names); ++i)
+        amiga_field(row, 46 + i, names[i],
+                    std::to_string(i == 4 || i == 5 ? signed_byte(b[46 + i]) : int(b[46 + i])));
+    amiga_field(row, 56, "Weight", std::to_string(amiga_word(b, 56)));
+    amiga_field(row, 58, "Quantity", std::to_string(b[58]));
+    amiga_field(row, 59, "Alignment padding", std::to_string(b[59]));
+    amiga_field(row, 60, "Value", std::to_string(amiga_word(b, 60)));
+    amiga_field(row, 62, "Charges / scroll spells", std::to_string(b[62]));
+    amiga_field(row, 63, "Effect", std::to_string(b[63]));
+    amiga_field(row, 64, "Special", std::to_string(b[64]));
+    return row;
+}
+
+RecordRow amiga_effect(unsigned id, unsigned slot, const std::uint8_t* b)
+{
+    RecordRow row{id, slot, "Effect " + std::to_string(b[0]), {{"Format", "Amiga effect"}}};
+    amiga_field(row, 0, "Effect ID", std::to_string(b[0]));
+    amiga_field(row, 1, "Padding", std::to_string(b[1]));
+    amiga_field(row, 2, "Duration in minutes (0 permanent)", std::to_string(amiga_word(b, 2)));
+    amiga_field(row, 4, "Strength", std::to_string(b[4]));
+    amiga_field(row, 5, "Removal callback", b[5] ? "Yes" : "No");
+    amiga_field(row, 6, "Runtime next pointer", raw_bytes(b, 6, 4));
+    return row;
+}
+
+std::vector<RecordRow> amiga_record_rows(const std::vector<DaxRecord>& records, RecordKind kind,
+                                         const std::map<unsigned, std::string>& owners)
+{
+    std::vector<RecordRow> rows;
+    const bool effects = kind == RecordKind::monster_effects;
+    const unsigned stride = effects ? 10 : 65;
+    for (const auto& record : records) {
+        if (record.bytes.empty())
+            continue;
+        if (kind == RecordKind::monsters) {
+            rows.push_back(amiga_monster(record));
+            continue;
+        }
+        if (record.bytes.size() % stride)
+            throw std::runtime_error("Unsupported Amiga item or effect record size");
+        const auto owner = owners.find(record.id);
+        for (unsigned slot = 0; slot < record.bytes.size() / stride; ++slot) {
+            const auto* b = record.bytes.data() + slot * stride;
+            auto row = effects ? amiga_effect(record.id, slot, b) : amiga_item(record.id, slot, b);
+            if (owner != owners.end() && !owner->second.empty())
+                row.fields.emplace(row.fields.begin() + 1, "Owner", owner->second);
+            rows.push_back(std::move(row));
+        }
+    }
+    return rows;
 }
 
 bool merged(const std::vector<DaxRecord>& records)
@@ -445,8 +618,11 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
     if (kind == RecordKind::saved_character || kind == RecordKind::saved_inventory ||
         kind == RecordKind::saved_effects)
         return read_save_rows(path, kind);
-    const auto records = read_dax(path);
-    const bool trailer = merged(records);
+    auto records = try_amiga_dax(path);
+    const bool amiga = !records.empty();
+    if (!amiga)
+        records = read_dax(path);
+    const bool trailer = !amiga && merged(records);
     const auto filename = upper(path.filename().string());
     std::map<unsigned, std::string> owners;
     std::size_t owner_size = 0;
@@ -460,8 +636,12 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
             if (upper(entry.path().filename().string()) != companion)
                 continue;
             try {
-                for (const auto& record : read_dax(entry.path())) {
-                    if (known_monster_size(record.bytes.size())) {
+                const auto companions = amiga ? try_amiga_dax(entry.path()) : read_dax(entry.path());
+                for (const auto& record : companions) {
+                    if (amiga && amiga_character_size(record.bytes.size())) {
+                        if (kind != RecordKind::items)
+                            owners.emplace(record.id, amiga_name(record.bytes.data(), 16));
+                    } else if (!amiga && known_monster_size(record.bytes.size())) {
                         owner_size = record.bytes.size();
                         if (kind != RecordKind::items)
                             owners.emplace(record.id, name_at(record.bytes.data(), 15));
@@ -473,6 +653,8 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
             break;
         }
     }
+    if (amiga)
+        return amiga_record_rows(records, kind, owners);
     unsigned stride = item_size;
     const auto fits = [&](unsigned width) {
         return std::all_of(records.begin(), records.end(), [&](const auto& record) {
