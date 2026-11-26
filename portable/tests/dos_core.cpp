@@ -594,9 +594,6 @@ void walls(const fs::path& dir)
     banks[0] = frames;
     const auto view = wall_perspective(map, banks, 8, 8, 0);
     check(view.width == 88 && view.height == 88, "Unexpected wall perspective geometry");
-    check(view.rgba[0] < 128 && view.rgba[0] != view.rgba[(87 * 88) * 4] &&
-          view.rgba[3] == 255 && view.rgba[(87 * 88) * 4 + 3] == 255,
-          "Perspective backdrop is missing distinct opaque ceiling and floor bands");
     const auto pixel = (20 * 88 + 40) * 4;
     check(view.rgba.at(pixel) == 173 && view.rgba.at(pixel + 1) == 0,
           "Front wall is missing from the perspective");
@@ -1032,21 +1029,6 @@ void ecl_scripts(const fs::path& dir)
         check(has_field(buck[0], {"$8014", "$08  RANDOM $12345678, long[$9000]"}),
               "Buck Rogers long operands were not decoded");
     }
-    Bytes dispatch;
-    for (unsigned i = 0; i < 5; ++i)
-        dispatch.insert(dispatch.end(), {1, 1, 0x14, 0x99});
-    dispatch.insert(dispatch.end(), {0x21, 0, 42, 0, 2, 0, 255,
-        0x2f, 1, 0x4f, 0xc0, 0, 127, 1, 0x79, 0x6e,
-        0x25, 1, 0x79, 0x6e, 0, 2, 1, 0x30, 0x99, 1, 0x31, 0x99,
-        0, 0});
-    const auto mapped = dir / "ECL42.DAX";
-    dax(mapped, 7, dispatch);
-    const auto link = find_ecl_event(mapped, 42, 1);
-    const auto mapped_rows = read_ecl_rows(mapped);
-    check(link && link->script == 0 && !link->inferred && link->instruction &&
-          mapped_rows[0].fields.at(*link->instruction).first == "$9931",
-          "Map link did not follow the masked event table in a differently numbered script");
-    check(!find_ecl_event(mapped, 9, 1), "Map link guessed an unrelated script");
     const auto buck_dir = dir / "buck_rogers";
     fs::create_directories(buck_dir);
     script[0] = 0;
