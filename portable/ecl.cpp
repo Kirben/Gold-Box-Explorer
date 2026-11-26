@@ -14,6 +14,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 
 namespace goldbox {
 namespace {
@@ -225,8 +226,19 @@ Instruction decode(const Bytes& bytes, std::size_t offset, const ecl::Opcodes& o
     return result;
 }
 
+struct MapReferences {
+    std::set<unsigned> maps;
+    struct Dispatch {
+        unsigned address;
+        Operand selector;
+        std::vector<unsigned> targets;
+    };
+    std::vector<Dispatch> dispatches;
+    std::map<unsigned, unsigned> cell_event_copies;
+};
+
 RecordRow read_script(DaxRecord record, unsigned slot, std::string game, bool prefixed,
-                      bool c64_file, bool amiga_file)
+                      bool c64_file, bool amiga_file, MapReferences* references)
 {
     RecordRow row{record.id, slot, "Script " + std::to_string(record.id), {}};
     auto& bytes = record.bytes;
@@ -310,6 +322,24 @@ RecordRow read_script(DaxRecord record, unsigned slot, std::string game, bool pr
                 if (table >= base + 20 && table - base < bytes.size())
                     tables.insert(table - base);
             }
+            if (references && ins.code == 0x21 && ins.args[0].tag == 0 &&
+                ins.args[0].value < 127)
+                references->maps.insert(ins.args[0].value);
+            if (references && (game == "por" || game == "amiga" || record.pc98)) {
+                constexpr unsigned cell_event = 0xc04f;
+                if (ins.code == 0x2f && ins.args[0].tag == 1 && ins.args[0].value == cell_event &&
+                    ins.args[1].tag == 0 && ins.args[1].value == 127 && ins.args[2].tag == 1)
+                    references->cell_event_copies.emplace(base + ins.end, ins.args[2].value);
+            }
+            if (references && (ins.code == 0x25 || ins.code == 0x26) &&
+                ins.args.size() > 2 && (ins.args[0].tag == 1 || ins.args[0].tag == 3)) {
+                MapReferences::Dispatch dispatch{base + static_cast<unsigned>(offset), ins.args[0], {}};
+                for (std::size_t i = 2; i < ins.args.size(); ++i) {
+                    const auto& arg = ins.args[i];
+                    dispatch.targets.push_back(arg.tag == 1 || arg.tag == 2 ? arg.value : 0);
+                }
+                references->dispatches.push_back(std::move(dispatch));
+            }
             const bool skip = buck && ins.code == 0x44;
             const bool conditional = ins.code >= 0x16 && ins.code <= 0x1b;
             if (conditional || skip) {
@@ -365,7 +395,8 @@ bool is_ecl_archive(const std::filesystem::path& path)
            suffix.find_first_not_of("0123456789") == std::string::npos;
 }
 
-std::vector<RecordRow> read_ecl_rows(const std::filesystem::path& path, std::string_view profile)
+static std::vector<RecordRow> read_ecl(const std::filesystem::path& path, std::string_view profile,
+                                       std::vector<MapReferences>* references)
 {
     const auto extension = upper(path.extension().string());
     std::string game(profile);
@@ -427,9 +458,65 @@ std::vector<RecordRow> read_ecl_rows(const std::filesystem::path& path, std::str
         std::none_of(std::begin(games), std::end(games), [&](const auto& item) { return game == item.key; }))
         throw std::runtime_error("unknown ECL profile: " + game);
     std::vector<RecordRow> rows;
+    if (references)
+        references->resize(records.size());
     for (unsigned i = 0; i < records.size(); ++i)
-        rows.push_back(read_script(std::move(records[i]), i, game, extension != ".GLB", extension == ".PRG", amiga_file));
+        rows.push_back(read_script(std::move(records[i]), i, game, extension != ".GLB", extension == ".PRG",
+                                   amiga_file, references ? &(*references)[i] : nullptr));
     return rows;
+}
+
+std::vector<RecordRow> read_ecl_rows(const std::filesystem::path& path, std::string_view profile)
+{
+    return read_ecl(path, profile, nullptr);
+}
+
+std::optional<EclEventLink> find_ecl_event(const std::filesystem::path& archive, unsigned map_id,
+                                          unsigned event)
+{
+    std::vector<MapReferences> references;
+    const auto rows = read_ecl(archive, {}, &references);
+    std::optional<EclEventLink> best;
+    std::tuple<bool, bool, bool, std::size_t> best_rank{};
+    bool ambiguous = false;
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        const auto& ref = references[i];
+        const bool loads_map = ref.maps.count(map_id) != 0;
+        const bool matching_id = rows[i].id == map_id;
+        if (!loads_map && !matching_id)
+            continue;
+        for (const auto& dispatch : ref.dispatches) {
+            const auto copied = ref.cell_event_copies.find(dispatch.address);
+            const bool exact = copied != ref.cell_event_copies.end() && copied->second == dispatch.selector.value;
+            if (event >= dispatch.targets.size() || (!exact && dispatch.targets.size() <= 4))
+                continue;
+            const auto target = dispatch.targets[event];
+            if (!target)
+                continue;
+            const auto address = hex(target);
+            const auto& fields = rows[i].fields;
+            const auto line = std::find_if(fields.begin(), fields.end(), [&](const auto& field) {
+                return field.first == address && !field.second.empty() && field.second.front() == '$';
+            });
+            if (line == fields.end())
+                continue;
+            const auto rank = std::make_tuple(exact, loads_map, matching_id, dispatch.targets.size());
+            const auto instruction = static_cast<std::size_t>(std::distance(fields.begin(), line));
+            if (!best || rank > best_rank) {
+                best = EclEventLink{i, instruction, !exact};
+                best_rank = rank;
+                ambiguous = false;
+            } else if (rank == best_rank && (best->script != i || best->instruction != instruction)) {
+                ambiguous = true;
+            }
+        }
+    }
+    if (best && !ambiguous)
+        return best;
+    for (std::size_t i = 0; i < rows.size(); ++i)
+        if (rows[i].id == map_id)
+            return EclEventLink{i, {}, true};
+    return {};
 }
 
 void write_ecl_listing(std::ostream& output, const RecordRow& script)

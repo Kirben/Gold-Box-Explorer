@@ -623,15 +623,18 @@ public:
                 show_fields(static_cast<std::size_t>(event.GetIndex()));
         });
         preview_->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& event) {
-            if (!geo_ || banks_.empty() || !perspective_->IsShown())
+            if (!geo_ || !perspective_->IsShown())
                 return;
-            const auto p = preview_->CalcUnscrolledPosition(event.GetPosition()) - wxPoint(12, 12);
-            const int cell = 12 * (zoom_->GetSelection() + 1);
-            if (p.x >= cell && p.y >= cell && p.x < 17 * cell && p.y < 17 * cell) {
-                cursor_x_ = p.x / cell - 1;
-                cursor_y_ = p.y / cell - 1;
+            if (const auto cell = map_cell(event.GetPosition())) {
+                cursor_x_ = cell->x;
+                cursor_y_ = cell->y;
                 render();
             }
+        });
+        preview_->Bind(wxEVT_LEFT_DCLICK, [this](wxMouseEvent& event) {
+            if (geo_)
+                if (const auto cell = map_cell(event.GetPosition()))
+                    open_map_event(*cell);
         });
         browse(folder, initial.filename());
         if (goldbox::is_disk_image(initial))
@@ -653,6 +656,72 @@ public:
     }
 
 private:
+    std::optional<wxPoint> map_cell(wxPoint position) const
+    {
+        const auto p = preview_->CalcUnscrolledPosition(position) - wxPoint(12, 12);
+        const int cell = 12 * (zoom_->GetSelection() + 1);
+        const int edge = (goldbox::map_side + 1) * cell;
+        if (p.x < cell || p.y < cell || p.x >= edge || p.y >= edge)
+            return {};
+        return wxPoint(p.x / cell - 1, p.y / cell - 1);
+    }
+
+    void open_map_event(wxPoint cell)
+    {
+        const auto map_index = pictures_->GetSelection();
+        const auto file_index = files_->GetSelection();
+        if (map_index == wxNOT_FOUND || file_index == wxNOT_FOUND)
+            return;
+        try {
+            const auto& record = records_.at(map_index);
+            const auto map = goldbox::read_geo_map(record);
+            const auto event = map[cell.y * goldbox::map_side + cell.x].event;
+            if (!event) {
+                SetStatusText("This square has no numbered ECL event.");
+                return;
+            }
+            const auto name = wxString::FromUTF8(paths_.at(file_index).filename().u8string());
+            const auto companion = "ECL" + name.Mid(3);
+            const auto path = std::find_if(paths_.begin(), paths_.end(), [&](const auto& candidate) {
+                return wxString::FromUTF8(candidate.filename().u8string()).CmpNoCase(companion) == 0;
+            });
+            if (path == paths_.end()) {
+                SetStatusText("Companion archive " + companion + " is unavailable.");
+                return;
+            }
+            const auto link = goldbox::find_ecl_event(*path, record.id, event);
+            if (!link) {
+                SetStatusText(wxString::Format("No matching ECL script found for map %u, event %u.",
+                                               record.id, event));
+                return;
+            }
+            files_->SetSelection(static_cast<int>(std::distance(paths_.begin(), path)));
+            open();
+            if (record_kind_ != goldbox::RecordKind::ecl || link->script >= record_list_->rows().size())
+                return;
+            const auto script = static_cast<long>(link->script);
+            record_list_->SetItemState(script, wxLIST_STATE_SELECTED | wxLIST_STATE_FOCUSED,
+                                       wxLIST_STATE_SELECTED | wxLIST_STATE_FOCUSED);
+            record_list_->EnsureVisible(script);
+            show_fields(link->script);
+            if (link->instruction) {
+                const auto instruction = static_cast<long>(*link->instruction);
+                details_->SetItemState(instruction, wxLIST_STATE_SELECTED | wxLIST_STATE_FOCUSED,
+                                       wxLIST_STATE_SELECTED | wxLIST_STATE_FOCUSED);
+                details_->EnsureVisible(instruction);
+            }
+            auto status = wxString::Format("Map event %u   |   Script %u", event,
+                                           record_list_->rows()[link->script].id);
+            if (!link->instruction)
+                status += "   |   Event address unresolved";
+            else if (link->inferred)
+                status += "   |   Event address inferred";
+            SetStatusText(status);
+        } catch (const std::exception& error) {
+            SetStatusText(wxString::FromUTF8(error.what()));
+        }
+    }
+
     void show_about()
     {
         static constexpr unsigned char logo[]{
@@ -983,6 +1052,7 @@ private:
         hex_->clear();
         records_.clear();
         details_->load(nullptr);
+        detail_row_.reset();
         record_list_->load({});
         record_kind_ = goldbox::RecordKind::none;
         banks_.clear();
@@ -1244,8 +1314,9 @@ private:
     void show_fields(std::size_t index)
     {
         const auto& rows = record_list_->rows();
-        if (index >= rows.size())
+        if (index >= rows.size() || detail_row_ == index)
             return;
+        detail_row_ = index;
         const auto& record = rows[index];
         details_->load(&record.fields, record_kind_);
         SetStatusText(wxString::Format("%s %zu of %zu   |   ", record_kind_ == goldbox::RecordKind::ecl ? "Script" : "Record",
@@ -1309,11 +1380,11 @@ private:
                     const auto view = goldbox::wall_perspective(map, banks, cursor_x_, cursor_y_, direction);
                     perspective_->show(&view, 2, export_name(wxString::Format("-map-%02X-view-%d-%d-%d",
                         record.id, cursor_x_, cursor_y_, direction)));
-                    SetStatusText(wxString::Format("Map %u   |   Camera (%d, %d)   |   Click a square to move",
+                    SetStatusText(wxString::Format("Map %u   |   Camera (%d, %d)   |   Click to move, double-click for ECL",
                                                    record.id, cursor_x_, cursor_y_));
                 } else {
-                    SetStatusText(amiga_geo_ ? pictures_->GetString(selected) + "   |   16 x 16" :
-                        wxString::Format("Map %u   |   16 x 16   |   No compatible wall set", record.id));
+                    SetStatusText(amiga_geo_ ? pictures_->GetString(selected) + "   |   Double-click a square for ECL" :
+                        wxString::Format("Map %u   |   Double-click a square for ECL", record.id));
                 }
             } catch (const std::exception& error) {
                 show_view(false, true, true);
@@ -1350,6 +1421,7 @@ private:
     wxSplitterWindow* tables_;
     RecordList* record_list_;
     RecordDetails* details_;
+    std::optional<std::size_t> detail_row_;
     goldbox::RecordKind record_kind_ = goldbox::RecordKind::none;
     fs::path current_folder_;
     fs::path disk_cache_;
