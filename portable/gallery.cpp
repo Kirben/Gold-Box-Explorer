@@ -40,6 +40,48 @@
 namespace {
 namespace fs = std::filesystem;
 
+struct ImageExportFormat {
+    const char* name;
+    const char* extension;
+    const char* filter;
+    wxBitmapType type;
+};
+
+constexpr ImageExportFormat image_export_formats[]{
+    {"PNG", "png", "PNG images (*.png)|*.png", wxBITMAP_TYPE_PNG},
+    {"JPEG", "jpg", "JPEG images (*.jpg;*.jpeg)|*.jpg;*.jpeg", wxBITMAP_TYPE_JPEG},
+    {"BMP", "bmp", "Bitmap images (*.bmp)|*.bmp", wxBITMAP_TYPE_BMP},
+};
+
+constexpr unsigned preview_background[]{28, 29, 33};
+
+bool save_image(wxImage image, wxOutputStream& stream, const ImageExportFormat& format)
+{
+    if (!image.IsOk() || !stream.IsOk())
+        return false;
+    if (format.type != wxBITMAP_TYPE_PNG) {
+        image = image.Copy();
+        // JPG and 24-bit BMP use the preview pane's background behind transparent pixels.
+        const auto* alpha = image.GetAlpha();
+        const bool masked = image.HasMask();
+        const unsigned char mask[]{image.GetMaskRed(), image.GetMaskGreen(), image.GetMaskBlue()};
+        auto* rgb = image.GetData();
+        const auto pixels = static_cast<std::size_t>(image.GetWidth()) * image.GetHeight();
+        for (std::size_t i = 0; i < pixels; ++i, rgb += 3) {
+            const unsigned opacity = masked && std::equal(mask, mask + 3, rgb) ? 0 : alpha ? alpha[i] : 255;
+            for (unsigned channel = 0; channel < 3; ++channel)
+                rgb[channel] = static_cast<unsigned char>((rgb[channel] * opacity +
+                    preview_background[channel] * (255 - opacity) + 127) / 255);
+        }
+        if (alpha)
+            image.ClearAlpha();
+        image.SetMask(false);
+        if (format.type == wxBITMAP_TYPE_JPEG)
+            image.SetOption(wxIMAGE_OPTION_QUALITY, 95);
+    }
+    return image.SaveFile(stream, format.type) && stream.IsOk();
+}
+
 wxString amiga_map_label(unsigned id)
 {
     static const char* const names[]{
@@ -241,7 +283,7 @@ public:
         Bind(wxEVT_PAINT, [this](wxPaintEvent&) {
             wxAutoBufferedPaintDC dc(this);
             PrepareDC(dc);
-            dc.SetBackground(wxBrush(wxColour(28, 29, 33)));
+            dc.SetBackground(wxBrush(wxColour(preview_background[0], preview_background[1], preview_background[2])));
             dc.Clear();
             if (bitmap_.IsOk()) {
                 const auto size = GetClientSize();
@@ -493,8 +535,30 @@ public:
         auto* file_menu = new wxMenu;
         file_menu->Append(wxID_OPEN, "&Open Disk Image...\tCtrl+O");
         file_menu->AppendSeparator();
-        file_menu->Append(export_png_id, "Export PNG...");
-        file_menu->Append(export_frames_id, "Export All Frames...");
+        auto* image_menu = new wxMenu;
+        auto* frames_menu = new wxMenu;
+        for (unsigned i = 0; i < std::size(image_export_formats); ++i) {
+            const auto& format = image_export_formats[i];
+            if (!wxImage::FindHandler(format.type))
+                continue;
+            const auto label = wxString::FromUTF8(format.name) + "...";
+            image_menu->Append(export_image_id + i, label);
+            frames_menu->Append(export_frames_id + i, label);
+            Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent& event) {
+                event.Enable(preview_->can_export());
+            }, export_image_id + i);
+            Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent& event) {
+                event.Enable(can_export_frames());
+            }, export_frames_id + i);
+            Bind(wxEVT_MENU, [this, i](wxCommandEvent&) {
+                export_image(*preview_, image_export_formats[i]);
+            }, export_image_id + i);
+            Bind(wxEVT_MENU, [this, i](wxCommandEvent&) {
+                export_frames(image_export_formats[i]);
+            }, export_frames_id + i);
+        }
+        file_menu->AppendSubMenu(image_menu, "Export Image");
+        file_menu->AppendSubMenu(frames_menu, "Export All Frames");
         file_menu->Append(export_animation_id, "Export Animation...");
         file_menu->AppendSeparator();
         file_menu->Append(export_script_id, "Export Selected Script...");
@@ -518,14 +582,6 @@ public:
             if (dialog.ShowModal() == wxID_OK)
                 mount_image(fs::u8path(dialog.GetPath().ToUTF8().data()));
         }, wxID_OPEN);
-        Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent& event) {
-            event.Enable(preview_->can_export());
-        }, export_png_id);
-        Bind(wxEVT_MENU, [this](wxCommandEvent&) { export_png(*preview_); }, export_png_id);
-        Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent& event) {
-            event.Enable(can_export_frames());
-        }, export_frames_id);
-        Bind(wxEVT_MENU, [this](wxCommandEvent&) { export_frames(); }, export_frames_id);
         Bind(wxEVT_UPDATE_UI, [this](wxUpdateUIEvent& event) {
             event.Enable(selected_clip() != nullptr);
         }, export_animation_id);
@@ -551,8 +607,15 @@ public:
                 if (!pane->can_export())
                     return;
                 wxMenu menu;
-                menu.Append(wxID_SAVE, "Export PNG...");
-                menu.Bind(wxEVT_MENU, [this, pane](wxCommandEvent&) { export_png(*pane); }, wxID_SAVE);
+                for (unsigned i = 0; i < std::size(image_export_formats); ++i) {
+                    const auto& format = image_export_formats[i];
+                    if (!wxImage::FindHandler(format.type))
+                        continue;
+                    menu.Append(export_image_id + i, "Export " + wxString::FromUTF8(format.name) + "...");
+                    menu.Bind(wxEVT_MENU, [this, pane, i](wxCommandEvent&) {
+                        export_image(*pane, image_export_formats[i]);
+                    }, export_image_id + i);
+                }
                 pane->PopupMenu(&menu);
             });
         }
@@ -695,17 +758,17 @@ private:
         return splitter;
     }
 
-    static constexpr int export_png_id = wxID_HIGHEST + 1;
-    static constexpr int export_frames_id = wxID_HIGHEST + 2;
+    static constexpr int export_image_id = wxID_HIGHEST + 8;
+    static constexpr int export_frames_id = export_image_id + std::size(image_export_formats);
     static constexpr int export_animation_id = wxID_HIGHEST + 3;
     static constexpr int export_script_id = wxID_HIGHEST + 4;
     static constexpr int export_scripts_id = wxID_HIGHEST + 5;
     static constexpr int export_sample_id = wxID_HIGHEST + 6;
     static constexpr int export_midi_id = wxID_HIGHEST + 7;
 
-    wxString export_name(const wxString& suffix) const
+    wxString export_name(const wxString& suffix, const char* extension = "png") const
     {
-        return wxString::FromUTF8(paths_.at(files_->GetSelection()).stem().u8string()) + suffix + ".png";
+        return wxString::FromUTF8(paths_.at(files_->GetSelection()).stem().u8string()) + suffix + "." + wxString::FromUTF8(extension);
     }
 
     static wxString frame_suffix(const goldbox::Frame& frame)
@@ -726,13 +789,14 @@ private:
                 goldbox::is_vace_archive(paths_.at(selected)));
     }
 
-    void export_frames()
+    void export_frames(const ImageExportFormat& format)
     {
         if (!can_export_frames())
             return;
         const auto& archive = paths_.at(files_->GetSelection());
-        wxDirDialog dialog(this, "Choose a folder for the PNG frames",
-                           wxString::FromUTF8(archive.parent_path().u8string()));
+        const auto folder = active_image_.empty() ? archive.parent_path() : active_image_.parent_path();
+        wxDirDialog dialog(this, "Choose a folder for the " + wxString::FromUTF8(format.name) + " frames",
+                           wxString::FromUTF8(folder.u8string()));
         if (dialog.ShowModal() != wxID_OK)
             return;
 
@@ -743,9 +807,9 @@ private:
         for (std::size_t i = 0; i < count; ++i) {
             const auto& frame = frames_[i];
             const auto suffix = frame_suffix(frame);
-            auto name = export_name(suffix);
+            auto name = export_name(suffix, format.extension);
             for (unsigned copy = 2; !names.insert(name).second; ++copy)
-                name = export_name(suffix + wxString::Format("-%u", copy));
+                name = export_name(suffix + wxString::Format("-%u", copy), format.extension);
             auto path = wxFileName(dialog.GetPath(), name).GetFullPath();
             if (wxFileName::Exists(path, wxFILE_EXISTS_ANY | wxFILE_EXISTS_NO_FOLLOW)) {
                 wxMessageBox("The destination already contains " + name +
@@ -760,10 +824,9 @@ private:
             wxFile file;
             bool saved = false;
             if (file.Create(targets[i], false)) {
-                auto image = frame_image(frames_[i]);
                 {
                     wxFileOutputStream stream(file);
-                    saved = image.SaveFile(stream, wxBITMAP_TYPE_PNG) && stream.IsOk();
+                    saved = save_image(frame_image(frames_[i]), stream, format);
                 }
                 saved = file.Close() && saved;
                 if (!saved)
@@ -776,7 +839,7 @@ private:
                 return;
             }
         }
-        SetStatusText(wxString::Format("Exported %zu PNG frames", count));
+        SetStatusText(wxString::Format("Exported %zu %s frames", count, wxString::FromUTF8(format.name)));
     }
 
     void export_animation()
@@ -799,16 +862,22 @@ private:
         SetStatusText("Exported animated PNG");
     }
 
-    void export_png(const Preview& pane)
+    void export_image(const Preview& pane, const ImageExportFormat& format)
     {
         if (!pane.can_export())
             return;
-        // Snapshot the current frame before the dialog runs its modal event loop.
+        // Snapshot the frame before the modal dialog can tick the playback timer.
         auto image = pane.export_image();
-        wxFileDialog dialog(this, "Export PNG", {}, pane.filename(), "PNG images (*.png)|*.png",
+        wxFileName filename(pane.filename());
+        filename.SetExt(wxString::FromUTF8(format.extension));
+        const auto title = "Export " + wxString::FromUTF8(format.name);
+        wxFileDialog dialog(this, title, {}, filename.GetFullName(), wxString::FromUTF8(format.filter),
                             wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
-        if (dialog.ShowModal() == wxID_OK && !image.SaveFile(dialog.GetPath(), wxBITMAP_TYPE_PNG))
-            wxMessageBox("Could not save the PNG image.", "Export PNG", wxOK | wxICON_ERROR, this);
+        if (dialog.ShowModal() != wxID_OK)
+            return;
+        wxTempFileOutputStream output(dialog.GetPath());
+        if (!save_image(std::move(image), output, format) || !output.Commit())
+            wxMessageBox("Could not save the image.", title, wxOK | wxICON_ERROR, this);
     }
 
     long selected_record(goldbox::RecordKind kind) const
@@ -1379,6 +1448,9 @@ class ExplorerApp : public wxApp {
     bool OnInit() override
     {
         wxImage::AddHandler(new wxPNGHandler);
+#if wxUSE_LIBJPEG
+        wxImage::AddHandler(new wxJPEGHandler);
+#endif
         fs::path initial;
         if (argc > 1)
             initial = fs::u8path(wxString(argv[1]).ToUTF8().data());
