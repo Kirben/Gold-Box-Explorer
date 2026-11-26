@@ -618,6 +618,19 @@ void walls(const fs::path& dir)
     const auto slot_three = wall_perspective(map, pc98, 8, 8, 0);
     check(slot_three.width == 176 && slot_three.rgba.at((40 * 176 + 80) * 4 + 1) == 0,
           "PC-98 map preview collapsed empty wall slots");
+    dax(dir / "8X8D5.DAX", 24, tile);
+    dax(dir / "WALLDEF5.DAX", 24, Bytes(1560, 1));
+    dax(dir / "ECL5.DAX", 3, {0x37, 0, 24, 0, 25, 0, 1});
+    const auto castle = load_map_walls(dir / "GEO5.DAX", 4);
+    check(castle[0].size() == 50 && castle[1].size() == 50 && castle[2].size() == 50,
+          "Castle wall definitions did not fill successive slots");
+
+    dax(dir / "ECL8.DAX", 16, {0x21, 0, 30, 0, 2, 0, 255,
+                                0x37, 0, 1, 0, 255, 0, 255});
+    const auto alternate = load_map_walls(dir / "GEO8.DAX", 30);
+    check(alternate[0].size() == 50 && alternate[1].empty() && alternate[2].empty(),
+          "A map loaded from a different script lost its wall bank or empty slots");
+
 }
 
 Bytes character()

@@ -29,6 +29,7 @@
 #include <wx/wfstream.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <fstream>
 #include <functional>
@@ -466,6 +467,8 @@ private:
     bool fit_ = false;
 };
 
+enum class MapNavigation { forward, back, turn_left, turn_right };
+
 class Gallery : public wxFrame {
 public:
     explicit Gallery(const fs::path& initial)
@@ -489,10 +492,20 @@ public:
         pictures_ = new wxListBox(picture_split_, wxID_ANY);
         pictures_->Hide();
         preview_split_ = make_splitter(content);
-        preview_split_->SetSashGravity(1.0);
+        preview_split_->SetSashGravity(0.5);
         preview_ = new Preview(preview_split_);
-        perspective_ = new Preview(preview_split_);
-        perspective_->Hide();
+        perspective_group_ = new wxPanel(preview_split_);
+        auto* perspective_layout = new wxBoxSizer(wxVERTICAL);
+        perspective_ = new Preview(perspective_group_);
+        perspective_->SetMinSize(wxSize(-1, FromDIP(205)));
+        perspective_layout->Add(perspective_, 0, wxEXPAND);
+        perspective_group_->SetSizer(perspective_layout);
+        perspective_group_->Bind(wxEVT_SIZE, [this](wxSizeEvent& event) {
+            const int size = std::clamp(event.GetSize().x, FromDIP(60), FromDIP(205));
+            perspective_->SetMinSize(wxSize(-1, size));
+            event.Skip();
+        });
+        perspective_group_->Hide();
         preview_split_->Initialize(preview_);
         hex_ = new HexView(content);
         hex_->Hide();
@@ -519,16 +532,39 @@ public:
         play_ = new wxButton(panel, wxID_ANY, "Play");
         play_->Hide();
         controls->Add(play_, 0, wxRIGHT, 8);
-        facing_ = new wxChoice(panel, wxID_ANY);
+        map_controls_ = new wxPanel(content);
+        auto* map_controls_layout = new wxBoxSizer(wxVERTICAL);
+        facing_ = new wxChoice(map_controls_, wxID_ANY);
         for (const auto* direction : {"North", "East", "South", "West"})
             facing_->Append(direction);
         facing_->SetSelection(0);
-        facing_->Hide();
-        controls->Add(facing_, 0);
+        constexpr const char* navigation_labels[]{"Forward", "Back", "Turn Left", "Turn Right"};
+        constexpr const char* navigation_keys[]{"Up", "Down", "Left", "Right"};
+        for (unsigned i = 0; i < map_navigation_.size(); ++i) {
+            auto* button = new wxButton(map_controls_, wxID_ANY, wxString::FromUTF8(navigation_labels[i]),
+                                        wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
+            button->SetToolTip(wxString::Format("%s (%s arrow)", wxString::FromUTF8(navigation_labels[i]),
+                                               wxString::FromUTF8(navigation_keys[i])));
+            button->Bind(wxEVT_BUTTON, [this, i](wxCommandEvent&) {
+                navigate_map(static_cast<MapNavigation>(i));
+            });
+            map_navigation_[i] = button;
+        }
+        const int control_gap = FromDIP(4);
+        auto* turn_controls = new wxBoxSizer(wxHORIZONTAL);
+        turn_controls->Add(map_navigation_[2], 0, wxRIGHT, control_gap);
+        turn_controls->Add(map_navigation_[3]);
+        map_controls_layout->Add(facing_, 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, control_gap);
+        map_controls_layout->Add(map_navigation_[0], 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, control_gap);
+        map_controls_layout->Add(turn_controls, 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, control_gap);
+        map_controls_layout->Add(map_navigation_[1], 0, wxALIGN_CENTER_HORIZONTAL | wxTOP | wxBOTTOM, control_gap);
+        map_controls_->SetSizer(map_controls_layout);
+        map_controls_->Hide();
+        content_layout->Insert(1, map_controls_, 0, wxEXPAND);
         original_map_ = new wxCheckBox(panel, wxID_ANY, "Show original map");
         original_map_->Hide();
         controls->Add(original_map_, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, 8);
-        layout->Add(controls, 0, wxALL, 8);
+        layout->Add(controls, 0, wxALL, FromDIP(8));
         panel->SetSizer(layout);
         CreateStatusBar();
 
@@ -685,9 +721,28 @@ public:
             if (event.GetIndex() >= 0)
                 show_fields(static_cast<std::size_t>(event.GetIndex()));
         });
+        Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent& event) {
+            const auto* focus = wxWindow::FindFocus();
+            if (map_navigation_available() && !event.HasModifiers() &&
+                (focus == preview_ || focus == perspective_ ||
+                 std::find(map_navigation_.begin(), map_navigation_.end(), focus) != map_navigation_.end())) {
+                switch (event.GetKeyCode()) {
+                case WXK_UP: navigate_map(MapNavigation::forward); return;
+                case WXK_DOWN: navigate_map(MapNavigation::back); return;
+                case WXK_LEFT: navigate_map(MapNavigation::turn_left); return;
+                case WXK_RIGHT: navigate_map(MapNavigation::turn_right); return;
+                }
+            }
+            event.Skip();
+        });
+        perspective_->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& event) {
+            perspective_->SetFocus();
+            event.Skip();
+        });
         preview_->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& event) {
-            if (!geo_ || !perspective_->IsShown())
+            if (!map_navigation_available())
                 return;
+            preview_->SetFocus();
             if (const auto cell = map_cell(event.GetPosition())) {
                 cursor_x_ = cell->x;
                 cursor_y_ = cell->y;
@@ -699,10 +754,10 @@ public:
                 if (const auto cell = map_cell(event.GetPosition()))
                     open_map_event(*cell);
         });
-        browse(folder, initial.filename());
-        if (goldbox::is_disk_image(initial))
-            mount_image(initial);
-        CallAfter([folders] {
+        CallAfter([this, folder, initial, folders] {
+            browse(folder, initial.filename());
+            if (goldbox::is_disk_image(initial))
+                mount_image(initial);
             auto* tree = folders->GetTreeCtrl();
             const auto selected = tree->GetSelection();
             if (selected.IsOk())
@@ -719,6 +774,33 @@ public:
     }
 
 private:
+    bool map_navigation_available() const
+    {
+        return geo_ && preview_split_->IsShown() && !records_.empty() &&
+            pictures_->GetSelection() != wxNOT_FOUND;
+    }
+
+    void navigate_map(MapNavigation action)
+    {
+        if (!map_navigation_available())
+            return;
+        const int direction = facing_->GetSelection();
+        const int directions = facing_->GetCount();
+        if (direction < 0 || direction >= directions)
+            return;
+        if (action == MapNavigation::turn_left || action == MapNavigation::turn_right) {
+            const int step = action == MapNavigation::turn_left ? -1 : 1;
+            facing_->SetSelection((direction + step + directions) % directions);
+        } else {
+            constexpr int dx[]{0, 1, 0, -1};
+            constexpr int dy[]{-1, 0, 1, 0};
+            const int step = action == MapNavigation::forward ? 1 : -1;
+            cursor_x_ = std::clamp(cursor_x_ + step * dx[direction], 0, goldbox::map_side - 1);
+            cursor_y_ = std::clamp(cursor_y_ + step * dy[direction], 0, goldbox::map_side - 1);
+        }
+        render();
+    }
+
     std::optional<wxPoint> map_cell(wxPoint position) const
     {
         const auto p = preview_->CalcUnscrolledPosition(position) - wxPoint(12, 12);
@@ -1297,14 +1379,28 @@ private:
         zoom_->Show(picture);
         play_->Show(picture && selected_clip());
         if (perspective && !preview_split_->IsSplit()) {
-            perspective_->Show();
-            preview_split_->SplitVertically(preview_, perspective_,
-                                            -(perspective_width_ ? perspective_width_ : FromDIP(205)));
+            perspective_group_->Show();
+            picture_split_->UpdateSize();
+            preview_split_->GetParent()->Layout();
+            const int preferred = perspective_width_ ? perspective_width_ : FromDIP(205);
+            const int width = preview_split_->GetClientSize().x;
+            const int controls_width = map_controls_->GetBestSize().x;
+            const int right_width = std::min(std::max(FromDIP(60), width - FromDIP(60)),
+                std::max(controls_width, std::min(preferred, width / 2)));
+            preview_split_->SplitVertically(preview_, perspective_group_, -right_width);
         } else if (!perspective && preview_split_->IsSplit()) {
             perspective_width_ = preview_split_->GetClientSize().x - preview_split_->GetSashPosition();
-            preview_split_->Unsplit(perspective_);
+            preview_split_->Unsplit(perspective_group_);
         }
-        facing_->Show(perspective);
+        auto* content = preview_split_->GetParent();
+        auto* controls_parent = perspective ? static_cast<wxWindow*>(perspective_group_) : content;
+        if (map_controls_->GetParent() != controls_parent) {
+            map_controls_->GetContainingSizer()->Detach(map_controls_);
+            map_controls_->Reparent(controls_parent);
+            controls_parent->GetSizer()->Insert(1, map_controls_, 0, wxEXPAND);
+        }
+        map_controls_->Show(picture && geo_ && !records_.empty());
+        perspective_group_->Layout();
         hex_->Show(raw);
         tables_->Show(fields);
         original_map_->Show(map_comparison);
@@ -1439,22 +1535,30 @@ private:
                     }
                 }
                 const auto& banks = entry.first->second;
-                const bool has_walls = !banks[0].empty();
+                const bool has_walls = std::any_of(banks.begin(), banks.end(),
+                    [](const auto& bank) { return !bank.empty(); });
                 const int direction = facing_->GetSelection();
                 preview_->show_map(map, zoom_->GetSelection() + 1, cursor_x_, cursor_y_,
-                                   has_walls ? direction : -1,
+                                   direction,
                                    export_name(wxString::Format("-map-%02X", record.id)));
-                show_view(true, false, true, has_walls);
+                std::optional<goldbox::Frame> view;
                 if (has_walls) {
-                    const auto view = goldbox::wall_perspective(map, banks, cursor_x_, cursor_y_, direction);
-                    perspective_->show(&view, 2, export_name(wxString::Format("-map-%02X-view-%d-%d-%d",
-                        record.id, cursor_x_, cursor_y_, direction)));
-                    SetStatusText(wxString::Format("Map %u   |   Camera (%d, %d)   |   Click to move, double-click for ECL",
-                                                   record.id, cursor_x_, cursor_y_));
-                } else {
-                    SetStatusText(amiga_geo_ ? pictures_->GetString(selected) + "   |   Double-click a square for ECL" :
-                        wxString::Format("Map %u   |   Double-click a square for ECL", record.id));
+                    try {
+                        view = goldbox::wall_perspective(map, banks, cursor_x_, cursor_y_, direction);
+                    } catch (const std::exception&) {
+                        // Keep the overhead map usable if the optional 3D view fails.
+                    }
                 }
+                show_view(true, false, true, view.has_value());
+                if (view)
+                    perspective_->show(&*view, 0, export_name(wxString::Format("-map-%02X-view-%d-%d-%d",
+                        record.id, cursor_x_, cursor_y_, direction)));
+                const auto label = amiga_geo_ ? pictures_->GetString(selected) : wxString::Format("Map %u", record.id);
+                auto status = label + wxString::Format("   |   Camera (%d, %d)   |   Arrow keys with map focused",
+                                                        cursor_x_, cursor_y_);
+                if (!view)
+                    status += "   |   3D wall set unavailable";
+                SetStatusText(status);
             } catch (const std::exception& error) {
                 show_view(false, true, true);
                 show_record();
@@ -1481,9 +1585,12 @@ private:
     wxChoice* zoom_;
     wxButton* play_;
     wxChoice* facing_;
+    wxPanel* map_controls_;
+    std::array<wxButton*, 4> map_navigation_{};
     wxCheckBox* original_map_;
     Preview* preview_;
     Preview* perspective_;
+    wxPanel* perspective_group_;
     wxSplitterWindow* picture_split_;
     wxSplitterWindow* preview_split_;
     HexView* hex_;

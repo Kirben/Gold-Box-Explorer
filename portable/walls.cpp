@@ -216,18 +216,25 @@ public:
         return compose_pieces(record, bank, record.pc98);
     }
 
-    bool wall_location(unsigned id, std::string& name, const DaxRecord*& record)
+    bool wall_location(unsigned id, const std::string& preferred, std::string& name,
+                       const DaxRecord*& record)
     {
-        for (const auto& file : files_) {
-            if (!is_wall_archive(file.second))
-                continue;
-            for (const auto& block : archive(file.first)) {
+        const auto find = [&](const std::string& filename) {
+            for (const auto& block : archive(filename)) {
                 if (block.id == id) {
-                    name = file.first;
+                    name = filename;
                     record = &block;
                     return true;
                 }
             }
+            return false;
+        };
+        if (find(preferred))
+            return true;
+        for (const auto& file : files_) {
+            if (file.first != preferred && is_wall_archive(file.second) &&
+                upper(file.second.extension().string()) == ".DAX" && find(file.first))
+                return true;
         }
         return false;
     }
@@ -377,33 +384,33 @@ std::vector<Frame> read_wall_pieces(const fs::path& path)
 WallBanks load_map_walls(const fs::path& geo_path, unsigned map_id)
 {
     WallResources resources(geo_path.parent_path());
-    const auto companion = "ECL" + upper(geo_path.filename().string()).substr(3);
-    const auto& scripts = resources.archive(companion);
+    const auto suffix = upper(geo_path.filename().string()).substr(3);
+    const auto& scripts = resources.archive("ECL" + suffix);
     const auto assemble = [&](const std::array<unsigned, 3>& selection, bool pc98) -> std::optional<WallBanks> {
+        constexpr unsigned views_per_slot = 50;
         WallBanks result;
         for (unsigned i = 0; i < result.size();) {
             const auto value = selection[i];
-            if (pc98 && value == 255) {
+            if (value == 255) {
                 ++i;
                 continue;
             }
             std::string name;
             const DaxRecord* record = nullptr;
-            const auto id = value == 127 || value == 255 ? (pc98 ? 0u : map_id) : value;
-            if (!resources.wall_location(id, name, record))
+            const bool default_walls = value == 127 && (pc98 || i == 0);
+            const auto id = default_walls ? 0u : value;
+            if (!resources.wall_location(id, "WALLDEF" + suffix, name, record))
                 return {};
             auto frames = resources.assemble(*record, name);
-            if (pc98) {
-                // GAME.OVR copies one 780-byte definition into each successive slot.
-                constexpr unsigned views_per_slot = 50;
-                for (std::size_t first = 0; first < frames.size() && i < result.size(); first += views_per_slot, ++i)
-                    result[i].assign(std::make_move_iterator(frames.begin() + first),
-                                     std::make_move_iterator(frames.begin() + first + views_per_slot));
-                if (value == 127)
-                    break;
-            } else {
-                result[i++] = std::move(frames);
-            }
+            if (frames.empty() || frames.size() % views_per_slot ||
+                frames.size() / views_per_slot > result.size() - i)
+                return {};
+            // Both View3D implementations fill successive banks for multi-slot records.
+            for (std::size_t first = 0; first < frames.size(); first += views_per_slot, ++i)
+                result[i].assign(std::make_move_iterator(frames.begin() + first),
+                                 std::make_move_iterator(frames.begin() + first + views_per_slot));
+            if (default_walls)
+                break;
         }
         if (std::any_of(result.begin(), result.end(), [](const auto& bank) { return !bank.empty(); }))
             return result;
@@ -412,15 +419,48 @@ WallBanks load_map_walls(const fs::path& geo_path, unsigned map_id)
     if (const auto original = pc98_wall_selection(scripts, map_id))
         if (auto result = assemble(*original, true))
             return std::move(*result);
+
+    const auto command = [](const DaxRecord& script, std::size_t pos, unsigned opcode) {
+        const auto& b = script.bytes;
+        return pos + 7 <= b.size() && b[pos] == opcode && !b[pos + 1] && !b[pos + 3] && !b[pos + 5];
+    };
+    const auto pieces = [&](const DaxRecord& script, std::size_t pos) {
+        const auto& b = script.bytes;
+        return assemble({b[pos + 2], b[pos + 4], b[pos + 6]}, script.pc98);
+    };
+    // A constant LOAD_FILES for this map immediately followed by LOAD_PIECES
+    // also identifies maps entered from another script, such as GEO8's 30 and 32.
+    for (const auto& script : scripts) {
+        for (std::size_t pos = 0; pos + 14 <= script.bytes.size(); ++pos) {
+            if (command(script, pos, 0x21) && script.bytes[pos + 2] == map_id &&
+                command(script, pos + 7, 0x37)) {
+                if (auto result = pieces(script, pos + 7))
+                    return std::move(*result);
+            }
+        }
+    }
     for (const auto& script : scripts) {
         if (script.id != map_id)
             continue;
-        const auto& bytes = script.bytes;
-        for (std::size_t pos = 0; pos + 7 <= bytes.size(); ++pos) {
-            if (bytes[pos] != 0x37 || bytes[pos + 1] || bytes[pos + 3] || bytes[pos + 5])
+        for (std::size_t pos = 0; pos + 7 <= script.bytes.size(); ++pos) {
+            if (command(script, pos, 0x37))
+                if (auto result = pieces(script, pos))
+                    return std::move(*result);
+        }
+    }
+    // Pool of Radiance's Valjevo Castle submaps retain the banks loaded
+    // by the castle script. Match that script's specific LOAD_PIECES signature.
+    if (suffix == "5.DAX" && map_id >= 3 && map_id <= 7) {
+        for (const auto& script : scripts) {
+            if (script.id != 3 || script.pc98)
                 continue;
-            if (auto result = assemble({bytes[pos+2], bytes[pos+4], bytes[pos+6]}, script.pc98))
-                return std::move(*result);
+            for (std::size_t pos = 0; pos + 7 <= script.bytes.size(); ++pos) {
+                constexpr unsigned castle[]{24, 25, 1};
+                if (command(script, pos, 0x37) && script.bytes[pos + 2] == castle[0] &&
+                    script.bytes[pos + 4] == castle[1] && script.bytes[pos + 6] == castle[2])
+                    if (auto result = pieces(script, pos))
+                        return std::move(*result);
+            }
         }
     }
     throw std::runtime_error("No matching DOS wall sets found in the companion ECL archive");
@@ -460,7 +500,7 @@ Frame wall_perspective(const GeoMap& map, const WallBanks& banks, int x, int y, 
             return;
         const Frame* piece = nullptr;
         for (const auto& bank : banks) {
-            const auto count = scale == 2 ? 5 : bank.size() / 10;
+            constexpr unsigned count = 5;
             if (type <= count) {
                 const auto index = (type - 1) * 10 + view;
                 if (index < bank.size())
