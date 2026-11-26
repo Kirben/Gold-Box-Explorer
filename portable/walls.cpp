@@ -432,7 +432,19 @@ Frame wall_perspective(const GeoMap& map, const WallBanks& banks, int x, int y, 
     const auto scale = nonempty == banks.end() ? 1 : static_cast<int>(nonempty->front().width / 8);
     const auto size = 88 * scale;
     Frame result{0, 0, static_cast<unsigned>(size), static_cast<unsigned>(size),
-                 std::vector<std::uint8_t>(size * size * 4, 255)};
+                 std::vector<std::uint8_t>(size * size * 4)};
+    // The original DOS view uses four bands. These subdued preview colours
+    // stand in for the dynamic ceiling and floor selectors held by the game.
+    constexpr std::array<std::uint8_t, 4> ceiling{49, 57, 65, 255};
+    constexpr std::array<std::uint8_t, 4> horizon_line{32, 34, 36, 255};
+    constexpr std::array<std::uint8_t, 4> horizon{80, 76, 70, 255};
+    constexpr std::array<std::uint8_t, 4> floor{70, 56, 43, 255};
+    for (int row = 0; row < size; ++row) {
+        const auto y = row / scale;
+        const auto& color = y < 43 ? ceiling : y == 43 ? horizon_line : y < 46 ? horizon : floor;
+        for (int col = 0; col < size; ++col)
+            std::copy(color.begin(), color.end(), result.rgba.data() + 4 * (row * size + col));
+    }
     constexpr int dx[] = {0, 1, 0, -1};
     constexpr int dy[] = {-1, 0, 1, 0};
     const auto right = (direction + 1) % 4;
