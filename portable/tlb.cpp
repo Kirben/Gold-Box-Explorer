@@ -696,6 +696,7 @@ std::string glb_map_label(unsigned id, const std::uint8_t* walls, unsigned cells
         {14, 0xec0112461b629753ull, "Naulidis"},
         {18, 0x73efac31fe53d2d8ull, "Hamlet of Hizden"},
         {22, 0x8b5462b5871df0feull, "Luminari"},
+        {24, 0x8a0e10b51a5a7cadull, "Hizden (alternate layout)"},
         {26, 0xe7e089e14852c1b5ull, "Hulderfolk Wood"},
         {30, 0x297157f8d6d255dbull, "New Aurim"},
         {34, 0xff75ebb3de30207dull, "Palace of the Thenol King"},
