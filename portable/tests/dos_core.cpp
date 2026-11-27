@@ -567,6 +567,7 @@ void geo(const fs::path& dir)
     dax(path, 15, data);
     const auto records = read_dax(path);
     check(records.size() == 1 && records[0].id == 15, "Unexpected GEO directory");
+    check(geo_map_name(records[0]).empty(), "A reused map ID inherited a Pool of Radiance name");
     const auto map = read_geo_map(records[0]);
     const auto& cell = map[index];
     check(cell.walls == std::array<unsigned, 4>{1, 2, 3, 4}, "Wall order changed");

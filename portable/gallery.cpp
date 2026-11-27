@@ -83,22 +83,11 @@ bool save_image(wxImage image, wxOutputStream& stream, const ImageExportFormat& 
     return image.SaveFile(stream, format.type) && stream.IsOk();
 }
 
-wxString amiga_map_label(unsigned id)
+wxString geo_map_label(const goldbox::DaxRecord& record)
 {
-    static const char* const names[]{
-        "Civilized Area, New Phlan", "Buccaneer Base", "Cadorna Textile House",
-        "Valjevo Castle, North West", "Valjevo Castle, North East", "Valjevo Castle, South East",
-        "Valjevo Castle, South West", "Valjevo Castle, Inner Tower", nullptr, "Stojanow Gate",
-        "Valhingen Graveyard", nullptr, nullptr, "Kobold Caves", "Kovel Mansion", "Mendor's Library",
-        "Lizard Men Keep", "Nomad Camp", "Podal Plaza", nullptr, "Slums", "Sokal Keep",
-        "Sorcerer's Island, Level 1", "Sorcerer's Island, Level 2 and 3", "Temple of Bane",
-        "Western Wilderness Caves", "Central Wilderness Groves and Ruined Huts", "Eastern Wilderness Caves",
-        "Outpost of Zhentil Keep", "Kuto's Well", "Lizard Men Catacombs", "Wealthy Area",
-        "Kuto's Well Catacombs"
-    };
-    if (id < std::size(names) && names[id])
-        return wxString::FromUTF8(names[id]);
-    return wxString::Format("Map %u", id);
+    const auto name = goldbox::geo_map_name(record);
+    return name.empty() ? wxString::Format("Map %u", record.id)
+                        : wxString::FromUTF8(name.data(), name.size());
 }
 
 class RecordList : public wxListCtrl {
@@ -1290,8 +1279,7 @@ private:
                             if (!records_.empty()) {
                                 show_view(geo_, !geo_, true);
                                 for (const auto& record : records_)
-                                    pictures_->Append(amiga_geo_ && path.stem().u8string().size() == 3
-                                                       ? amiga_map_label(record.id) : geo_ ? wxString::Format("Map %u", record.id)
+                                    pictures_->Append(geo_ ? geo_map_label(record)
                                                            : wxString::Format("Record $%02X", record.id));
                                 pictures_->SetSelection(0);
                                 render();
@@ -1553,7 +1541,7 @@ private:
                 if (view)
                     perspective_->show(&*view, 0, export_name(wxString::Format("-map-%02X-view-%d-%d-%d",
                         record.id, cursor_x_, cursor_y_, direction)));
-                const auto label = amiga_geo_ ? pictures_->GetString(selected) : wxString::Format("Map %u", record.id);
+                const auto label = pictures_->GetString(selected);
                 auto status = label + wxString::Format("   |   Camera (%d, %d)   |   Arrow keys with map focused",
                                                         cursor_x_, cursor_y_);
                 if (!view)

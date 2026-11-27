@@ -1,4 +1,5 @@
 #include "tlb.h"
+#include "geo.h"
 
 #include <algorithm>
 #include <array>
@@ -683,6 +684,41 @@ PictureArchive read_amiga_tiles(const Library& library, const fs::path& path)
     return result;
 }
 
+std::string glb_map_label(unsigned id, const std::uint8_t* walls, unsigned cells)
+{
+    // Dark Queen's ECL selects these GEO records by ID. Check both wall
+    // planes so another release or an edited layout can fall back to its ID.
+    struct Area { unsigned id; std::uint64_t hash; const char* name; };
+    static constexpr Area areas[] = {
+        {2, 0x399b9b815845e313ull, "Shared Encounter Map"},
+        {4, 0x7475ce968a73b889ull, "Palanthas and Caergoth"},
+        {10, 0x552e973b6e98cef6ull, "Draconian Caves"},
+        {14, 0xec0112461b629753ull, "Naulidis"},
+        {18, 0x73efac31fe53d2d8ull, "Hamlet of Hizden"},
+        {22, 0x8b5462b5871df0feull, "Luminari"},
+        {26, 0xe7e089e14852c1b5ull, "Hulderfolk Wood"},
+        {30, 0x297157f8d6d255dbull, "New Aurim"},
+        {34, 0xff75ebb3de30207dull, "Palace of the Thenol King"},
+        {38, 0x9c632bdfe7a62e99ull, "Kristophan"},
+        {42, 0xc47cca6259bcf905ull, "The Tombs"},
+        {46, 0x66a7725834a33727ull, "Hawkbluff"},
+        {47, 0xc0f7ba5374dbb367ull, "Hawkbluff (Second Layout)"},
+        {50, 0x1b7a688efffc2e0aull, "Blackwater Glade"},
+        {54, 0xb24b5ec1a562798cull, "Bai'or"},
+        {58, 0x948858c9a24d70bdull, "Aldinanachru"},
+        {62, 0xad21d2330417c48aull, "Tower of Flame"},
+        {63, 0xaef0928cccec5377ull, "Tower of Flame (Open Shafts)"},
+        {66, 0x035e8e44ac4ed4e8ull, "The Abyss"},
+    };
+    std::uint64_t hash = 14695981039346656037ull;
+    for (unsigned i = 0; i < 2 * cells; ++i)
+        hash = (hash ^ walls[i]) * 1099511628211ull;
+    for (const auto& area : areas)
+        if (area.id == id && area.hash == hash)
+            return area.name;
+    return "Map " + std::to_string(id);
+}
+
 PictureArchive read_amiga_geo(const Library& maps)
 {
     PictureArchive result;
@@ -727,6 +763,10 @@ PictureArchive read_amiga_geo(const Library& maps)
                     for (unsigned dx = 5; dx < 8; ++dx)
                         paint(x + dx, y + dy, event);
         }
+        const auto name = rows == map_side && cols == map_side
+            ? geo_map_name(id, area.data + header, 4 * cells) : std::string_view{};
+        result.frame_labels.push_back(name.empty() ? glb_map_label(id, area.data + header, cells)
+                                                   : std::string(name));
         result.frames.push_back(std::move(frame));
     }
     return result;
@@ -942,6 +982,7 @@ PictureArchive read_geo_glb(const fs::path& path)
             draw_layer(map, tiles[glyph], static_cast<int>(cell % cols * tile_size) + dx,
                           static_cast<int>(cell / cols * tile_size) + dy);
         }
+        result.frame_labels.push_back(glb_map_label(id, ne, cells));
         result.frames.push_back(std::move(map));
     }
     return result;
