@@ -80,7 +80,9 @@ std::optional<MapMask> explored(const Bytes& data, unsigned script, unsigned map
 bool is_saved_world(const std::filesystem::path& path)
 {
     static const std::regex name(R"(SAVGAM[A-Z]\.DAT)", std::regex::icase);
-    return std::regex_match(path.filename().string(), name);
+    std::error_code error;
+    return std::regex_match(path.filename().string(), name) &&
+           std::filesystem::file_size(path, error) == 13137 && !error;
 }
 
 SavedMap read_saved_map(const std::filesystem::path& path)

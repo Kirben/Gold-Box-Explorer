@@ -1006,6 +1006,25 @@ void saves(const fs::path& dir)
           "Unexpected saved map changes");
     check(area.visited && area.visited->count() == 1 && area.visited->test(position),
           "Unexpected explored cells");
+
+    // The two Buck Rogers SaveLoad units serialize byte banks; Gateway and
+    // Curse serialize word banks plus the active ECL. Both end in String[40]s.
+    for (unsigned size : {2901u, 13149u}) {
+        Bytes party(size);
+        party[size == 2901 ? 2561 : 12801] = 11;
+        const auto roster = size - 328;
+        party[roster - 1] = 1;
+        party[roster] = 3;
+        party[roster + 1] = 'O';
+        party[roster + 2] = 'R';
+        party[roster + 3] = 'C';
+        const auto slot = folder / "SAVGAMB.DAT";
+        write(slot, party);
+        check(!is_saved_world(slot), "Later DOS save sent to Pool map decoder");
+        const auto rows = read_record_rows(slot);
+        check(rows.size() == 2 && rows[1].name == "Orc" &&
+              has_field(rows[0], {"Map X", "11"}), "Later DOS party roster or position lost");
+    }
 }
 }
 

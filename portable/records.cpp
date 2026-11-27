@@ -1097,10 +1097,30 @@ std::vector<RecordRow> read_countdown_ships(const std::filesystem::path& path)
 std::vector<RecordRow> read_vault(const std::filesystem::path& path)
 {
     constexpr unsigned header_size = 16;
-    constexpr unsigned record_size = 18;
     constexpr unsigned padded_records = 50;
     const auto bytes = read_record_file(path);
     const auto* data = bytes.data();
+    // Pascal SaveVault writes three long currency totals followed by TItem records.
+    const bool gateway = bytes.size() >= 28 && (bytes.size() - 28) % item_size == 0;
+    const unsigned money_bytes = gateway ? 28 : 12;
+    const bool tagged = bytes.size() >= 866 && word(data, 12) == 0xffff;
+    if (!tagged && bytes.size() >= money_bytes && (bytes.size() - money_bytes) % item_size == 0) {
+        std::vector<RecordRow> rows{{0, 0, "Vault contents", {}}};
+        constexpr const char* currencies[]{"Copper", "Silver", "Electrum", "Gold", "Platinum", "Gems", "Jewels"};
+        for (unsigned i = 0; i < money_bytes / 4; ++i)
+            field(rows.front(), gateway ? currencies[i] : i == 0 ? "Coin total" : currencies[4 + i],
+                  word(data, i * 4) | (std::uint32_t(word(data, i * 4 + 2)) << 16));
+        for (unsigned offset = money_bytes; offset < bytes.size(); offset += item_size)
+            rows.push_back(item(0, (offset - money_bytes) / item_size, data + offset, nullptr, false));
+        return rows;
+    }
+    // Dark Queen uses 17-byte ItemRec and FRUA uses 18. Beyond the
+    // mandatory padding, use the corresponding save slot to disambiguate.
+    const bool queen = bytes.size() == 866 ||
+        (bytes.size() > 866 && (bytes.size() - header_size) % 17 == 0 &&
+         ((bytes.size() - header_size) % 18 != 0 ||
+          std::filesystem::exists(path.parent_path() / ("SAVGAM" + upper(path.stem().string()).substr(5) + ".QSV"))));
+    const unsigned record_size = queen ? 17 : 18;
     if (bytes.size() < header_size + padded_records * record_size ||
         (bytes.size() - header_size) % record_size != 0 || word(data, 12) != 0xffff)
         throw std::runtime_error("Expected a Forgotten Realms Unlimited Adventures DOS vault");
@@ -1110,7 +1130,7 @@ std::vector<RecordRow> read_vault(const std::filesystem::path& path)
         throw std::runtime_error("Invalid FRUA vault item count");
 
     RecordRow summary{0, 0, "Vault contents", {}};
-    field(summary, "Platinum pieces", word(data, 0) | (std::uint32_t(word(data, 2)) << 16));
+    field(summary, queen ? "Steel pieces" : "Platinum pieces", word(data, 0) | (std::uint32_t(word(data, 2)) << 16));
     field(summary, "Gems", word(data, 4) | (std::uint32_t(word(data, 6)) << 16));
     field(summary, "Jewels", word(data, 8) | (std::uint32_t(word(data, 10)) << 16));
     field(summary, "Stored items and bundles", roots);
@@ -1131,7 +1151,7 @@ std::vector<RecordRow> read_vault(const std::filesystem::path& path)
                 continue;
             if (!row.name.empty())
                 row.name += ' ';
-            if (id < std::size(frua_item_components))
+            if (!queen && id < std::size(frua_item_components))
                 row.name += frua_item_components[id];
             else
                 row.name += '[' + std::to_string(id) + ']';
@@ -1169,41 +1189,166 @@ std::vector<RecordRow> read_vault(const std::filesystem::path& path)
     return rows;
 }
 
+void position_fields(RecordRow& row, const std::uint8_t* p)
+{
+    field(row, "Map X", signed_byte(p[0]));
+    field(row, "Map Y", signed_byte(p[1]));
+    field(row, "Facing", p[2]);
+    field(row, "Wall ahead", p[3]);
+    field(row, "Cell event", p[4]);
+}
+
+// Dark Queen saveload.c: game_write_cb embeds each hero_write_cb stream.
+// The item pointer holds a count. Effect pointers are serialized chain markers.
+std::vector<RecordRow> read_queen_save(const std::vector<std::uint8_t>& b, bool party)
+{
+    if (party && b.size() < 0x1f1d)
+        throw std::runtime_error("Truncated Dark Queen party save");
+    auto count = party ? word(b.data(), 0x40d) : 1u;
+    if (count > 8)
+        throw std::runtime_error("Invalid Dark Queen party count");
+    std::vector<RecordRow> rows;
+    if (party) {
+        rows.push_back({0, 0, "Party", {}});
+        auto& summary = rows.back();
+        field(summary, "Map ID", b[0x12]);
+        field(summary, "Script", b[0x15]);
+        field(summary, "Loaded map", b[0xc5]);
+        position_fields(summary, b.data() + 0x400);
+        field(summary, "Party members", count);
+    }
+    std::size_t cursor = party ? 0x40f : 0;
+    auto take = [&](std::size_t length) {
+        if (length > b.size() - cursor)
+            throw std::runtime_error("Truncated Dark Queen character data");
+        const auto* p = b.data() + cursor;
+        cursor += length;
+        return p;
+    };
+    for (unsigned i = 0; i < count; ++i) {
+        const auto* p = take(0x19e);
+        RecordRow member{i + 1, 0, amiga_name(p + 0x68, 16), {}};
+        field(member, "Current HP", p[0x198]);
+        field(member, "Age", word(p, 0x52));
+        field(member, "Class", word(p, 0x5a));
+        field(member, "Status", word(p, 0x64));
+        const auto items = word(p, 8);
+        field(member, "Inventory entries", items);
+        for (unsigned item_index = 0; item_index < items; ++item_index) {
+            const auto* item = take(17);
+            if (item[0] == 'I')
+                take(17u * item[13]);
+        }
+        const auto* link = p + 4;
+        while (word(link, 0) || word(link, 2)) {
+            const auto* effect = take(9);
+            member.fields.emplace_back("Effect " + std::to_string(effect[0]),
+                                       std::to_string(word(effect, 1)) + " minutes");
+            link = effect + 5;
+        }
+        rows.push_back(std::move(member));
+    }
+    return rows;
+}
+
+std::vector<RecordRow> read_dos_party(const std::filesystem::path& path)
+{
+    const auto bytes = read_record_file(path);
+    const auto ext = upper(path.extension().string());
+    if (ext == ".QSV" || ext == ".QCH")
+        return read_queen_save(bytes, ext == ".QSV");
+    // SaveLoad in each Pascal game writes the VM banks, five position bytes,
+    // interface states and wall cache, then a byte count and eight String[40]s.
+    unsigned position = 0;
+    if (ext == ".DAT") {
+        switch (bytes.size()) {
+        case 13149: position = 12801; break; // Curse, Gateway
+        case 5469: position = 5121; break;   // Champions, Silver Blades
+        case 2901: position = 2561; break;   // both Buck Rogers games
+        }
+    } else if (ext == ".PTY") {
+        if (bytes.size() == 1364) position = 1024; // Pools, Treasures
+        if (bytes.size() == 2913) position = 2561; // Death Knights
+    }
+    if (!position)
+        throw std::runtime_error("Unsupported DOS party save layout");
+    const auto roster = bytes.size() - 8 * 41;
+    const auto count = bytes[roster - 1];
+    if (count > 8)
+        throw std::runtime_error("Invalid DOS party count");
+    std::vector<RecordRow> rows{{0, 0, "Party", {}}};
+    position_fields(rows.front(), bytes.data() + position);
+    field(rows.front(), "Previous interface", bytes[position + 5]);
+    field(rows.front(), "Current interface", bytes[position + 6]);
+    field(rows.front(), "Party members", count);
+    for (unsigned i = 0; i < count; ++i) {
+        const auto* p = bytes.data() + roster + i * 41;
+        if (!p[0] || p[0] > 40)
+            throw std::runtime_error("Invalid party member filename");
+        const auto stem = name_at(p, 40);
+        RecordRow member{i + 1, 0, stem, {}};
+        const auto filename = upper(stem) + (bytes.size() == 2913 ? ".GAM" : ".SAV");
+        const auto folder = path.has_parent_path() ? path.parent_path() : std::filesystem::path(".");
+        for (const auto& entry : std::filesystem::directory_iterator(folder)) {
+            if (upper(entry.path().filename().string()) != filename || !entry.is_regular_file()) continue;
+            auto data = read_record_file(entry.path());
+            if (known_monster_size(data.size())) {
+                const auto length = static_cast<unsigned>(data.size());
+                member = read_monster({i + 1, length, std::move(data)});
+            }
+            break;
+        }
+        member.fields.emplace_back("Member file", filename);
+        rows.push_back(std::move(member));
+    }
+    return rows;
+}
+
 std::vector<RecordRow> read_save_rows(const std::filesystem::path& path, RecordKind kind)
 {
     const auto bytes = read_record_file(path);
     if (kind == RecordKind::saved_character) {
-        if (bytes.size() != monster_size)
-            throw std::runtime_error("Expected a 285-byte Pool of Radiance DOS character save");
-        auto row = monster(0, bytes.data());
+        if (!known_monster_size(bytes.size()))
+            throw std::runtime_error("Unsupported DOS character save layout");
+        auto row = read_monster({0, static_cast<unsigned>(bytes.size()), bytes});
         row.fields.front() = {"Save file", path.filename().u8string()};
         return {std::move(row)};
     }
     const bool effects = kind == RecordKind::saved_effects;
-    const auto stride = effects ? effect_size : item_size;
-    if (bytes.size() % stride)
-        throw std::runtime_error(effects ? "Expected 9-byte Pool of Radiance DOS effect entries"
-                                        : "Expected 63-byte Pool of Radiance DOS inventory entries");
+    const auto extension = upper(path.extension().string());
+    if (extension == ".WIZ")
+        return {death_knights_spells({0, static_cast<unsigned>(bytes.size()), bytes}, nullptr)};
     std::string owner;
+    std::size_t owner_size = 0;
     const auto folder = path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
-    const auto companion = upper(path.stem().string()) + ".SAV";
     for (const auto& entry : std::filesystem::directory_iterator(folder)) {
-        if (upper(entry.path().filename().string()) != companion)
+        const auto ext = upper(entry.path().extension().string());
+        if (upper(entry.path().stem().string()) != upper(path.stem().string()) ||
+            (ext != ".SAV" && ext != ".GUY" && ext != ".WHO" && ext != ".GAM" && ext != ".PC"))
             continue;
         try {
             const auto character = read_record_file(entry.path());
-            if (character.size() == monster_size)
+            if (known_monster_size(character.size())) {
+                owner_size = character.size();
                 owner = name_at(character.data(), 15);
+            }
         } catch (const std::exception&) {
             // Inventory can be inspected on its own.
         }
         break;
     }
+    const bool buck = extension == ".HID" || (extension == ".STF" &&
+        (owner_size == 259 || owner_size == 263 || (!owner_size && bytes.size() % item_size != 0)));
+    const auto stride = effects ? effect_size : buck ? 62u : item_size;
+    if (bytes.size() % stride)
+        throw std::runtime_error("Truncated DOS saved item or effect");
     std::vector<RecordRow> rows;
     for (unsigned slot = 0; slot < bytes.size() / stride; ++slot) {
         const auto* b = bytes.data() + slot * stride;
         if (!effects) {
-            rows.push_back(item(0, slot, b, owner.empty() ? nullptr : &owner));
+            if (buck) rows.push_back(compact_item(0, slot, b, stride, owner.empty() ? nullptr : &owner));
+            else rows.push_back(item(0, slot, b, owner.empty() ? nullptr : &owner,
+                                     extension == ".ITM", false, owner_size));
             continue;
         }
         rows.push_back(effect(b[0], slot, b, owner.empty() ? nullptr : &owner));
@@ -1266,7 +1411,21 @@ RecordKind record_kind(const std::filesystem::path& path)
     if (std::regex_match(name, item_name)) return RecordKind::items;
     const auto extension = upper(path.extension().string());
     if (extension == ".XMI") return RecordKind::xmi;
+    static const std::regex party_name(R"(SAVGAM[A-JZ]\.(DAT|PTY|QSV))");
+    if (std::regex_match(name, party_name)) return RecordKind::dos_party;
+    if (extension == ".QCH") return RecordKind::dos_party;
+    if (extension == ".GUY" || extension == ".PC" || extension == ".WHO")
+        return RecordKind::saved_character;
+    if (extension == ".SWG" || extension == ".THG" || extension == ".JNK" ||
+        extension == ".STF" || extension == ".HID") return RecordKind::saved_inventory;
+    if (extension == ".FX" || extension == ".EFX" || extension == ".EFF" ||
+        extension == ".SFX" || extension == ".WIZ") return RecordKind::saved_effects;
+    if (extension == ".HIL") return RecordKind::hillsfar_character;
+    if (extension == ".GAM" && name.compare(0, 6, "CHRDAT") == 0)
+        return RecordKind::saved_character;
     const auto stem = upper(path.stem().string());
+    if (stem == "VAULT" && extension.size() == 2 && extension[1] >= 'A' && extension[1] <= 'J')
+        return RecordKind::vault;
     if (extension == ".DAT" && (stem == "VAULT" ||
         (stem.size() == 6 && stem.compare(0, 5, "VAULT") == 0 && stem.back() >= 'A' && stem.back() <= 'Z')))
         return RecordKind::vault;
@@ -1279,6 +1438,21 @@ RecordKind record_kind(const std::filesystem::path& path)
 std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
 {
     const auto kind = record_kind(path);
+    if (kind == RecordKind::dos_party)
+        return read_dos_party(path);
+    if (kind == RecordKind::hillsfar_character) {
+        // Hillsfar hfchar.h starts at the name, four bytes into the .HIL.
+        const auto bytes = read_record_file(path);
+        if (bytes.size() != 188) throw std::runtime_error("Invalid Hillsfar character size");
+        const auto* p = bytes.data() + 4;
+        RecordRow row{0, 0, amiga_name(p, 16), {}};
+        field(row, "Age", word(p, 0x1a));
+        field(row, "Current HP", p[0x1c]);
+        field(row, "Maximum HP", p[0x1d]);
+        field(row, "Quest state", p[0x99]);
+        field(row, "Completed quests", p[0xb1]);
+        return {std::move(row)};
+    }
     if (kind == RecordKind::none)
         throw std::runtime_error("Unrecognized DOS record archive");
     if (kind == RecordKind::vault)
