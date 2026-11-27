@@ -1160,6 +1160,27 @@ void ecl_scripts(const fs::path& dir)
 namespace {
 void c64_assets(const fs::path& dir)
 {
+    Bytes party(7426);
+    party[1] = 0x40;
+    party[2 + 0xc00] = party[2 + 0x400 + 5 * 256] = 'A';
+    const auto save = dir / "SAVEDRAGN.PRG";
+    write(save, party);
+    const auto roster = read_record_rows(save);
+    check(roster.size() == 2 && roster[1].name == "A" && roster[1].fields.back().second == "5",
+          "C64 saved roster position and character bank are independent");
+    Bytes cores(7170), runtime(2050);
+    cores[1] = 0x49;
+    cores[2 + 0x400 + 2 * 256] = 'B';
+    runtime[1] = 0x83;
+    runtime[2] = 1;
+    runtime[2 + 13] = 2;
+    const auto unpaired = dir / "unpaired";
+    fs::create_directories(unpaired);
+    write(unpaired / "SAVEDGAME0.PRG", cores);
+    check(read_record_rows(unpaired / "SAVEDGAME0.PRG").size() == 1, "Unpaired cores imply no verified party");
+    write(dir / "SAVEDGAME0.PRG", cores);
+    write(dir / "SAVEDGAME1.PRG", runtime);
+    check(read_record_rows(dir / "SAVEDGAME1.PRG").at(1).name == "B", "C64 split party bank link");
     Bytes bitmap(8002), colors(2002);
     bitmap[1] = colors[1] = 0x10;
     bitmap[2] = 0x1b; // Four selector values in one multicolour bitmap byte.

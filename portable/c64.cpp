@@ -1212,16 +1212,136 @@ bool is_c64_picture(const fs::path& path)
            std::regex_match(name, graphics);
 }
 
+namespace {
+// The D64 browser escapes the PETSCII $02 character-file prefix as "%02".
+bool character_filename(const std::string& name)
+{
+    return name.size() > 7 && name.compare(0, 3, "%02") == 0 &&
+           name.compare(name.size() - 4, 4, ".PRG") == 0;
+}
+
+bool hillsfar_character(const std::string& name)
+{
+    return name.size() > 3 && name.compare(0, 3, "%08") == 0;
+}
+
+bool later_save(const std::string& name)
+{
+    return name == "SAVEDRAGN.PRG" || name == "SAVEDEATH.PRG" || name == "SAVEAZURE.PRG" ||
+           name == "SAVEDBASH.PRG" || name == "SAVEGATEWAY.PRG" || name == "SAVEBUCK.PRG";
+}
+
+std::string party_name(const Bytes& data, unsigned offset, unsigned width = 16)
+{
+    std::string result;
+    for (unsigned i = 0; i < width && data.at(offset + i); ++i) {
+        unsigned c = data[offset + i];
+        if (c >= 0xc1 && c <= 0xda) c -= 128;
+        result += c >= 32 && c <= 126 ? char(c) : '?';
+    }
+    return result;
+}
+
+std::vector<RecordRow> later_party(const Bytes& data, const std::string& name)
+{
+    // CAMP saves [$4b00,$6800). The two shipped Krynn parties have a relocated PRG header.
+    const bool krynn = name == "SAVEDRAGN.PRG" || name == "SAVEDEATH.PRG";
+    require(data, 7426, krynn && data.size() >= 2 && word(data, 0) == 0x4000 ? 0x4000 : 0x4b00);
+    std::vector<RecordRow> rows{{0, 0, "Saved party", {{"File", name}}}};
+    if (name == "SAVEBUCK.PRG") {
+        rows.front().fields.emplace_back("Saved memory range", "$4B00-$67FF");
+        return rows;
+    }
+    for (unsigned slot = 0; slot < 8; ++slot) {
+        auto member = party_name(data, 2 + 0xc00 + slot * 16);
+        if (member.empty()) continue;
+        RecordRow row{slot, slot, member, {{"Party position", std::to_string(slot + 1)}}};
+        for (unsigned bank = 0; bank < 8; ++bank)
+            if (party_name(data, 2 + 0x400 + bank * 256) == member)
+                row.fields.emplace_back("Matching character bank", std::to_string(bank));
+        rows.push_back(std::move(row));
+    }
+    rows.front().fields.emplace_back("Party members", std::to_string(rows.size() - 1));
+    return rows;
+}
+
+std::vector<RecordRow> pool_party(const fs::path& path, const Bytes& selected, bool first)
+{
+    const char* companion_name = first ? "SAVEDGAME1.PRG" : "SAVEDGAME0.PRG";
+    const auto sibling = find_file(fs::absolute(path).parent_path(), companion_name);
+    const Bytes companion = sibling ? read_prg(*sibling) : Bytes{};
+    const auto& cores = first ? selected : companion;
+    const auto& runtime = first ? companion : selected;
+    if (first || sibling) require(cores, 7170, 0x4900);
+    if (!first || sibling) require(runtime, 2050, 0x8300);
+    std::vector<RecordRow> rows{{0, 0, "Saved party", {{"Companion", sibling ? companion_name : "Missing " + std::string(companion_name)}}}};
+    if (!runtime.empty()) {
+        for (unsigned slot = 0; slot < 8; ++slot) {
+            const unsigned at = 2 + slot * 32;
+            if (!runtime[at]) continue;
+            const unsigned bank = runtime[at + 13];
+            if (bank >= 12) throw std::runtime_error("Invalid C64 party character bank");
+            const unsigned core = 2 + 0x400 + bank * 256;
+            RecordRow row{slot, slot, cores.empty() ? "Party member" : party_name(cores, core, 18),
+                {{"Party position", std::to_string(slot + 1)}, {"Character bank", std::to_string(bank)},
+                 {"Hit points", std::to_string(word(runtime, at + 25))}}};
+            if (!cores.empty()) {
+                row.fields.emplace_back("Race ID", std::to_string(cores[core + 0x72]));
+                row.fields.emplace_back("Constitution", std::to_string(cores[core + 0x18]));
+                row.fields.emplace_back("Class ID", std::to_string(cores[core + 0x73]));
+                row.fields.emplace_back("Age", std::to_string(word(cores, core + 0x74)));
+                row.fields.emplace_back("Maximum HP", std::to_string(word(cores, core + 0x76)));
+                for (unsigned i = 0; i < 16; ++i) {
+                    const unsigned type = cores[2 + 0x1000 + bank * 256 + i * 16];
+                    if (type) row.fields.emplace_back("Inventory slot " + std::to_string(i + 1),
+                                                      "Item type " + std::to_string(type));
+                }
+            }
+            rows.push_back(std::move(row));
+        }
+        rows.front().fields.emplace_back("Party members", std::to_string(rows.size() - 1));
+    }
+    if (!cores.empty()) {
+        rows.front().fields.emplace_back("Map ID", std::to_string(cores[2 + 0xc5]));
+        rows.front().fields.emplace_back("Script ID", std::to_string(cores[2 + 0xf2]));
+        for (unsigned i = 0; i < 64; ++i)
+            if (cores[2 + i])
+                rows.push_back({i, i, "Effect " + std::to_string(cores[2 + i]),
+                    {{"Owner index", std::to_string(cores[2 + 64 + i])},
+                     {"Time byte", std::to_string(cores[2 + 128 + i])},
+                     {"Parameter", std::to_string(cores[2 + 0x280 + i])}}});
+    }
+    return rows;
+}
+}
+
 bool is_c64_record(const fs::path& path)
 {
     const auto name = upper(path.filename().string());
-    return name == "ITEMS.PRG" || name == "ITEMNAMES.PRG" || std::regex_match(name, records);
+    return hillsfar_character(name) || character_filename(name) || later_save(name) ||
+           name == "SAVEDGAME0.PRG" || name == "SAVEDGAME1.PRG" ||
+           name == "ITEMS.PRG" || name == "ITEMNAMES.PRG" || std::regex_match(name, records);
 }
 
 std::vector<RecordRow> read_c64_records(const fs::path& path)
 {
     const auto name = upper(path.filename().string());
     const auto bytes = read_prg(path);
+    if (hillsfar_character(name)) {
+        // CG0 fills the character block at $14d3 and indexes the name at $14d5.
+        require(bytes, 202, 0x14d3);
+        return {{0, 0, party_name(bytes, 4, 15), {{"Format", "C64 Hillsfar character"},
+                                                 {"Saved memory range", "$14D3-$159A"}}}};
+    }
+    if (character_filename(name)) {
+        // Countdown GEN writes [$7c00,$7e44), with the character name at the start.
+        require(bytes, 582, 0x7c00);
+        return {{0, 0, party_name(bytes, 2), {{"Format", "C64 saved character"},
+                                               {"Saved memory range", "$7C00-$7E43"}}}};
+    }
+    if (later_save(name)) return later_party(bytes, name);
+    if (name == "SAVEDGAME0.PRG" || name == "SAVEDGAME1.PRG")
+        return pool_party(path, bytes, name == "SAVEDGAME0.PRG");
     auto number = [](RecordRow& row, const char* label, int value) {
         row.fields.emplace_back(label, std::to_string(value));
     };
