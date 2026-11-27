@@ -1025,6 +1025,36 @@ void saves(const fs::path& dir)
         check(rows.size() == 2 && rows[1].name == "Orc" &&
               has_field(rows[0], {"Map X", "11"}), "Later DOS party roster or position lost");
     }
+
+    // The Amiga Gateway writer uses a 434-byte body and the presence of a
+    // four-byte pointer to append each item and effect to the same file.
+    Bytes gateway(12825 + 434 + 66 + 10);
+    gateway[12824] = 1;
+    gateway[12825] = 'A';
+    gateway[12825 + 0x152 + 2] = 1;
+    gateway[12825 + 0xf2 + 1] = 1;
+    gateway[12825 + 434] = 'B';
+    gateway[12825 + 434 + 66] = 23;
+    gateway[12825 + 434 + 66 + 3] = 9;
+    const auto amiga_slot = folder / "SAVGAMC.DAT";
+    write(amiga_slot, gateway);
+    const auto amiga_rows = read_record_rows(amiga_slot);
+    check(amiga_rows.size() == 2 && amiga_rows[1].name == "A" &&
+          has_field(amiga_rows[1], {"Item 1", "B"}) &&
+          has_field(amiga_rows[1], {"Effect 23", "9"}), "Amiga inline roster or byte order mismatch");
+    gateway.pop_back();
+    write(amiga_slot, gateway);
+    bool rejected = false;
+    try { read_record_rows(amiga_slot); }
+    catch (const std::runtime_error&) { rejected = true; }
+    check(rejected, "Truncated Amiga effect accepted");
+
+    Bytes hil(188);
+    hil[4] = 'A';
+    hil[4 + 0x1b] = 31;
+    write(folder / "AMIGA.HIL", hil);
+    check(has_field(read_record_rows(folder / "AMIGA.HIL").front(), {"Age", "31"}),
+          "Amiga Hillsfar age decoded in DOS byte order");
 }
 }
 

@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iterator>
@@ -1100,6 +1101,55 @@ std::vector<RecordRow> read_vault(const std::filesystem::path& path)
     constexpr unsigned padded_records = 50;
     const auto bytes = read_record_file(path);
     const auto* data = bytes.data();
+    // The small vault headers are identical in size on DOS and Amiga.
+    // Use the matching party format to choose byte order and item stride.
+    if ((bytes.size() >= 12 && (bytes.size() - 12) % 72 == 0) ||
+        (bytes.size() >= 28 && (bytes.size() - 28) % 70 == 0)) {
+        const auto folder = path.has_parent_path() ? path.parent_path() : std::filesystem::path(".");
+        static const std::regex slot(R"(SAVGAM[A-J]\.(SAV|PTY))");
+        for (const auto& entry : std::filesystem::directory_iterator(folder)) {
+            if (!std::regex_match(upper(entry.path().filename().string()), slot) || !entry.is_regular_file()) continue;
+            const bool knights = upper(entry.path().extension().string()) == ".PTY";
+            if (knights ? entry.file_size() != 2925 : entry.file_size() < 5143) continue;
+            const unsigned header = knights ? 12 : 28;
+            const unsigned width = knights ? 72 : 70;
+            if (bytes.size() < header || (bytes.size() - header) % width) continue;
+            std::vector<RecordRow> rows{{0, 0, "Vault contents", {{"Format", "Amiga"}}}};
+            constexpr const char* labels[]{"Copper", "Silver", "Electrum", "Gold", "Platinum", "Gems", "Jewels"};
+            for (unsigned at = 0; at < header; at += 4) {
+                const auto label = knights && !at ? "Steel" : labels[(knights ? 4 : 0) + at / 4];
+                field(rows.front(), label, (std::uint32_t(amiga_word(data, at)) << 16) | amiga_word(data, at + 2));
+            }
+            for (unsigned at = header; at < bytes.size(); at += width)
+                rows.push_back({0, (at - header) / width, amiga_name(data + at, 41), {}});
+            return rows;
+        }
+    }
+    // Amiga Dark Queen and Pools reserve 200 item slots; the FFFF tag
+    // precedes a big-endian root count. Unused slots contain template data.
+    if ((bytes.size() == 3616 || bytes.size() == 4016) && word(data, 12) == 0xffff) {
+        const unsigned width = bytes.size() == 3616 ? 18 : 20;
+        const auto roots = amiga_word(data, 14);
+        if (roots <= 200) {
+            std::vector<RecordRow> rows{{0, 0, "Vault contents", {{"Format", "Amiga"}}}};
+            for (unsigned i = 0; i < 3; ++i)
+                field(rows.front(), i == 0 ? "Coins" : i == 1 ? "Gems" : "Jewels",
+                      (std::uint32_t(amiga_word(data, i * 4)) << 16) | amiga_word(data, i * 4 + 2));
+            field(rows.front(), "Stored items and bundles", roots);
+            unsigned slot = 0;
+            for (unsigned i = 0; i < roots; ++i) {
+                if (slot >= 200) throw std::runtime_error("Truncated Amiga vault");
+                const auto* p = data + 16 + width * slot;
+                RecordRow row{i + 1, slot++, "Item type " + std::to_string(p[0]), {}};
+                const unsigned quantity = p[width == 18 ? 13 : 12];
+                field(row, "Quantity", quantity);
+                if (p[0] == 'I') slot += quantity;
+                if (slot > 200) throw std::runtime_error("Truncated Amiga vault bundle");
+                rows.push_back(std::move(row));
+            }
+            return rows;
+        }
+    }
     // Pascal SaveVault writes three long currency totals followed by TItem records.
     const bool gateway = bytes.size() >= 28 && (bytes.size() - 28) % item_size == 0;
     const unsigned money_bytes = gateway ? 28 : 12;
@@ -1251,12 +1301,191 @@ std::vector<RecordRow> read_queen_save(const std::vector<std::uint8_t>& b, bool 
     return rows;
 }
 
-std::vector<RecordRow> read_dos_party(const std::filesystem::path& path)
+// Save streams contain pointer values from the Amiga heap. Only their
+// presence matters: the next serialized node follows the preceding record.
+struct AmigaPartyLayout {
+    unsigned character, item, item_pointer, effect_pointer, name;
+    bool counted_items;
+};
+
+bool read_amiga_members(const std::vector<std::uint8_t>& b, std::size_t& at, unsigned count,
+                        const AmigaPartyLayout& l, std::vector<RecordRow>& rows)
+{
+    auto take = [&](unsigned length) -> const std::uint8_t* {
+        if (at > b.size() || length > b.size() - at) return nullptr;
+        const auto* p = b.data() + at;
+        at += length;
+        return p;
+    };
+    auto linked = [](const std::uint8_t* p) { return amiga_word(p, 0) || amiga_word(p, 2); };
+    for (unsigned i = 0; i < count; ++i) {
+        const auto* p = take(l.character);
+        if (!p || p[l.name] < 32 || !std::memchr(p + l.name, 0, 16)) return false;
+        RecordRow row{i + 1, 0, amiga_name(p + l.name, 16), {}};
+        auto remaining = l.counted_items ? amiga_word(p, l.item_pointer + 2) : unsigned(linked(p + l.item_pointer));
+        unsigned items = 0;
+        while (remaining) {
+            const auto* item = take(l.item);
+            if (!item) return false;
+            ++items;
+            if (l.counted_items) {
+                --remaining;
+                const auto quantity = item[l.item == 18 ? 13 : 12];
+                row.fields.emplace_back("Item type " + std::to_string(item[0]), std::to_string(quantity));
+                if (item[0] == 'I' && !take(quantity * l.item)) return false;
+            } else {
+                row.fields.emplace_back("Item " + std::to_string(items), amiga_name(item, 41));
+                remaining = linked(item + 42);
+                if (l.item == 70 && item[46] == 'I' && !take(item[58] * l.item)) return false;
+            }
+        }
+        field(row, "Inventory entries", items);
+        const auto* link = p + l.effect_pointer;
+        while (linked(link)) {
+            const auto* effect = take(10);
+            if (!effect) return false;
+            row.fields.emplace_back("Effect " + std::to_string(effect[0]), std::to_string(amiga_word(effect, 2)));
+            link = effect + 6;
+        }
+        rows.push_back(std::move(row));
+    }
+    return true;
+}
+
+std::vector<RecordRow> amiga_inline_party(const std::vector<std::uint8_t>& b, unsigned start,
+                                         const AmigaPartyLayout& layout, bool padded, bool single = false)
+{
+    if (start > b.size()) return {};
+    unsigned count = single ? 1 : amiga_word(b.data(), start - 2);
+    if (!count || count > 8) return {};
+    std::vector<RecordRow> rows;
+    if (!single) {
+        rows.push_back({0, 0, "Party", {{"Format", "Amiga"}}});
+        field(rows.front(), "Party members", count);
+        if (start == 12825 || start == 5765) {
+            const unsigned pos = start - 24;
+            field(rows.front(), "Map X", amiga_word(b.data(), pos));
+            field(rows.front(), "Map Y", amiga_word(b.data(), pos + 2));
+            field(rows.front(), "Facing", b[pos + 4]);
+        } else if (start == 5143) {
+            position_fields(rows.front(), b.data() + 5121);
+        }
+    }
+    std::size_t at = start;
+    if (!read_amiga_members(b, at, count, layout, rows) || (!padded && at != b.size())) return {};
+    return rows;
+}
+
+std::vector<RecordRow> read_party_save(const std::filesystem::path& path)
 {
     const auto bytes = read_record_file(path);
     const auto ext = upper(path.extension().string());
+    if (ext == ".DAA" && bytes.size() >= 2633) {
+        // Countdown writer $2A252: 402-byte character, two lists of
+        // 70-byte items, then 10-byte effects. The slot header stores the
+        // counts in three eight-word arrays, just as the native reader uses.
+        const unsigned count = amiga_word(bytes.data(), 2583);
+        if (count > 8) throw std::runtime_error("Invalid Countdown party count");
+        std::vector<RecordRow> rows{{0, 0, "Party", {{"Format", "Amiga Countdown to Doomsday"}}}};
+        field(rows.front(), "Party members", count);
+        field(rows.front(), "Map X", amiga_word(bytes.data(), 2561));
+        field(rows.front(), "Map Y", amiga_word(bytes.data(), 2563));
+        std::size_t at = 2633;
+        for (unsigned i = 0; i < count; ++i) {
+            const auto items = amiga_word(bytes.data(), 2585 + 2 * i);
+            const auto hidden = amiga_word(bytes.data(), 2601 + 2 * i);
+            const auto effects = amiga_word(bytes.data(), 2617 + 2 * i);
+            const auto length = 402u + 70u * (items + hidden) + 10u * effects;
+            if (length > bytes.size() - at) throw std::runtime_error("Truncated Countdown party member");
+            RecordRow row{i + 1, 0, amiga_name(bytes.data() + at, 16), {}};
+            at += 402;
+            for (unsigned j = 0; j < items + hidden; ++j, at += 70)
+                row.fields.emplace_back(j < items ? "Item" : "Hidden item", amiga_name(bytes.data() + at, 41));
+            for (unsigned j = 0; j < effects; ++j, at += 10)
+                field(row, "Effect ID", bytes[at]);
+            rows.push_back(std::move(row));
+        }
+        if (at != bytes.size()) throw std::runtime_error("Invalid Countdown save length");
+        return rows;
+    }
+    // Curse writer at executable offset $260CC, Gateway at $230FE.
+    // Both follow item links at +$2A and effect links at +6.
+    if (ext == ".DAT" || ext == ".GUY") {
+        for (unsigned width : {428u, 434u}) {
+            const AmigaPartyLayout layout{width, 66, 0x152, 0xf2, 0, false};
+            auto rows = amiga_inline_party(bytes, ext == ".GUY" ? 0 : 12825, layout, false, ext == ".GUY");
+            if (!rows.empty()) return rows;
+            // Treasures writes smaller state banks; its slot writer is at $1C344.
+            if (ext == ".DAT" && width == 434) {
+                rows = amiga_inline_party(bytes, 5765, layout, false);
+                if (!rows.empty()) return rows;
+            }
+        }
+    }
+    if (ext == ".SAV") {
+        // Secret's writer at $27144 uses 70-byte items with bundle children.
+        auto rows = amiga_inline_party(bytes, 5143, {340, 70, 0xfe, 0x96, 0, false}, false);
+        if (!rows.empty()) return rows;
+    }
+    if (ext == ".QCH") {
+        auto rows = amiga_inline_party(bytes, 0, {406, 18, 8, 4, 96, true}, false, true);
+        if (!rows.empty()) return rows;
+    }
+    if (ext == ".QSV" || ext == ".PTY") {
+        const bool queen = ext == ".QSV";
+        auto rows = amiga_inline_party(bytes, 1038,
+            {queen ? 406u : 404u, queen ? 18u : 20u, 8, 4, 96, true}, true);
+        if (!rows.empty()) {
+            position_fields(rows.front(), bytes.data() + 1024);
+            return rows;
+        }
+    }
     if (ext == ".QSV" || ext == ".QCH")
         return read_queen_save(bytes, ext == ".QSV");
+    // Pool's Amiga writer omits the disk byte and writes ten position
+    // bytes followed by the interface state and C strings (not String[40]).
+    const bool pool = ext == ".DAT" && bytes.size() == 13141 && bytes[0] == 0;
+    const bool champions = ext == ".DAT" && bytes.size() == 5481;
+    const bool knights = ext == ".PTY" && bytes.size() == 2925;
+    if (pool || champions || knights) {
+        const unsigned stride = pool ? 41 : 42;
+        const unsigned roster = static_cast<unsigned>(bytes.size()) - 8 * stride;
+        const auto count = bytes[roster - 1];
+        if (count > 8) throw std::runtime_error("Invalid Amiga party count");
+        std::vector<RecordRow> rows{{0, 0, "Party", {{"Format", pool ? "Amiga Pool of Radiance" :
+            champions ? "Amiga Champions of Krynn" : "Amiga Death Knights of Krynn"}}}};
+        if (pool) {
+            position_fields(rows.front(), bytes.data() + 0x3200);
+            field(rows.front(), "Map ID", amiga_word(bytes.data(), 2 * 0xc5));
+            field(rows.front(), "Script", amiga_word(bytes.data(), 2 * 0xf2));
+            field(rows.front(), "Location type", bytes[0x320a]);
+            field(rows.front(), "Interface", bytes[0x320b]);
+        } else {
+            const unsigned pos = champions ? 5121 : 2561;
+            field(rows.front(), "Map X", amiga_word(bytes.data(), pos));
+            field(rows.front(), "Map Y", amiga_word(bytes.data(), pos + 2));
+            field(rows.front(), "Facing", bytes[pos + 4]);
+        }
+        field(rows.front(), "Party members", count);
+        const auto folder = path.has_parent_path() ? path.parent_path() : std::filesystem::path(".");
+        for (unsigned i = 0; i < count; ++i) {
+            const auto* p = bytes.data() + roster + i * stride;
+            const auto stem = amiga_name(p, stride);
+            if (stem.empty() || stem.size() > 8)
+                throw std::runtime_error("Invalid Amiga party member filename");
+            RecordRow member{i + 1, 0, stem, {}};
+            for (const auto& entry : std::filesystem::directory_iterator(folder)) {
+                if (upper(entry.path().filename().string()) != upper(stem) + (knights ? ".GAM" : ".SAV")) continue;
+                auto data = read_record_file(entry.path());
+                if (pool && data.size() == 288) member = amiga_monster({i + 1, 288, std::move(data)});
+                if (!pool && data.size() == (knights ? 232u : 426u)) member.name = amiga_name(data.data(), 16);
+                break;
+            }
+            member.fields.emplace_back("Member file", stem + (knights ? ".gam" : ".sav"));
+            rows.push_back(std::move(member));
+        }
+        return rows;
+    }
     // SaveLoad in each Pascal game writes the VM banks, five position bytes,
     // interface states and wall cache, then a byte count and eight String[40]s.
     unsigned position = 0;
@@ -1308,6 +1537,16 @@ std::vector<RecordRow> read_save_rows(const std::filesystem::path& path, RecordK
 {
     const auto bytes = read_record_file(path);
     if (kind == RecordKind::saved_character) {
+        if (upper(path.extension().string()) == ".GUY" && bytes.size() != 422)
+            return read_party_save(path);
+        if ((bytes.size() == 232 || bytes.size() == 426) && bytes.front() >= 32) {
+            RecordRow row{0, 0, amiga_name(bytes.data(), 16), {{"Format", "Amiga character"}}};
+            field(row, "Strength", bytes[16]);
+            field(row, "Intelligence", bytes[18]);
+            return {row};
+        }
+        if (bytes.size() == 288 && bytes.front() >= 32)
+            return {amiga_monster({0, 288, bytes})};
         if (!known_monster_size(bytes.size()))
             throw std::runtime_error("Unsupported DOS character save layout");
         auto row = read_monster({0, static_cast<unsigned>(bytes.size()), bytes});
@@ -1328,6 +1567,14 @@ std::vector<RecordRow> read_save_rows(const std::filesystem::path& path, RecordK
             continue;
         try {
             const auto character = read_record_file(entry.path());
+            if (character.size() == 288 && character.front() >= 32) {
+                owner_size = 288;
+                owner = amiga_name(character.data(), 16);
+            }
+            if ((character.size() == 426 || character.size() == 232) && character.front() >= 32) {
+                owner_size = character.size();
+                owner = amiga_name(character.data(), 16);
+            }
             if (known_monster_size(character.size())) {
                 owner_size = character.size();
                 owner = name_at(character.data(), 15);
@@ -1336,6 +1583,33 @@ std::vector<RecordRow> read_save_rows(const std::filesystem::path& path, RecordK
             // Inventory can be inspected on its own.
         }
         break;
+    }
+    if ((extension == ".ITM" || extension == ".SPC") && owner_size == 288) {
+        const auto stride = effects ? 10u : 65u;
+        if (bytes.size() % stride) throw std::runtime_error("Truncated Amiga saved item or effect");
+        std::vector<RecordRow> rows;
+        for (unsigned offset = 0; offset < bytes.size(); offset += stride) {
+            const auto* p = bytes.data() + offset;
+            auto row = effects ? amiga_effect(p[0], offset / stride, p) : amiga_item(0, offset / stride, p);
+            row.fields.emplace_back("Owner", owner);
+            rows.push_back(std::move(row));
+        }
+        return rows;
+    }
+    if (owner_size == 232 || owner_size == 426) {
+        const unsigned width = effects ? 10 : 72;
+        if (bytes.size() % width) throw std::runtime_error("Truncated Amiga character companion");
+        std::vector<RecordRow> rows;
+        for (unsigned at = 0; at < bytes.size(); at += width) {
+            const auto* p = bytes.data() + at;
+            // These 72-byte inventory nodes differ from Pool's 65-byte nodes.
+            auto row = effects ? amiga_effect(p[0], at / width, p) :
+                RecordRow{0, at / width, amiga_name(p, 41), {}};
+            if (row.name.empty()) row.name = "Inventory entry " + std::to_string(at / width + 1);
+            row.fields.emplace_back("Owner", owner);
+            rows.push_back(std::move(row));
+        }
+        return rows;
     }
     const bool buck = extension == ".HID" || (extension == ".STF" &&
         (owner_size == 259 || owner_size == 263 || (!owner_size && bytes.size() % item_size != 0)));
@@ -1411,7 +1685,7 @@ RecordKind record_kind(const std::filesystem::path& path)
     if (std::regex_match(name, item_name)) return RecordKind::items;
     const auto extension = upper(path.extension().string());
     if (extension == ".XMI") return RecordKind::xmi;
-    static const std::regex party_name(R"(SAVGAM[A-JZ]\.(DAT|PTY|QSV))");
+    static const std::regex party_name(R"(SAVGAM[A-JZ]\.(DAT|PTY|QSV|SAV|DAA))");
     if (std::regex_match(name, party_name)) return RecordKind::dos_party;
     if (extension == ".QCH") return RecordKind::dos_party;
     if (extension == ".GUY" || extension == ".PC" || extension == ".WHO")
@@ -1439,14 +1713,27 @@ std::vector<RecordRow> read_record_rows(const std::filesystem::path& path)
 {
     const auto kind = record_kind(path);
     if (kind == RecordKind::dos_party)
-        return read_dos_party(path);
+        return read_party_save(path);
     if (kind == RecordKind::hillsfar_character) {
         // Hillsfar hfchar.h starts at the name, four bytes into the .HIL.
         const auto bytes = read_record_file(path);
         if (bytes.size() != 188) throw std::runtime_error("Invalid Hillsfar character size");
         const auto* p = bytes.data() + 4;
         RecordRow row{0, 0, amiga_name(p, 16), {}};
-        field(row, "Age", word(p, 0x1a));
+        // Amiga Hillsfar $626C/$6306 writes the same 188-byte block. The
+        // name starts four bytes in and $5B9E stores the age as a native word.
+        // Character generation uses a byte-range age. Other byte fields below
+        // have the same offsets and need no platform inference.
+        const auto age = word(p, 0x1a);
+        const auto amiga_age = amiga_word(p, 0x1a);
+        if (age > 255 && amiga_age <= 255)
+            field(row, "Age", amiga_age);
+        else if (age <= 255 || age == amiga_age)
+            field(row, "Age", age);
+        else {
+            field(row, "Age (DOS byte order)", age);
+            field(row, "Age (Amiga byte order)", amiga_age);
+        }
         field(row, "Current HP", p[0x1c]);
         field(row, "Maximum HP", p[0x1d]);
         field(row, "Quest state", p[0x99]);
