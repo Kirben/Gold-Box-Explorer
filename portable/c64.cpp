@@ -1,4 +1,5 @@
 #include "c64.h"
+#include "c64_spell_names.h"
 #include "geo.h"
 
 #include <algorithm>
@@ -1242,7 +1243,195 @@ std::string party_name(const Bytes& data, unsigned offset, unsigned width = 16)
     return result;
 }
 
-std::vector<RecordRow> later_party(const Bytes& data, const std::string& name)
+using Names = std::vector<std::pair<unsigned, std::string>>;
+Names read_names(const Bytes& file)
+{
+    if (file.size() < 515)
+        throw std::runtime_error("Truncated C64 ITEMNAMES header");
+    const auto address = word(file, 0);
+    if (address != 0x6f00 && address != 0x1517 && !relocated(address))
+        throw std::runtime_error("Invalid C64 ITEMNAMES header");
+    const bool later = address != 0x6f00;
+    const bool buck = file.size() == 2185 && word(file, 0) == 0x4000;
+    Names names(buck ? 239 : 256);
+    const unsigned base = buck ? 0xa5de : later ? 0xa000 : 0x7100;
+    const auto first = 2 + 2 * names.size();
+    for (unsigned id = 0; id < names.size(); ++id)
+        names[id].first = unsigned(file[2 + id]) | unsigned(file[2 + names.size() + id]) << 8;
+    for (unsigned id = 0; id < names.size(); ++id) {
+        const auto pointer = names[id].first;
+        if (!pointer)
+            continue;
+        std::size_t at = pointer - base + first;
+        auto& text = names[id].second;
+        if (later && at == file.size())
+            continue; // Tail entries point just past the last stored string.
+        if (pointer < base || at >= file.size())
+            throw std::runtime_error("Invalid C64 item name pointer");
+        auto end = std::find(file.begin() + at, file.end(), 0) - file.begin();
+        if (end == static_cast<std::ptrdiff_t>(file.size())) {
+            if (!later)
+                throw std::runtime_error("Unterminated C64 item name");
+            // Some ports append a table of loader filenames with no NUL separators.
+            for (const auto& other : names)
+                if (other.first > pointer)
+                    end = std::min(end, static_cast<std::ptrdiff_t>(other.first - base + first));
+        }
+        while (at < static_cast<std::size_t>(end)) {
+            const auto c = file[at++];
+            if (c < 32 || c > 126 || text.size() == 40)
+                throw std::runtime_error("Invalid C64 item name text");
+            text += static_cast<char>(c);
+        }
+    }
+    return names;
+}
+
+std::string item_name(const std::uint8_t* b, const Names& names, bool visible)
+{
+    std::string result;
+    for (unsigned i = 0; i < 3; ++i) {
+        if (b[3-i] >= names.size())
+            continue;
+        const auto& part = names[b[3-i]].second;
+        if (part.empty() || (visible && (b[6] & (1 << i))))
+            continue;
+        if (!result.empty())
+            result += " ";
+        result += part;
+    }
+    return result;
+}
+
+void add_saved_spells(RecordRow& row, const std::uint8_t* core, const std::string& file)
+{
+    // CAMP scans these slots backwards (inclusive). Marking a spell for
+    // memorization sets bit 7; rest clears it when that copy is ready.
+    const bool champions = file == "SAVEDRAGN.PRG";
+    const bool death = file == "SAVEDEATH.PRG";
+    const bool blades = file == "SAVEDBASH.PRG";
+    const unsigned first = death || blades ? 0x1b : 0x20;
+    const unsigned end = champions ? 0x59 : 0x65;
+    const auto& names = champions ? c64_spells::champions : death ? c64_spells::death :
+                        blades ? c64_spells::blades : c64_spells::azure;
+    std::array<unsigned, 128> ready{}, pending{};
+    unsigned ready_total = 0;
+    for (unsigned offset = first; offset < end; ++offset) {
+        const unsigned entry = core[offset], id = entry & 0x7f;
+        if (!id) continue;
+        if (entry & 0x80) ++pending[id];
+        else { ++ready[id]; ++ready_total; }
+    }
+    row.fields.emplace_back("Memorized copies", std::to_string(ready_total));
+    for (unsigned id = 1; id < names.size(); ++id) {
+        const bool known = (core[0x78 + id / 8] & (1u << (id % 8))) != 0;
+        if (!known && !ready[id] && !pending[id]) continue;
+        std::string label = "Spell " + std::to_string(id);
+        if (names[id]) label += " — " + std::string(c64_spells::names[names[id]]);
+        std::string value = known ? "Known; " : "";
+        value += "Memorized: " + std::to_string(ready[id]);
+        if (pending[id]) value += "; Pending: " + std::to_string(pending[id]);
+        row.fields.emplace_back(std::move(label), std::move(value));
+    }
+}
+
+// COMBAT loads nine bytes per spell from COMBAT2; byte 5 is eventually
+// written to $4b00,X. Several spells can produce the same condition.
+const char* saved_effect_name(unsigned id, const std::string& file)
+{
+    const bool death = file == "SAVEDEATH.PRG";
+    const bool blades = file == "SAVEDBASH.PRG";
+    const bool azure = file == "SAVEAZURE.PRG" || file == "SAVEGATEWAY.PRG";
+    const bool curse = file == "SAVEAZURE.PRG";
+    const bool champions = file == "SAVEDRAGN.PRG";
+    // Item power $80 passes the parameter at $7e8a to the effect add/remove
+    // routines. Name these associations only for games with a matching item.
+    switch (id) {
+    case 1: return "Bless";
+    case 2: return death ? "Olin's Quarterstaff" : "Curse";
+    case 3: return "Sticks to Snakes";
+    case 4: return file == "SAVEDRAGN.PRG" ? nullptr : "Dispel Evil";
+    case 5: return "Detect Magic";
+    case 6: return curse ? "Flametongue" : nullptr;
+    case 7: return azure ? "Faerie Fire" : champions || death ? "Hoopak" : nullptr;
+    case 8: return "Protection from Evil";
+    case 9: return death ? "Boots of Speed" : "Protection from Good";
+    case 10: return "Resist Cold";
+    case 11: return "Charm";
+    case 12: return "Enlarge";
+    // Champions MON00 (Aurak) and MON12 (Myrtani) carry $0d. COMBAT
+    // $1932 starts the six-round second form and restores the creature to 20 HP.
+    case 13: return death ? "Faerie Fire" : blades ? "Barkskin" : azure ? "Reduce" : "Aurak transformation";
+    case 16: return "Read Magic";
+    case 17: return "Shield";
+    case 20: return "Resist Fire";
+    case 21: return "Silence 15' Radius";
+    case 23: return "Spiritual Hammer";
+    case 24: return "Detect Invisibility";
+    case 25: return "Invisibility";
+    case 27: return "Fumble";
+    case 28: return "Mirror Image";
+    case 29: return "Ray of Enfeeblement";
+    case 30: return "Stinking Cloud";
+    case 32: return death ? "Invisibility to Animals" : nullptr;
+    case 33: return "Blindness";
+    case 34: return death ? nullptr : "Disease";
+    case 35: return "Confusion";
+    case 36: return "Bestow Curse";
+    case 37: return "Blink";
+    case 39: return "Haste";
+    case 41: return "Protection from Normal Missiles";
+    case 42: return "Slow";
+    case 45: return "Protection from Evil 10' Radius";
+    case 46: return death ? nullptr : "Protection from Good 10' Radius";
+    case 48: return death ? "Barkskin" : nullptr;
+    case 49: return "Prayer";
+    case 51: return death ? nullptr : "Snake Charm";
+    case 52: return "Hold";
+    case 53: return "Sleep";
+    case 55: return "Poison";
+    case 56: return curse || blades ? "Ring of Invisibility" : nullptr;
+    case 57: return death ? "Otto's Irresistible Dance" : blades ? "Globe of Invulnerability" : nullptr;
+    case 58: return champions ? "Aurak transformation timer" : death ? "Mind Blank" : nullptr;
+    case 59: return death ? "Globe of Invulnerability" : nullptr;
+    case 60: return death ? "Iron Skin" : nullptr;
+    case 61: return death ? "Feeblemind" : blades ? "Ring of Fire Resistance" : nullptr;
+    case 63: return "Minor Globe of Invulnerability";
+    case 68: return azure || blades ? "Feeblemind" : nullptr;
+    case 69: return azure || blades ? "Invisibility to Animals" : nullptr;
+    case 71: return blades ? "Faerie Fire" : azure ? "Dust of Disappearance" : nullptr;
+    case 73: return "Protection from Dragon Breath";
+    case 74: return death ? "Fire Touch" : blades ? "Boots of Speed" : curse ? "Robe of Vermin" : nullptr;
+    case 75: return curse ? "Dragon Slayer" : blades ? "Sword vs. Giants" : nullptr;
+    case 76: return curse ? "Frost Brand" : blades ? "Periapt of Health" : nullptr;
+    case 77: return curse ? "Berserker sword" : nullptr;
+    case 78: return blades ? "Stone of Good Luck" : nullptr;
+    case 89: return file == "SAVEGATEWAY.PRG" ? nullptr : "Cloak of Displacement";
+    // Champions COMBAT vectors 91 to $29ac (tests the YELL victim flag)
+    // and 92 to $29c3 (cancels incoming effect $6f, Fear).
+    case 91: return champions ? "Kender taunt response" : nullptr;
+    case 92: return champions ? "Fear immunity" : nullptr;
+    // GEN grants this when $7cd0 (ranger level) is nonzero. COMBAT tests
+    // target type bit $08 and adds that level to the damage accumulator.
+    case 105: return azure ? nullptr : "Ranger damage bonus";
+    case 109: return azure ? "Protection from Paralysis" : nullptr;
+    case 111: return azure ? nullptr : "Fear";
+    case 112: return azure ? nullptr : "Fire Shield";
+    case 113: return azure ? nullptr : "Giant Strength";
+    case 114: return champions || death ? "Footman's Dragonlance" : nullptr;
+    case 115: return champions || death ? "Sword vs. Reptiles" : nullptr;
+    case 116: return champions || death ? "Periapt of Proof against Poison" : nullptr;
+    case 117: return champions || death ? "Mace of Disruption" : nullptr;
+    case 134: return azure ? "Ranger damage bonus" : nullptr;
+    case 136: return azure ? "Entangle" : nullptr;
+    case 142: return azure ? "Fear" : nullptr;
+    case 143: return azure ? "Fire Shield" : nullptr;
+    case 146: return curse ? "Giant Strength" : nullptr;
+    default: return nullptr;
+    }
+}
+
+std::vector<RecordRow> later_party(const Bytes& data, const std::string& name, const fs::path& path)
 {
     // CAMP saves [$4b00,$6800). The two shipped Krynn parties have a relocated PRG header.
     const bool krynn = name == "SAVEDRAGN.PRG" || name == "SAVEDEATH.PRG";
@@ -1252,6 +1441,14 @@ std::vector<RecordRow> later_party(const Bytes& data, const std::string& name)
         rows.front().fields.emplace_back("Saved memory range", "$4B00-$67FF");
         return rows;
     }
+    Names names;
+    try {
+        const auto file = companion(path, "ITEMNAMES.PRG");
+        if (!file.empty()) names = read_names(file);
+    } catch (const std::runtime_error&) {
+        // A save disk can be browsed without a usable game dictionary.
+    }
+    std::array<unsigned, 8> owner_row{};
     for (unsigned slot = 0; slot < 8; ++slot) {
         auto member = party_name(data, 2 + 0xc00 + slot * 16);
         if (member.empty()) continue;
@@ -1265,16 +1462,76 @@ std::vector<RecordRow> later_party(const Bytes& data, const std::string& name)
             ++matches;
         }
         if (matches == 1) {
+            add_saved_spells(row, data.data() + core, name);
+            // These core slots share the effect ID namespace with the timed
+            // table, but have no timer and can also hold equipped-item traits.
+            for (unsigned i = 0; i < 10; ++i) {
+                const unsigned id = data[core + 0xad + i];
+                if (!id) continue;
+                std::string value = "ID " + std::to_string(id);
+                if (const char* label = saved_effect_name(id, name)) value += " (" + std::string(label) + ")";
+                row.fields.emplace_back("Character effect slot " + std::to_string(i + 1), std::move(value));
+            }
             // GEN copies the ability scores from $7c65 onwards to $7c14.
             // LIBRARY passes $7c74/75 together to its numeric display routine.
             constexpr const char* abilities[]{"Strength", "Intelligence", "Wisdom", "Dexterity",
                                                "Constitution", "Charisma", "Exceptional strength"};
             for (unsigned i = 0; i < std::size(abilities); ++i)
                 row.fields.emplace_back(abilities[i], std::to_string(data[core + 0x14 + i]));
+            // LIBRARY walks its display-order table backwards and skips zero levels.
+            // Death Knights adds paladins before the Champions display sequence.
+            const unsigned order[]{6, 1, 3, 0, krynn ? 4u : 6u, 7, 2};
+            constexpr const char* classes[]{"Mage", "Cleric", "Thief", "Fighter", "Knight", "", "Paladin", "Ranger"};
+            constexpr const char* robes[]{"Mage", "White Robe", "Red Robe"};
+            constexpr const char* clerics[]{"Cleric", "Paladine Cleric", "Majere Cleric", "Kiri-Jolith Cleric",
+                                           "Mishakal Cleric", "Sirrion Cleric", "Reorx Cleric", "Shinare Cleric"};
+            constexpr const char* knights[]{"Knight", "Knight of the Crown", "Knight of the Sword", "Knight of the Rose"};
+            for (unsigned pos = name == "SAVEDEATH.PRG" ? 0 : 1; pos < std::size(order); ++pos) {
+                const unsigned index = order[pos];
+                const unsigned level = data[core + 0xc9 + index];
+                if (!level) continue;
+                const char* label = classes[index];
+                if (krynn) {
+                    const unsigned subtype = data[core + (name == "SAVEDEATH.PRG" ? 0xbb : 0x5d) + index];
+                    if (index == 0 && subtype < std::size(robes)) label = robes[subtype];
+                    if (index == 1 && subtype < std::size(clerics)) label = clerics[subtype];
+                    if (index == 4 && subtype < std::size(knights)) label = knights[subtype];
+                }
+                row.fields.emplace_back(std::string(label) + " level", std::to_string(level));
+            }
             row.fields.emplace_back("Race ID", std::to_string(data[core + 0x72]));
             row.fields.emplace_back("Age", std::to_string(word(data, core + 0x74)));
             // GEN initializes this byte and the separate runtime HP byte at $7d19.
             row.fields.emplace_back("Maximum HP", std::to_string(data[core + 0x76]));
+            // LIBRARY copies [$6700 + 32*slot, +32) to/from $7d00.
+            // $7d0d selects the character bank; $7d19 holds current HP.
+            const unsigned bank = (core - 2 - 0x400) / 256;
+            // LIBRARY copies the $5b00 bank page into $7d20 and the selected
+            // 16-byte slot into $7e7c. Ready/unready sets/clears bit 7 of $7e82.
+            unsigned occupied = 0;
+            for (unsigned i = 0; i < 16; ++i) {
+                const auto* item = data.data() + 2 + 0x1000 + bank * 256 + i * 16;
+                if (!item[0]) continue;
+                ++occupied;
+                auto label = item_name(item, names, true);
+                if (label.empty()) label = "Item type " + std::to_string(item[0]);
+                label += (item[6] & 0x80) ? " (equipped)" : " (not equipped)";
+                row.fields.emplace_back("Inventory slot " + std::to_string(i + 1), std::move(label));
+            }
+            row.fields.emplace_back("Occupied inventory slots", std::to_string(occupied));
+            std::optional<unsigned> record;
+            for (unsigned runtime = 2 + 0x1c00; runtime < data.size(); runtime += 32) {
+                if (!data[runtime] || data[runtime + 0x0d] != bank) continue;
+                if (record) { record.reset(); break; }
+                record = runtime;
+            }
+            if (record) {
+                row.fields.emplace_back("Current HP", std::to_string(data[*record + 0x19]));
+                constexpr const char* status[]{"Unknown (0)", "OK", "Gone", "Dead", "Dying",
+                                               "Unconscious", "Running", "Stoned"};
+                row.fields.emplace_back("Status", status[data[*record] & 7]);
+                owner_row[(*record - 2 - 0x1c00) / 32] = static_cast<unsigned>(rows.size());
+            }
             // All five LIBRARY overlays pass $7ce8/9/a to the XP display in A/X/Y.
             const unsigned xp = word(data, core + 0xe8) | (unsigned(data[core + 0xea]) << 16);
             row.fields.emplace_back("Experience", std::to_string(xp));
@@ -1282,6 +1539,24 @@ std::vector<RecordRow> later_party(const Bytes& data, const std::string& name)
         rows.push_back(std::move(row));
     }
     rows.front().fields.emplace_back("Party members", std::to_string(rows.size() - 1));
+    // LIBRARY compares $4b40,X with the runtime slot. Negative owners
+    // bypass the character match. CAMP skips a zero timer even for a live ID.
+    for (unsigned slot = 0; slot < 64; ++slot) {
+        const unsigned id = data[2 + slot];
+        if (!id) continue;
+        const unsigned owner = data[2 + 0x40 + slot], timer = data[2 + 0x80 + slot];
+        const unsigned target = owner < owner_row.size() ? owner_row[owner] : 0;
+        std::string value = "ID " + std::to_string(id);
+        if (const char* label = saved_effect_name(id, name)) value += " (" + std::string(label) + ")";
+        if (!target) value += ", owner byte " + std::to_string(owner);
+        constexpr const char* units[]{"round", "turn", "hour", "day"};
+        const unsigned remaining = timer & 63;
+        if (!timer) value += ", no countdown";
+        else if (remaining) value += ", remaining " + std::to_string(remaining) + " " + units[timer >> 6] +
+                                     (remaining == 1 ? "" : "s");
+        else value += ", timer byte " + std::to_string(timer);
+        rows[target].fields.emplace_back("Active effect slot " + std::to_string(slot + 1), std::move(value));
+    }
     return rows;
 }
 
@@ -1359,55 +1634,13 @@ std::vector<RecordRow> read_c64_records(const fs::path& path)
         return {{0, 0, party_name(bytes, 2), {{"Format", "C64 saved character"},
                                                {"Saved memory range", "$7C00-$7E43"}}}};
     }
-    if (later_save(name)) return later_party(bytes, name);
+    if (later_save(name)) return later_party(bytes, name, path);
     if (name == "SAVEDGAME0.PRG" || name == "SAVEDGAME1.PRG")
         return pool_party(path, bytes, name == "SAVEDGAME0.PRG");
     auto number = [](RecordRow& row, const char* label, int value) {
         row.fields.emplace_back(label, std::to_string(value));
     };
     auto signed_byte = [](unsigned value) { return value < 128 ? int(value) : int(value) - 256; };
-    using Names = std::vector<std::pair<unsigned, std::string>>;
-    auto read_names = [](const Bytes& file) {
-        if (file.size() < 515)
-            throw std::runtime_error("Truncated C64 ITEMNAMES header");
-        const auto address = word(file, 0);
-        if (address != 0x6f00 && address != 0x1517 && !relocated(address))
-            throw std::runtime_error("Invalid C64 ITEMNAMES header");
-        const bool later = address != 0x6f00;
-        const bool buck = file.size() == 2185 && word(file, 0) == 0x4000;
-        Names names(buck ? 239 : 256);
-        const unsigned base = buck ? 0xa5de : later ? 0xa000 : 0x7100;
-        const auto first = 2 + 2 * names.size();
-        for (unsigned id = 0; id < names.size(); ++id)
-            names[id].first = unsigned(file[2 + id]) | unsigned(file[2 + names.size() + id]) << 8;
-        for (unsigned id = 0; id < names.size(); ++id) {
-            const auto pointer = names[id].first;
-            if (!pointer)
-                continue;
-            std::size_t at = pointer - base + first;
-            auto& text = names[id].second;
-            if (later && at == file.size())
-                continue; // Tail entries point just past the last stored string.
-            if (pointer < base || at >= file.size())
-                throw std::runtime_error("Invalid C64 item name pointer");
-            auto end = std::find(file.begin() + at, file.end(), 0) - file.begin();
-            if (end == static_cast<std::ptrdiff_t>(file.size())) {
-                if (!later)
-                    throw std::runtime_error("Unterminated C64 item name");
-                // Some ports append a table of loader filenames with no NUL separators.
-                for (const auto& other : names)
-                    if (other.first > pointer)
-                        end = std::min(end, static_cast<std::ptrdiff_t>(other.first - base + first));
-            }
-            while (at < static_cast<std::size_t>(end)) {
-                const auto c = file[at++];
-                if (c < 32 || c > 126 || text.size() == 40)
-                    throw std::runtime_error("Invalid C64 item name text");
-                text += static_cast<char>(c);
-            }
-        }
-        return names;
-    };
     std::vector<RecordRow> rows;
     if (name == "ITEMNAMES.PRG") {
         const auto names = read_names(bytes);
@@ -1512,21 +1745,7 @@ std::vector<RecordRow> read_c64_records(const fs::path& path)
         if (monster && !b[0])
             continue;
         RecordRow row{id, monster ? slot + 1 : slot, {}, {}};
-        auto item_name = [&](bool visible) {
-            std::string result;
-            for (unsigned i = 0; i < 3; ++i) {
-                if (b[3-i] >= names.size())
-                    continue;
-                const auto& part = names[b[3-i]].second;
-                if (part.empty() || (visible && (b[6] & (1 << i))))
-                    continue;
-                if (!result.empty())
-                    result += " ";
-                result += part;
-            }
-            return result;
-        };
-        row.name = b[0] ? item_name(false) : "Empty slot";
+        row.name = b[0] ? item_name(b, names, false) : "Empty slot";
         if (row.name.empty())
             row.name = "Item type " + std::to_string(b[0]);
         if (monster)
@@ -1534,7 +1753,7 @@ std::vector<RecordRow> read_c64_records(const fs::path& path)
         number(row, "Payload offset", at - 2);
         number(row, "File offset", at);
         number(row, "Type", b[0]);
-        row.fields.emplace_back("Visible name", item_name(true));
+        row.fields.emplace_back("Visible name", item_name(b, names, true));
         row.fields.emplace_back("Name component IDs", std::to_string(b[3]) + ", " +
                                 std::to_string(b[2]) + ", " + std::to_string(b[1]));
         number(row, "Magic bonus", signed_byte(b[4]));

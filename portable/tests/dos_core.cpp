@@ -1169,13 +1169,66 @@ void c64_assets(const fs::path& dir)
     party[core + 0x76] = 42;
     party[core + 0x77] = 99;
     party[core + 0xea] = 3;
-    const auto save = dir / "SAVEDRAGN.PRG";
+    party[core + 0x78] = 8;
+    party[core + 0x20] = party[core + 0x58] = 3;
+    party[core + 0x21] = 0x83;
+    party[core + 0x59] = 3; // Past the last Champions slot.
+    party[core + 0xc9] = 4;
+    party[core + 0xca] = 3;
+    party[core + 0xcc] = 5;
+    party[core + 0x5d] = 2;
+    party[core + 0x5e] = 4;
+    const unsigned runtime_record = 2 + 0x1c00 + 3 * 32;
+    party[runtime_record] = 0x85;
+    // Last effect slot belongs to runtime slot 3, not core bank 5.
+    party[2 + 63] = 39;
+    party[2 + 0x40 + 63] = 3;
+    party[2 + 0x80 + 63] = 0x45;
+    party[2] = 201;
+    party[2 + 0x40] = 255;
+    party[core + 0xad] = 13;
+    party[2 + 1] = 58;
+    party[2 + 0x40 + 1] = 3;
+    party[2 + 0x80 + 1] = 6;
+    party[runtime_record + 13] = 5;
+    party[runtime_record + 25] = 17;
+    party[runtime_record + 26] = 99;
+    const auto inventory_dir = dir / "saved-inventory";
+    fs::create_directories(inventory_dir);
+    Bytes dictionary(514);
+    dictionary[1] = 0x40;
+    dictionary[258 + 1] = dictionary[258 + 2] = 0xa0;
+    dictionary[2 + 2] = 5;
+    dictionary.insert(dictionary.end(), {'M','A','C','E',0,'+','1',0});
+    write(inventory_dir / "ITEMNAMES.PRG", dictionary);
+    const unsigned last_item = 2 + 0x1000 + 5 * 256 + 15 * 16;
+    party[last_item] = 42;
+    party[last_item + 3] = 1;
+    party[last_item + 2] = 2;
+    party[last_item + 6] = 0x82;
+    const auto save = inventory_dir / "SAVEDRAGN.PRG";
     write(save, party);
     const auto roster = read_record_rows(save);
+    check(has_field(roster.at(1), {"Character effect slot 1","ID 13 (Aurak transformation)"}) &&
+          has_field(roster.at(1), {"Active effect slot 2","ID 58 (Aurak transformation timer), remaining 6 rounds"}),
+          "Champions Aurak trait and timed second form");
+    const auto death_save = inventory_dir / "SAVEDEATH.PRG";
+    write(death_save, party);
+    const auto death_member = read_record_rows(death_save).at(1);
+    check(has_field(death_member, {"Character effect slot 1","ID 13 (Faerie Fire)"}) &&
+          has_field(death_member, {"Active effect slot 2","ID 58 (Mind Blank), remaining 6 rounds"}),
+          "Death Knights uses different effects for the same IDs");
+    check(has_field(roster[0], {"Active effect slot 1","ID 201, owner byte 255, no countdown"}) &&
+          has_field(roster.at(1), {"Active effect slot 64","ID 39 (Haste), remaining 5 turns"}) &&
+          has_field(roster.at(1), {"Status","Unconscious"}), "C64 status and active effect ownership");
     check(roster.size() == 2 && roster[1].name == "A" && roster[1].fields.at(1).second == "5",
           "C64 saved roster position and character bank are independent");
     for (const Field& expected : {Field{"Strength","18"}, Field{"Age","256"}, Field{"Maximum HP","42"},
-                                  Field{"Experience","196608"}})
+                                  Field{"Experience","196608"}, Field{"Current HP","17"},
+                                  Field{"Red Robe level","4"}, Field{"Mishakal Cleric level","3"},
+                                  Field{"Fighter level","5"}, Field{"Inventory slot 16","MACE (equipped)"},
+                                  Field{"Occupied inventory slots","1"}, Field{"Memorized copies","2"},
+                                  Field{"Spell 3 — CURE LIGHT WOUNDS","Known; Memorized: 2; Pending: 1"}})
         check(std::find(roster[1].fields.begin(), roster[1].fields.end(), expected) != roster[1].fields.end(),
               "C64 saved character stat offset or width changed");
     party[2 + 0x400] = 'A';
