@@ -1256,9 +1256,29 @@ std::vector<RecordRow> later_party(const Bytes& data, const std::string& name)
         auto member = party_name(data, 2 + 0xc00 + slot * 16);
         if (member.empty()) continue;
         RecordRow row{slot, slot, member, {{"Party position", std::to_string(slot + 1)}}};
-        for (unsigned bank = 0; bank < 8; ++bank)
-            if (party_name(data, 2 + 0x400 + bank * 256) == member)
-                row.fields.emplace_back("Matching character bank", std::to_string(bank));
+        unsigned matches = 0, core = 0;
+        for (unsigned bank = 0; bank < 8; ++bank) {
+            const unsigned offset = 2 + 0x400 + bank * 256;
+            if (party_name(data, offset) != member) continue;
+            row.fields.emplace_back("Matching character bank", std::to_string(bank));
+            core = offset;
+            ++matches;
+        }
+        if (matches == 1) {
+            // GEN copies the ability scores from $7c65 onwards to $7c14.
+            // LIBRARY passes $7c74/75 together to its numeric display routine.
+            constexpr const char* abilities[]{"Strength", "Intelligence", "Wisdom", "Dexterity",
+                                               "Constitution", "Charisma", "Exceptional strength"};
+            for (unsigned i = 0; i < std::size(abilities); ++i)
+                row.fields.emplace_back(abilities[i], std::to_string(data[core + 0x14 + i]));
+            row.fields.emplace_back("Race ID", std::to_string(data[core + 0x72]));
+            row.fields.emplace_back("Age", std::to_string(word(data, core + 0x74)));
+            // GEN initializes this byte and the separate runtime HP byte at $7d19.
+            row.fields.emplace_back("Maximum HP", std::to_string(data[core + 0x76]));
+            // All five LIBRARY overlays pass $7ce8/9/a to the XP display in A/X/Y.
+            const unsigned xp = word(data, core + 0xe8) | (unsigned(data[core + 0xea]) << 16);
+            row.fields.emplace_back("Experience", std::to_string(xp));
+        }
         rows.push_back(std::move(row));
     }
     rows.front().fields.emplace_back("Party members", std::to_string(rows.size() - 1));

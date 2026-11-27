@@ -1163,11 +1163,24 @@ void c64_assets(const fs::path& dir)
     Bytes party(7426);
     party[1] = 0x40;
     party[2 + 0xc00] = party[2 + 0x400 + 5 * 256] = 'A';
+    const unsigned core = 2 + 0x400 + 5 * 256;
+    party[core + 0x14] = 18;
+    party[core + 0x75] = 1;
+    party[core + 0x76] = 42;
+    party[core + 0x77] = 99;
+    party[core + 0xea] = 3;
     const auto save = dir / "SAVEDRAGN.PRG";
     write(save, party);
     const auto roster = read_record_rows(save);
-    check(roster.size() == 2 && roster[1].name == "A" && roster[1].fields.back().second == "5",
+    check(roster.size() == 2 && roster[1].name == "A" && roster[1].fields.at(1).second == "5",
           "C64 saved roster position and character bank are independent");
+    for (const Field& expected : {Field{"Strength","18"}, Field{"Age","256"}, Field{"Maximum HP","42"},
+                                  Field{"Experience","196608"}})
+        check(std::find(roster[1].fields.begin(), roster[1].fields.end(), expected) != roster[1].fields.end(),
+              "C64 saved character stat offset or width changed");
+    party[2 + 0x400] = 'A';
+    write(save, party);
+    check(read_record_rows(save).at(1).fields.size() == 3, "Ambiguous character banks must not supply stats");
     Bytes cores(7170), runtime(2050);
     cores[1] = 0x49;
     cores[2 + 0x400 + 2 * 256] = 'B';
